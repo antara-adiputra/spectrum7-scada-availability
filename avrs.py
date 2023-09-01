@@ -148,7 +148,7 @@ class AvRemoteStation:
 		"""
 		Main process of availability calculation.
 		"""
-		
+
 		rtu_list = self.setup()
 
 		if self.is_valid:
@@ -316,7 +316,7 @@ class AvRemoteStation:
 
 		rtu_table = self.cpoint_ifs[['B3', 'B3 text']].rename(columns={'B3': 'RTU', 'B3 text': 'Long Name'})
 		down_count = df[groupby_columns].groupby(columns, as_index=False).count().rename(columns={'Duration': 'Downtime Occurences'})
-		down_agg = df[groupby_columns].groupby(columns, as_index=False).agg(['sum', 'mean', 'max']).reset_index()
+		down_agg = df[groupby_columns].groupby(columns).agg(['sum', 'mean', 'max']).reset_index()
 		down_agg.columns = ['RTU', 'Long Name', 'Total Downtime', 'Average Downtime', 'Longest Downtime']
 		filter_max_downtime = df.groupby(columns, as_index=False)['Duration'].transform(max)==df['Duration']
 		down_max_t = df[columns + ['Down Time']][filter_max_downtime].rename(columns={'Down Time': 'Longest Downtime Date'})

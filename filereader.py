@@ -129,7 +129,7 @@ class SpectrumFileReader:
 		# Change B1, B2, B3 from description style into mnemonic style
 		if hasattr(self, 'cpoint_description'):
 			df_trans = self.cpoint_description.copy()
-			if new_df['B1'].str.len().max()>7:
+			if new_df['B1'].str.len().max()>7 or new_df['B3'].str.len().max()>7:
 				# Swap column labels, because exported His. Messages using description text
 				# ['B1', 'B2', 'B3', 'B1 text', 'B2 text', 'B3 text'] -> ['B1 text', 'B2 text', 'B3 text', 'B1', 'B2', 'B3']
 				df_trans.columns = col2 + col1
@@ -146,7 +146,7 @@ class SpectrumFileReader:
 				# Fill unknown (nan) Point Description B1, B2, B3 with its own text
 				new_df.loc[without_description, col2] = new_df.loc[without_description, col1].values
 
-			if new_df['B1'].str.len().max()>7:
+			if new_df['B1'].str.len().max()>7 or new_df['B3'].str.len().max()>7:
 				# Swap column labels, because exported His. Messages using description text
 				# Swap columns name
 				new_df[col1 + col2] = new_df[col2 + col1]
