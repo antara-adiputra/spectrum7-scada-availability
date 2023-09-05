@@ -253,15 +253,15 @@ class RCAnalyzer:
 				if df_ifs[join_datetime(df_ifs['System time stamp'], df_ifs['System milliseconds'])<data['t1']].shape[0]>0:
 					# IFS status changes occured before
 					ifs_last_change = df_ifs[join_datetime(df_ifs['System time stamp'], df_ifs['System milliseconds'])<data['t1']].iloc[-1]
-					ifs_status = 'Up' if ifs_last_change['Status']=='Up' else 'Down'
+					ifs_status = 'Down' if ifs_last_change['Status']=='Down' else 'Up'
 				else:
 					# IFS status changes occured after
 					ifs_first_change = df_ifs[join_datetime(df_ifs['System time stamp'], df_ifs['System milliseconds'])>=data['t1']].iloc[0]
 					t_delta = round((join_datetime(ifs_first_change['System time stamp'], ifs_first_change['System milliseconds'])-data['t1']).total_seconds(), 1)
 					if abs(t_delta)<t_hyst:
-						ifs_status = f'transisi menuju Up ({t_delta}s)' if ifs_first_change['Status']=='Up' else f'transisi menuju down ({t_delta}s)'
+						ifs_status = f'transisi menuju down ({t_delta}s)' if ifs_first_change['Status']=='Down' else f'transisi menuju Up ({t_delta}s)'
 					else:
-						ifs_status = f'Down' if ifs_first_change['Status']=='Up' else f'Up'
+						ifs_status = f'Up' if ifs_first_change['Status']=='Down' else f'Down'
 
 		return ifs_status, ifs_name
 
@@ -621,11 +621,11 @@ class RCAnalyzer:
 					t_executed = join_datetime(*first_change.loc[['Time stamp', 'Milliseconds']].to_list())
 					lr_status_1, lr_quality_1 = self.check_remote_status(data={'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
 					cd_status_1, cd_quality_1 = self.check_enable_status(data={'t1': t_executed, 'b1': b1})
-					if cd_quality_1=='good': txt_list.append(f'CD={cd_status_1}')
+					# if cd_quality_1=='good': txt_list.append(f'CD={cd_status_1}')
 					
 					if sts=='Close':
 						cso_status_1, cso_quality_1 = self.check_synchro_interlock(data={'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-						if cso_quality_1=='good': txt_list.append(f'CSO={cso_status_1}')
+						# if cso_quality_1=='good': txt_list.append(f'CSO={cso_status_1}')
 						prot_isactive = self.check_protection_interlock(data={'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
 						if prot_isactive: txt_list.append(f'{prot_isactive}=Appeared')
 
@@ -675,11 +675,11 @@ class RCAnalyzer:
 					t_executed = join_datetime(*first_dist_change.loc[['Time stamp', 'Milliseconds']].to_list())
 					lr_status_1, lr_quality_1 = self.check_remote_status(data={'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
 					cd_status_1, cd_quality_1 = self.check_enable_status(data={'t1': t_executed, 'b1': b1})
-					if cd_quality_1=='good': txt_list.append(f'CD={cd_status_1}')
+					# if cd_quality_1=='good': txt_list.append(f'CD={cd_status_1}')
 					
 					if sts=='Close':
 						cso_status_1, cso_quality_1 = self.check_synchro_interlock(data={'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-						if cso_quality_1=='good': txt_list.append(f'CSO={cso_status_1}')
+						# if cso_quality_1=='good': txt_list.append(f'CSO={cso_status_1}')
 						prot_isactive = self.check_protection_interlock(data={'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
 						if prot_isactive: txt_list.append(f'{prot_isactive}=Appeared')
 
@@ -701,7 +701,7 @@ class RCAnalyzer:
 				# Eleminate unnecessary character
 				txt = re.sub('^\W*|\s*$', '', cmt)
 				annotation.append(txt)
-						
+
 		# Event marked by user
 		if self.unused_mark in df_range['User comment'].to_list() or 'notused' in df_range['User comment'].to_list():
 			annotation.append('User menandai RC dianulir**')

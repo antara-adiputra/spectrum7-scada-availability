@@ -179,7 +179,7 @@ class SpectrumFileReader:
 		# get highest similarity ratio
 		new_df = new_df[(new_df['B1']!='') & (new_df['Ratio']>0)]
 
-		filter_highest_ratio = new_df.groupby(columns_base, as_index=False)['Ratio'].transform(max)==new_df['Ratio']
+		filter_highest_ratio = new_df.groupby(columns_base, as_index=False)['Ratio'].transform('max')==new_df['Ratio']
 		new_df = new_df[filter_highest_ratio]
 
 		if verbose:
