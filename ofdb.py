@@ -634,15 +634,7 @@ class SpectrumOfdbClient:
 		
 
 def main():
-	df = SpectrumOfdbClient(date_start=datetime.now().replace(hour=0, minute=0, second=0, microsecond=0))
-	print('Date Range\n', df.date_range)
-	print('SOE All\n', df.soe_all)
-	print('SOE CD\n', df.soe_control_disable)
-	print('SOE LR\n', df.soe_local_remote)
-	print('SOE IFS\n', df.soe_rtu_updown)
-	print('SOE Switching\n', df.soe_switching)
-	print('SOE Synchro\n', df.soe_synchro)
-	print('SOE Trip\n', df.soe_trip)
+	pass
 
 if __name__=='__main__':
 	main()

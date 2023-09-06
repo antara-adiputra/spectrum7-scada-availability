@@ -23,6 +23,11 @@ class RCAnalyzer:
 		self._cd_qualities = {}
 		self._cso_qualities = {}
 		self._lr_qualities = {}
+		self.analyzed_messages = None
+		self.analyzed_rc = None
+		self.analyzed_station = None
+		self.analyzed_bay = None
+		self.analyzed_operator = None
 		self.t_monitor = {'CB': 15, 'BI1': 30, 'BI2': 30}
 		self.t_transition = {'CB': 1, 'BI1': 16, 'BI2': 16}
 		self.t_search = 3*60*60
@@ -32,6 +37,7 @@ class RCAnalyzer:
 		self.unused_mark = '**unused**'
 		self.keep_duplicate = 'last'
 		self.check_repetition = check_repetition
+		self.threshold_variable = 1
 
 		if calculate_bi: self.rc_element += ['BI1', 'BI2']
 
@@ -153,6 +159,7 @@ class RCAnalyzer:
 		self.analyzed_messages = pd.concat([self.rc_messages, self.lr_messages, self.cd_messages, self.sync_messages, self.prot_messages, self.ifs_messages], copy=False).drop_duplicates(keep='first').sort_values(['Time stamp', 'Milliseconds'])
 		self.analyzed_rc = pd.DataFrame(data=rc_list)
 		self.analyzed_rc['Annotations'] = list(map(lambda x: '\n'.join(list(map(lambda y: f'- {y}', x))), note_list))
+		self._analyzed = True
 
 		return return_value
 
@@ -172,13 +179,12 @@ class RCAnalyzer:
 			# Check RC event count
 			if self.order_messages.shape[0]>0:
 				self._rc_indexes = self.analyze()
-				self._summary = self.get_summary(self.analyzed_rc)
+				self._summary = self.summary()
 			else:
 				return print('Tidak terdeteksi event RC.')
 		
 			self._process_stop = time.time()
 			self._process_duration = round(self.process_stop - self.process_begin, 2)
-			self._analyzed = True
 
 	def check_enable_status(self, data:dict):
 		"""
@@ -404,8 +410,8 @@ class RCAnalyzer:
 		# Check required data
 		try:
 			worksheets = self.prepare_export(generate_formula=as_formula)
-			statistic = self.summary['statistic']
-			overall = self.summary['overall']
+			statistic = self.result['statistic']
+			overall = self.result['overall']
 		except (AttributeError, KeyError, ValueError):
 			return print('Tidak dapat export file RC.')
 		
@@ -451,12 +457,15 @@ class RCAnalyzer:
 				('Source File', self.sources),
 				('Output File', f'{filename}.{self.output_extension}'),
 				('RC Date Range', f'{self.date_start.strftime("%d-%m-%Y")} s/d {self.date_stop.strftime("%d-%m-%Y")}'),
-				('RC Element', ', '.join(self.rc_element)),
-				('RC Repetition', 'last-occurrence-only' if self.check_repetition else 'calculate-all'),
 				('Processed Date', datetime.now().strftime('%d-%m-%Y %H:%M:%S')),
 				('Execution Time', f'{self.process_duration}s'),
 				('PC', platform.node()),
 				('User', os.getlogin()),
+				('', ''),
+				('SETTING', ''),
+				('RC Element', ', '.join(self.rc_element)),
+				('RC Repetition', 'last-occurrence-only' if self.check_repetition else 'calculate-all'),
+				('Threshold (default=1)', self.threshold_variable),
 				('', ''),
 				('SUMMARY', ''),
 				('Success Percentage', overall['percentage']),
@@ -740,108 +749,57 @@ class RCAnalyzer:
 
 		return result_idx, final_result
 
-	def get_summary(self, df:pd.DataFrame):
-		"""
-		Get aggregate data as per Station, Bay, and Operator, then return list of Excel worksheet name and Dataframe wrapped into dictionaries.
-		* INPUT
-		df : Dataframe of the analyzed RC result
-		* OUTPUT
-		summary : Immutable dictionary
-		* SET
-		analyzed_station : Dataframe of grouped by Station (B1)
-		analyzed_bay : Dataframe of grouped by Bay (B1, B2, B3)
-		analyzed_operator : Dataframe of grouped by Dispatcher (Operator)
-		"""
-
-		# Filter only rows with not unused-marked
-		df_filtered = df.loc[df['Marked Unused']=='']
-
-		# Filter only rows without repetition-marked
-		if self.check_repetition:
-			df_filtered = df_filtered.loc[df_filtered['Rep. Flag']=='']
-
-		self.analyzed_station = self.groupby_base(df_filtered, ['B1']).merge(right=self.groupby_station(df_filtered, ['B1']), how='left', on=['B1']).fillna(0)
-		self.analyzed_bay = self.groupby_base(df_filtered, ['B1', 'B2', 'B3']).merge(right=self.groupby_bay(df_filtered, ['B1', 'B2', 'B3']), how='left', on=['B1', 'B2', 'B3'])
-		self.analyzed_operator = self.groupby_base(df_filtered, ['Operator'])
-
-		# Calculate overall success rate
-		rc_all = df.shape[0]
-		rc_unused = df[df['Marked Unused']=='*'].shape[0]
-		rc_valid = df_filtered.shape[0]
-		rc_repetition = df[df['Rep. Flag']=='*'].shape[0]
-		rc_close = df_filtered[df_filtered['Status']=='Close'].shape[0]
-		rc_open = df_filtered[df_filtered['Status']=='Open'].shape[0]
-		rc_marked = df[(df['Marked Unused']=='*') | (df['Marked Success']=='*') | (df['Marked Failed']=='*')].shape[0]
-		rc_marked_failed = df[df['Marked Failed']=='*'].shape[0]
-		rc_marked_success = df[df['Marked Success']=='*'].shape[0]
-		rc_failed = self.analyzed_bay['RC Failed'].sum()
-		rc_failed_close = self.analyzed_bay['Close Failed'].sum()
-		rc_failed_open = self.analyzed_bay['Open Failed'].sum()
-		rc_success = self.analyzed_bay['RC Success'].sum()
-		rc_success_close = self.analyzed_bay['Close Success'].sum()
-		rc_success_open = self.analyzed_bay['Open Success'].sum()
-		rc_percentage = round(rc_success/rc_valid*100, 2)
-		rc_percentage_close = round(rc_success_close/rc_close*100, 2)
-		rc_percentage_open = round(rc_success_open/rc_open*100, 2)
-
-		return {
-			'overall': {
-				'total': rc_valid,
-				'success': rc_success,
-				'failed': rc_failed,
-				'percentage': f'{rc_percentage}%'
-			},
-			'statistic': {
-				'total_event': rc_all,
-				'total_repetition': rc_repetition,
-				'total_marked': rc_marked,
-				'total_valid': rc_valid,
-				'marked': {'unused': rc_unused, 'success': rc_marked_success, 'failed': rc_marked_failed},
-				'operation': {'close': rc_close, 'close_failed': rc_failed_close, 'close_success': rc_success_close, 'close_success_percentage': f'{rc_percentage_close}%', 'open': rc_open, 'open_failed': rc_failed_open, 'open_success': rc_success_open, 'open_success_percentage': f'{rc_percentage_open}%'},
-				'cd_event': self.cd_messages.shape[0],
-				'lr_event': self.lr_messages.shape[0],
-				'prot_event': self.prot_messages.shape[0],
-				'sync_event': self.sync_messages.shape[0],
-				'updown_event': self.ifs_messages.shape[0]
-			}
-		}
-
-	def groupby_base(self, df:pd.DataFrame, columns:list):
+	def group(self, df:pd.DataFrame, columns:list):
 		"""
 		Return DataFrameGroupBy Class of aggregation values which used in all grouped Dataframe with groupby_columns as Columns parameter.
 		"""
-		
+
 		groupby_columns = columns + ['Final Result']
 		rc_count = df[groupby_columns].groupby(columns, as_index=False).count().rename(columns={'Final Result': 'RC Occurences'})
 		rc_success = df.loc[(df['Final Result']=='SUCCESS'), groupby_columns].groupby(columns, as_index=False).count().rename(columns={'Final Result': 'RC Success'})
 		rc_failed = df.loc[(df['Final Result']=='FAILED'), groupby_columns].groupby(columns, as_index=False).count().rename(columns={'Final Result': 'RC Failed'})
-		df_groupby = rc_count.merge(right=rc_success, how='left', on=columns).merge(right=rc_failed, how='left', on=columns)
+
+		df_groupby = rc_count.merge(right=rc_success, how='left', on=columns).merge(right=rc_failed, how='left', on=columns).fillna(0)
 		df_groupby['Success Rate'] = np.round(df_groupby['RC Success']/df_groupby['RC Occurences'], 4)
 
-		return df_groupby.fillna(0)
+		return df_groupby
 
-	def groupby_station(self, df:pd.DataFrame, columns:list):
+	def group_station(self, df:pd.DataFrame):
 		"""
 		ReturnDataFrameGroupBy Class for Station (columns = B1)
 		"""
 
+		columns = ['B1']
 		groupby_columns = columns + ['Execution (s)', 'Termination (s)', 'TxRx (s)']
+		df_groupby = self.group(df, columns)
 
-		return df[df['Final Result']=='SUCCESS'][groupby_columns].groupby(columns, as_index=False).mean().round(3).rename(columns={'Execution (s)': 'Execution Avg.', 'Termination (s)': 'Termination Avg.', 'TxRx (s)': 'TxRx Avg.'})
+		df_tmp = df.loc[df['Final Result']=='SUCCESS', groupby_columns].groupby(columns, as_index=False).mean().round(3).rename(columns={'Execution (s)': 'Execution Avg.', 'Termination (s)': 'Termination Avg.', 'TxRx (s)': 'TxRx Avg.'})
+		df_groupby = df_groupby.merge(right=df_tmp, how='left', on=columns).fillna(0)
 
-	def groupby_bay(self, df:pd.DataFrame, columns:list):
+		return df_groupby
+
+	def group_bay(self, df:pd.DataFrame):
 		"""
 		Return DataFrameGroupBy Class for Bay (columns = B1, B2, B3)
 		"""
-		
-		df_groupby = None
+
+		columns = ['B1', 'B2', 'B3']
 		groupby_columns = columns + ['Final Result']
+		df_groupby = None
+
+		# Assign column 'Open Success', 'Open Failed', 'Close Success', 'Close Failed'
 		for status in ['Open', 'Close']:
 			for result in ['Success', 'Failed']:
 				df_tmp = df.loc[(df['Final Result']==result.upper()) & (df['Status']==status), groupby_columns].groupby(columns, as_index=False).count().rename(columns={'Final Result': f'{status} {result}'})
-				df_groupby = df_groupby.merge(right=df_tmp, how='outer', on=columns) if type(df_groupby)==pd.DataFrame else df_tmp
+				df_groupby = df_groupby.merge(right=df_tmp, how='outer', on=columns) if isinstance(df_groupby, pd.DataFrame) else df_tmp
 
-		return df_groupby.fillna(0)
+		df_groupby = self.group(df, columns).merge(right=df_groupby, how='left', on=columns).fillna(0)
+		total_rc = df_groupby['RC Occurences']
+		df_groupby['Contribution'] = df_groupby['RC Occurences'].map(lambda x: x/total_rc)
+		df_groupby['Reduction'] = df_groupby['RC Failed'].map(lambda y: y/total_rc)
+		df_groupby['Tagging'] = ''
+
+		return df_groupby
 
 	def prepare_export(self, generate_formula:bool=False):
 		"""
@@ -864,6 +822,24 @@ class RCAnalyzer:
 			rlen = df_rc.shape[0]
 			blen = df_bay.shape[0]
 
+			# Threshold cell location in Sheet Info B12
+			thd_var = 'IFERROR(VALUE(Info!$B$12), 0)'
+
+			def rule_lookup(xcol, key=None):
+				if key:
+					return f'RC_ONLY!${xr[xcol]}$2:${xr[xcol]}${rlen+1}, {key}'
+				else:
+					return f'RC_ONLY!${xr[xcol]}$2:${xr[xcol]}${rlen+1}'
+
+			def ruleset(*rules):
+				return ', '.join(rules)
+
+			def countifs(*rules):
+				return f'COUNTIFS({ruleset(*rules)})'
+
+			def averageifs(range, *rules):
+				return f'AVERAGEIFS({range}, {ruleset(*rules)})'
+
 			# Create dict of excel column label
 			xr = {col: xl_col_to_name(rc_columns.index(col)) for col in rc_columns}
 			xg = {col: xl_col_to_name(gi_columns.index(col)) for col in gi_columns}
@@ -871,14 +847,12 @@ class RCAnalyzer:
 			xo = {col: xl_col_to_name(opr_columns.index(col)) for col in opr_columns}
 
 			gi_update = {'RC Occurences': [], 'RC Success': [], 'RC Failed': [], 'Success Rate': [], 'Execution Avg.': [], 'Termination Avg.': [], 'TxRx Avg.': []}
-			bay_update = {'RC Occurences': [], 'RC Success': [], 'RC Failed': [], 'Success Rate': [], 'Open Success': [], 'Open Failed': [], 'Close Success': [], 'Close Failed': []}
+			bay_update = {'RC Occurences': [], 'RC Success': [], 'RC Failed': [], 'Success Rate': [], 'Open Success': [], 'Open Failed': [], 'Close Success': [], 'Close Failed': [], 'Contribution': [], 'Reduction': [], 'Tagging': []}
 			opr_update = {'RC Occurences': [], 'RC Success': [], 'RC Failed': [], 'Success Rate': []}
 			
 			# Define excel formula rule
-			rule_close = f'RC_ONLY!${xr["Status"]}$2:${xr["Status"]}${rlen+1}, "Close"'
-			rule_repetition = f'RC_ONLY!${xr["Rep. Flag"]}$2:${xr["Rep. Flag"]}${rlen+1}, ""'
-			rule_unused = f'RC_ONLY!${xr["Marked Unused"]}$2:${xr["Marked Unused"]}${rlen+1}, ""'
-			rule_success = f'RC_ONLY!${xr["Final Result"]}$2:${xr["Final Result"]}${rlen+1}, "SUCCESS"'
+			rule_repetition = rule_lookup('Rep. Flag', '""')
+			rule_unused = rule_lookup('Marked Unused', '""')
 
 			# Apply excel formula as string
 			# Sheet RC_ONLY
@@ -887,35 +861,38 @@ class RCAnalyzer:
 						f'${xr["Pre Result"]}{row+2}))' for row in range(rlen)])
 			# Sheet GI
 			for rowg in range(df_gi.shape[0]):
-				rule_b1 = f'RC_ONLY!${xr["B1"]}$2:${xr["B1"]}${rlen+1}, ${xg["B1"]}{rowg+2}'
-				ruleset = f'{rule_b1}, {rule_repetition}, {rule_unused}'
-				gi_update['RC Occurences'].append(f'=COUNTIFS({ruleset})')
-				gi_update['RC Success'].append(f'=COUNTIFS({ruleset}, {rule_success})')
-				gi_update['RC Failed'].append(f'=COUNTIFS({ruleset}, {rule_success.replace("SUCCESS", "FAILED")})')
+				rule_b1 = rule_lookup('B1', f'${xg["B1"]}{rowg+2}')
+				rules = [rule_b1, rule_repetition, rule_unused]
+				gi_update['RC Occurences'].append('=' + countifs(*rules))
+				gi_update['RC Success'].append('=' + countifs(*rules, rule_lookup('Final Result', '"SUCCESS"')))
+				gi_update['RC Failed'].append('=' + countifs(*rules, rule_lookup('Final Result', '"FAILED"')))
 				gi_update['Success Rate'].append(f'=${xg["RC Success"]}{rowg+2}/${xg["RC Occurences"]}{rowg+2}')
-				gi_update['Execution Avg.'].append(f'=IF(${xg["RC Success"]}{rowg+2}=0, 0, AVERAGEIFS(RC_ONLY!${xr["Execution (s)"]}$2:${xr["Execution (s)"]}${rlen+1}, {ruleset}, {rule_success}))')
-				gi_update['Termination Avg.'].append(f'=IF(${xg["RC Success"]}{rowg+2}=0, 0, AVERAGEIFS(RC_ONLY!${xr["Termination (s)"]}$2:${xr["Termination (s)"]}${rlen+1}, {ruleset}, {rule_success}))')
-				gi_update['TxRx Avg.'].append(f'=IF(${xg["RC Success"]}{rowg+2}=0, 0, AVERAGEIFS(RC_ONLY!${xr["TxRx (s)"]}$2:${xr["TxRx (s)"]}${rlen+1}, {ruleset}, {rule_success}))')
+				gi_update['Execution Avg.'].append(f'=IF(${xg["RC Success"]}{rowg+2}=0, 0, ' + averageifs(rule_lookup('Execution (s)'), *rules, rule_lookup('Final Result', '"SUCCESS"')) + ')')
+				gi_update['Termination Avg.'].append(f'=IF(${xg["RC Success"]}{rowg+2}=0, 0, ' + averageifs(rule_lookup('Termination (s)'), *rules, rule_lookup('Final Result', '"SUCCESS"')) + ')')
+				gi_update['TxRx Avg.'].append(f'=IF(${xg["RC Success"]}{rowg+2}=0, 0,  ' + averageifs(rule_lookup('TxRx (s)'), *rules, rule_lookup('Final Result', '"SUCCESS"')) + ')')
 			# Sheet BAY
 			for rowb in range(df_bay.shape[0]):
-				rule_b1 = f'RC_ONLY!${xr["B1"]}$2:${xr["B1"]}${rlen+1}, ${xb["B1"]}{rowb+2}'
-				rule_b2 = f'RC_ONLY!${xr["B2"]}$2:${xr["B2"]}${rlen+1}, ${xb["B2"]}{rowb+2}'
-				rule_b3 = f'RC_ONLY!${xr["B3"]}$2:${xr["B3"]}${rlen+1}, ${xb["B3"]}{rowb+2}'
-				ruleset = f'{rule_b1}, {rule_b2}, {rule_b3}, {rule_repetition}, {rule_unused}'
-				bay_update['RC Occurences'].append(f'=COUNTIFS({ruleset})')
-				bay_update['RC Success'].append(f'=COUNTIFS({ruleset}, {rule_success})')
-				bay_update['RC Failed'].append(f'=COUNTIFS({ruleset}, {rule_success.replace("SUCCESS", "FAILED")})')
+				rule_b1 = rule_lookup('B1', f'${xb["B1"]}{rowb+2}')
+				rule_b2 = rule_lookup('B2', f'${xb["B2"]}{rowb+2}')
+				rule_b3 = rule_lookup('B3', f'${xb["B3"]}{rowb+2}')
+				rules = [rule_b1, rule_b2, rule_b3, rule_repetition, rule_unused]
+				bay_update['RC Occurences'].append('=' + countifs(*rules))
+				bay_update['RC Success'].append('=' + countifs(*rules, rule_lookup('Final Result', '"SUCCESS"')))
+				bay_update['RC Failed'].append('=' + countifs(*rules, rule_lookup('Final Result', '"FAILED"')))
 				bay_update['Success Rate'].append(f'=${xb["RC Success"]}{rowb+2}/${xb["RC Occurences"]}{rowb+2}')
 				for status in ['Open', 'Close']:
 					for result in ['Success', 'Failed']:
-						bay_update[f'{status} {result}'].append(f'=COUNTIFS({ruleset}, {rule_close.replace("Close", status)}, {rule_success.replace("SUCCESS", result.upper())})')
+						bay_update[f'{status} {result}'].append('=' + countifs(*rules, rule_lookup('Status', f'"{status}"'), rule_lookup('Final Result', f'"{result.upper()}"')))
+				bay_update['Contribution'].append(f'=${xb["RC Occurences"]}{rowb+2}/${xb["RC Occurences"]}${blen+2}')	# <rc occur>/<total rc occur>
+				bay_update['Reduction'].append(f'=${xb["RC Failed"]}{rowb+2}/${xb["RC Occurences"]}${blen+2}')	# <rc failed>/<total rc occur>
+				bay_update['Tagging'].append(f'=IF(IFERROR(${xb["Open Failed"]}{rowb+2}^2/(${xb["Open Failed"]}{rowb+2}+${xb["Open Success"]}{rowb+2}), 0)>{thd_var}, "O", "") & IF(IFERROR(${xb["Close Failed"]}{rowb+2}^2/(${xb["Close Failed"]}{rowb+2}+${xb["Close Success"]}{rowb+2}), 0)>{thd_var}, "C", "")')
 			# Sheet DISPATCHER
 			for rowo in range(df_opr.shape[0]):
-				rule_operator = f'RC_ONLY!${xr["Operator"]}$2:${xr["Operator"]}${rlen+1}, ${xo["Operator"]}{rowo+2}'
-				ruleset = f'{rule_operator}, {rule_repetition}, {rule_unused}'
-				opr_update['RC Occurences'].append(f'=COUNTIFS({ruleset})')
-				opr_update['RC Success'].append(f'=COUNTIFS({ruleset}, {rule_success})')
-				opr_update['RC Failed'].append(f'=COUNTIFS({ruleset}, {rule_success.replace("SUCCESS", "FAILED")})')
+				rule_operator = rule_lookup('Operator', f'${xo["Operator"]}{rowo+2}')
+				rules = [rule_operator, rule_repetition, rule_unused]
+				opr_update['RC Occurences'].append('=' + countifs(*rules))
+				opr_update['RC Success'].append('=' + countifs(*rules, rule_lookup('Final Result', '"SUCCESS"')))
+				opr_update['RC Failed'].append('=' + countifs(*rules, rule_lookup('Final Result', '"FAILED"')))
 				opr_update['Success Rate'].append(f'=${xo["RC Success"]}{rowo+2}/${xo["RC Occurences"]}{rowo+2}')
 
 			# Update new DataFrame
@@ -966,8 +943,8 @@ class RCAnalyzer:
 			'df_gi': df_gi.sort_values(['Success Rate', 'RC Occurences'], ascending=[True, False]).iloc[0:5, [0, 1, 4]].rename(columns={'RC Occurences': 'Jumlah', 'Success Rate': 'Persentase'}).to_string(index=False),
 			'df_gi_count': 5 if df_gi.shape[0]>5 else df_gi.shape[0],
 			'element': ', '.join(self.rc_element),
-			'rc_total': self.summary['overall']['total'],
-			'rc_percentage': self.summary['overall']['percentage'],
+			'rc_total': self.result['overall']['total'],
+			'rc_percentage': self.result['overall']['percentage'],
 			'width': width
 		}
 		print(summary_template(**context))
@@ -1035,6 +1012,76 @@ class RCAnalyzer:
 			raise ValueError
 		
 		return df
+
+	def summary(self):
+		"""
+		Get aggregate data as per Station, Bay, and Operator, then return list of Excel worksheet name and Dataframe wrapped into dictionaries.
+		* INPUT
+		df : Dataframe of the analyzed RC result
+		* OUTPUT
+		summary : Immutable dictionary
+		* SET
+		analyzed_station : Dataframe of grouped by Station (B1)
+		analyzed_bay : Dataframe of grouped by Bay (B1, B2, B3)
+		analyzed_operator : Dataframe of grouped by Dispatcher (Operator)
+		"""
+
+		# Filter only rows with not unused-marked
+		# df_filtered = df.loc[df['Marked Unused']=='']
+
+		# Filter only rows without repetition-marked
+		# if self.check_repetition:
+		# 	df_filtered = df_filtered.loc[df_filtered['Rep. Flag']=='']
+		df = self.analyzed_rc
+		df_filtered = self.used_rc
+
+		# self.analyzed_station = self.group(df_filtered, ['B1']).merge(right=self.group_station(df_filtered), how='left', on=['B1']).fillna(0)
+		# self.analyzed_bay = self.group(df_filtered, ['B1', 'B2', 'B3']).merge(right=self.group_bay(df_filtered), how='left', on=['B1', 'B2', 'B3'])
+		self.analyzed_station = self.group_station(df_filtered)
+		self.analyzed_bay = self.group_bay(df_filtered)
+		self.analyzed_operator = self.group(df_filtered, ['Operator'])
+
+		# Calculate overall success rate
+		rc_all = df.shape[0]
+		rc_unused = df[df['Marked Unused']=='*'].shape[0]
+		rc_valid = df_filtered.shape[0]
+		rc_repetition = df[df['Rep. Flag']=='*'].shape[0]
+		rc_close = df_filtered[df_filtered['Status']=='Close'].shape[0]
+		rc_open = df_filtered[df_filtered['Status']=='Open'].shape[0]
+		rc_marked = df[(df['Marked Unused']=='*') | (df['Marked Success']=='*') | (df['Marked Failed']=='*')].shape[0]
+		rc_marked_failed = df[df['Marked Failed']=='*'].shape[0]
+		rc_marked_success = df[df['Marked Success']=='*'].shape[0]
+		rc_failed = self.analyzed_bay['RC Failed'].sum()
+		rc_failed_close = self.analyzed_bay['Close Failed'].sum()
+		rc_failed_open = self.analyzed_bay['Open Failed'].sum()
+		rc_success = self.analyzed_bay['RC Success'].sum()
+		rc_success_close = self.analyzed_bay['Close Success'].sum()
+		rc_success_open = self.analyzed_bay['Open Success'].sum()
+		rc_percentage = round(rc_success/rc_valid*100, 2)
+		rc_percentage_close = round(rc_success_close/rc_close*100, 2)
+		rc_percentage_open = round(rc_success_open/rc_open*100, 2)
+
+		return {
+			'overall': {
+				'total': rc_valid,
+				'success': rc_success,
+				'failed': rc_failed,
+				'percentage': f'{rc_percentage}%'
+			},
+			'statistic': {
+				'total_event': rc_all,
+				'total_repetition': rc_repetition,
+				'total_marked': rc_marked,
+				'total_valid': rc_valid,
+				'marked': {'unused': rc_unused, 'success': rc_marked_success, 'failed': rc_marked_failed},
+				'operation': {'close': rc_close, 'close_failed': rc_failed_close, 'close_success': rc_success_close, 'close_success_percentage': f'{rc_percentage_close}%', 'open': rc_open, 'open_failed': rc_failed_open, 'open_success': rc_success_open, 'open_success_percentage': f'{rc_percentage_open}%'},
+				'cd_event': self.cd_messages.shape[0],
+				'lr_event': self.lr_messages.shape[0],
+				'prot_event': self.prot_messages.shape[0],
+				'sync_event': self.sync_messages.shape[0],
+				'updown_event': self.ifs_messages.shape[0]
+			}
+		}
 
 	def worksheet_writer(self, workbook:xlsxwriter.Workbook, sheet_name:str, sheet_data:pd.DataFrame, *args):
 		"""
@@ -1135,6 +1182,10 @@ class RCAnalyzer:
 		return self._cso_qualities
 
 	@property
+	def date_start(self):
+		return self._date_start
+
+	@property
 	def date_stop(self):
 		return self._date_stop
 	
@@ -1187,15 +1238,25 @@ class RCAnalyzer:
 		return self._rc_indexes
 
 	@property
-	def date_start(self):
-		return self._date_start
-
-	@property
-	def summary(self):
+	def result(self):
 		if self.analyzed:
 			return immutable_dict(self._summary)
 		else:
 			print('Data belum tersedia! Jalankan fungsi "calculate()" terlebih dahulu.')
+			return None
+
+	@property
+	def used_rc(self):
+		if isinstance(self.analyzed_rc, pd.DataFrame):
+			# Filter only rows with not unused-marked
+			df = self.analyzed_rc.loc[self.analyzed_rc['Marked Unused']=='']
+
+			# Filter only rows without repetition-marked
+			if self.check_repetition:
+				df = df.loc[df['Rep. Flag']=='']
+
+			return df
+		else:
 			return None
 
 
@@ -1232,4 +1293,5 @@ def main():
 	rc.export_result()
 
 
-if __name__=='__main__': main()
+if __name__=='__main__':
+	main()

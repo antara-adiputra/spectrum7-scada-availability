@@ -221,16 +221,7 @@ class SpectrumFileReader:
 	
 
 def main():
-	filepaths = input('Lokasi file : ')
-	df = SpectrumFileReader(filepaths)
-	print('Date Range\n', df.date_range)
-	print('SOE All\n', df.soe_all)
-	print('SOE CD\n', df.soe_control_disable)
-	print('SOE LR\n', df.soe_local_remote)
-	print('SOE IFS\n', df.soe_rtu_updown)
-	print('SOE Switching\n', df.soe_switching)
-	print('SOE Synchro\n', df.soe_synchro)
-	print('SOE Trip\n', df.soe_trip)
+	pass
 
 if __name__=='__main__':
 	main()

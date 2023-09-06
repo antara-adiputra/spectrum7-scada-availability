@@ -73,7 +73,10 @@ rcdgroup_sheet_param = {
 		'Open Success': {'num_format': '0', 'align': 'center'},
 		'Open Failed': {'num_format': '0', 'align': 'center'},
 		'Close Success': {'num_format': '0', 'align': 'center'},
-		'Close Failed': {'num_format': '0', 'align': 'center'}
+		'Close Failed': {'num_format': '0', 'align': 'center'},
+        'Contribution': {'num_format': '0.00%', 'align': 'center'},
+        'Reduction': {'num_format': '0.00%', 'align': 'center'},
+        'Tagging': {'num_format': '0', 'align': 'center'}
 	},
 	'width': {}
 }
