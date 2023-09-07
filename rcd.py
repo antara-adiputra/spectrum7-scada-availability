@@ -5,7 +5,7 @@ import xlsxwriter
 from datetime import date, datetime, timedelta
 from filereader import SpectrumFileReader
 from glob import glob
-from global_parameters import rcanalyzer_sheet_param
+from global_parameters import RCD_BOOK_PARAM
 from lib import get_datetime, get_execution_duration, get_termination_duration, join_datetime, immutable_dict, progress_bar
 from ofdb import SpectrumOfdbClient
 from pathlib import Path
@@ -18,7 +18,7 @@ class RCAnalyzer:
 	def __init__(self, input:Union[SpectrumFileReader, SpectrumOfdbClient], calculate_bi=False, check_repetition=True, **kwargs):
 		self._feedback_tags = ['RC', 'NE', 'R*', 'N*']
 		self._order_tags = ['OR', 'O*']
-		self._sheet_parameter = immutable_dict(rcanalyzer_sheet_param)
+		self._sheet_parameter = immutable_dict(RCD_BOOK_PARAM)
 		self._analyzed = False
 		self._cd_qualities = {}
 		self._cso_qualities = {}
@@ -47,7 +47,7 @@ class RCAnalyzer:
 			self.all_messages = input.soe_all.copy()
 		else:
 			raise AttributeError('Variable "date_range" belum diset.')
-		
+
 		self.base_dir = Path(__file__).parent.resolve()
 		self.output_dir = self.base_dir / 'output'
 		self.output_extension = 'xlsx'
@@ -751,7 +751,7 @@ class RCAnalyzer:
 
 	def group(self, df:pd.DataFrame, columns:list):
 		"""
-		Return DataFrameGroupBy Class of aggregation values which used in all grouped Dataframe with groupby_columns as Columns parameter.
+		Return DataFrame of aggregation values which used in all grouped Dataframe with groupby_columns as Columns parameter.
 		"""
 
 		groupby_columns = columns + ['Final Result']
@@ -766,7 +766,7 @@ class RCAnalyzer:
 
 	def group_station(self, df:pd.DataFrame):
 		"""
-		ReturnDataFrameGroupBy Class for Station (columns = B1)
+		Return DataFrame for Station (columns = B1)
 		"""
 
 		columns = ['B1']
@@ -780,7 +780,7 @@ class RCAnalyzer:
 
 	def group_bay(self, df:pd.DataFrame):
 		"""
-		Return DataFrameGroupBy Class for Bay (columns = B1, B2, B3)
+		Return DataFrame for Bay (columns = B1, B2, B3)
 		"""
 
 		columns = ['B1', 'B2', 'B3']
@@ -803,6 +803,7 @@ class RCAnalyzer:
 
 	def prepare_export(self, generate_formula:bool=False):
 		"""
+		Applying excel formulas to output file
 		"""
 
 		df_his = self.analyzed_messages
@@ -920,6 +921,10 @@ class RCAnalyzer:
 		}
 
 	def print_result(self):
+		"""
+		Print summary in terminal
+		"""
+
 		width, height = os.get_terminal_size()
 		
 		# Check if RC Event has been analyzed
@@ -973,7 +978,7 @@ class RCAnalyzer:
 		prot_messages : Dataframe of protection alarm only
 		"""
 
-		if type(self.all_messages)==pd.DataFrame:
+		if isinstance(self.all_messages, pd.DataFrame):
 			self._is_valid = True
 			df = self.all_messages.copy()
 			df = df.sort_values(['System time stamp', 'System milliseconds', 'Time stamp', 'Milliseconds'], ascending=[True, True, True, True]).reset_index(drop=True)
@@ -1026,17 +1031,9 @@ class RCAnalyzer:
 		analyzed_operator : Dataframe of grouped by Dispatcher (Operator)
 		"""
 
-		# Filter only rows with not unused-marked
-		# df_filtered = df.loc[df['Marked Unused']=='']
-
-		# Filter only rows without repetition-marked
-		# if self.check_repetition:
-		# 	df_filtered = df_filtered.loc[df_filtered['Rep. Flag']=='']
 		df = self.analyzed_rc
 		df_filtered = self.used_rc
 
-		# self.analyzed_station = self.group(df_filtered, ['B1']).merge(right=self.group_station(df_filtered), how='left', on=['B1']).fillna(0)
-		# self.analyzed_bay = self.group(df_filtered, ['B1', 'B2', 'B3']).merge(right=self.group_bay(df_filtered), how='left', on=['B1', 'B2', 'B3'])
 		self.analyzed_station = self.group_station(df_filtered)
 		self.analyzed_bay = self.group_bay(df_filtered)
 		self.analyzed_operator = self.group(df_filtered, ['Operator'])

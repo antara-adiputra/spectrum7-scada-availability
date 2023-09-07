@@ -1,7 +1,7 @@
-df_columns = ['A', 'Time stamp', 'Milliseconds', 'System time stamp', 'System milliseconds', 'B1', 'B2', 'B3', 'Element', 'Status', 'Tag', 'Operator', 'Comment', 'User comment']
-df_columns_dtype = {'A': 'str', 'Time stamp': 'datetime64[s]', 'Milliseconds': 'float32', 'System time stamp': 'datetime64[s]', 'System milliseconds': 'float32', 'B1': 'str', 'B2': 'str', 'B3': 'str', 'Element': 'str', 'Description': 'str', 'Status': 'str', 'Priority': 'uint16', 'Tag': 'str', 'Operator': 'str', 'Message class': 'str', 'Comment': 'str', 'User comment': 'str', 'SoE': 'str'}
-
-his_sheet_param = {
+SOE_COLUMNS = ['A', 'Time stamp', 'Milliseconds', 'System time stamp', 'System milliseconds', 'B1', 'B2', 'B3', 'Element', 'Status', 'Tag', 'Operator', 'Comment', 'User comment']
+SOE_COLUMNS_DTYPE = {'A': 'str', 'Time stamp': 'datetime64[s]', 'Milliseconds': 'float32', 'System time stamp': 'datetime64[s]', 'System milliseconds': 'float32', 'B1': 'str', 'B2': 'str', 'B3': 'str', 'Element': 'str', 'Description': 'str', 'Status': 'str', 'Priority': 'uint16', 'Tag': 'str', 'Operator': 'str', 'Message class': 'str', 'Comment': 'str', 'User comment': 'str', 'SoE': 'str'}
+RCD_COLUMNS = ['Order Time', 'Feedback Time', 'B1', 'B2', 'B3', 'Element', 'Status', 'Tag', 'Operator', 'Pre Result', 'Execution (s)', 'Termination (s)', 'TxRx (s)', 'Rep. Flag', 'Marked Unused', 'Marked Success', 'Marked Failed', 'Final Result', 'Annotations']
+HIS_SHEET_PARAM = {
 	'format': {
 		'A': {'num_format': '@'},
 		'Time stamp': {'num_format': 'dd-mm-yyyy hh:mm:ss'},
@@ -32,7 +32,7 @@ his_sheet_param = {
 		'User comment': 12
 	}
 }
-rcd_sheet_param = {
+RCD_SHEET_PARAM = {
 	'format': {
 		'Order Time': {'num_format': 'dd-mm-yyyy hh:mm:ss.000', 'align': 'center'},
 		'Feedback Time': {'num_format': 'dd-mm-yyyy hh:mm:ss.000', 'align': 'center'},
@@ -61,7 +61,7 @@ rcd_sheet_param = {
 		'Marked Failed': 8,
 	}
 }
-rcdgroup_sheet_param = {
+RCDGROUP_SHEET_PARAM = {
 	'format': {
 		'Success Rate': {'num_format': '0.00%', 'align': 'center'},
 		'RC Occurences': {'num_format': '0', 'align': 'center'},
@@ -80,7 +80,7 @@ rcdgroup_sheet_param = {
 	},
 	'width': {}
 }
-downtime_sheet_param = {
+RTUDOWN_SHEET_PARAM = {
 	'format': {
 		'Down Time': {'num_format': 'dd-mm-yyyy hh:mm:ss.000', 'align': 'center'},
 		'Up Time': {'num_format': 'dd-mm-yyyy hh:mm:ss.000', 'align': 'center'},
@@ -97,7 +97,7 @@ downtime_sheet_param = {
 		'Annotations': 28
 	}
 }
-downgroup_sheet_param = {
+RTUGROUP_SHEET_PARAM = {
 	'format': {
 		'Downtime Occurences': {'num_format': '0', 'align': 'center'},
 		'Total Downtime': {'num_format': '[hh]:mm:ss', 'align': 'center'},
@@ -118,11 +118,11 @@ downgroup_sheet_param = {
 	}
 }
 
-rcanalyzer_sheet_param = {
-	'format': {**his_sheet_param['format'], **rcd_sheet_param['format'], **rcdgroup_sheet_param['format']},
-	'width': {**his_sheet_param['width'], **rcd_sheet_param['width'], **rcdgroup_sheet_param['width']}
+RCD_BOOK_PARAM = {
+	'format': {**HIS_SHEET_PARAM['format'], **RCD_SHEET_PARAM['format'], **RCDGROUP_SHEET_PARAM['format']},
+	'width': {**HIS_SHEET_PARAM['width'], **RCD_SHEET_PARAM['width'], **RCDGROUP_SHEET_PARAM['width']}
 }
-avremote_sheet_param = {
-	'format': {**his_sheet_param['format'], **downtime_sheet_param['format'], **downgroup_sheet_param['format']},
-	'width': {**his_sheet_param['width'], **downtime_sheet_param['width'], **downgroup_sheet_param['width']}
+RTU_BOOK_PARAM = {
+	'format': {**HIS_SHEET_PARAM['format'], **RTUDOWN_SHEET_PARAM['format'], **RTUGROUP_SHEET_PARAM['format']},
+	'width': {**HIS_SHEET_PARAM['width'], **RTUDOWN_SHEET_PARAM['width'], **RTUGROUP_SHEET_PARAM['width']}
 }

@@ -2,18 +2,19 @@ import pandas as pd
 import re
 from datetime import datetime
 from glob import glob
-from global_parameters import df_columns, df_columns_dtype
-from lib import calc_time, immutable_dict, read_xls, read_xml, similarity_ratio, test_datetime_format
+from global_parameters import RCD_COLUMNS, SOE_COLUMNS, SOE_COLUMNS_DTYPE
+from lib import calc_time, immutable_dict, load_cpoint, load_workbook, read_xml, test_datetime_format
 from pathlib import Path
 from typing import Union
 
 
 class SpectrumFileReader:
-	column_dtype = immutable_dict(df_columns_dtype)
 	
 	def __init__(self, filepaths:Union[str, list], **kwargs):
+		self.column_dtype = immutable_dict(SOE_COLUMNS_DTYPE)
 		self.cpoint_file = 'cpoint.xlsx'
 		self.keep_duplicate = 'last'
+		self.cached_file = {}
 
 		if isinstance(filepaths, str):
 			self.filepaths = []
@@ -48,55 +49,53 @@ class SpectrumFileReader:
 				# If paths is not None
 				for file in self.filepaths:
 					df = self.load_file(file)
-					if type(df)==pd.DataFrame:
+					if isinstance(df, pd.DataFrame):
 						data.append(df)
 					else:
 						return print('Gagal.', end='', flush=True)
 
 			# Combine each Dataframe in data list into one and eleminate duplicated rows
 			df = pd.concat(data).drop_duplicates(keep=self.keep_duplicate)
-
 			# Load point description
-			print('Memuat data "Point Name Description"...', end='', flush=True)
-			try:
-				df_cpoint = read_xls(self.cpoint_file, is_soe=False).fillna('')
-				# Remove duplicates to prevent duplication in merge process
-				self.cpoint_description = self.validate_cpoint(df_cpoint)
-
-				print('\tOK!')
-			except FileNotFoundError:
-				raise FileNotFoundError(f'\tNOK!\nFile "{self.cpoint_file}" tidak ditemukan.')
-			except Exception:
-				raise ValueError(f'\tNOK!\nGagal membuka file "{self.cpoint_file}".')
+			self.cpoint_description = load_cpoint(self.cpoint_file)
 
 			if self._date_range==None: self._date_range = (df['Time stamp'].min(), df['Time stamp'].max())
 			self.sources = ',\n'.join(self.filepaths)
 			
 			self._soe_all = self.prepare_data(df, **kwargs)
-
 			print('Selesai.', end='', flush=True)
 
-	def load_file(self, filepath:str):
+	def load_file(self, filepath:str, **kwargs):
 		"""
 		Loads single excel file into pandas Dataframe.
 		"""
 
-		wb_path = Path(filepath.replace('"', ''))
+		xls = {'SOE': None, 'RCD': None}
+		wb = {}
 		df = None
 
 		print(f'Membuka file "{filepath}"...', end='', flush=True)
 		try:
-			df = read_xls(wb_path)
+			wb = load_workbook(filepath)
+			if 'HIS_MESSAGES' in wb:
+				ws = wb['HIS_MESSAGES']
+				if set(SOE_COLUMNS).issubset(ws.columns):
+					df = ws[ws['Time stamp'].notnull()].fillna('')
+			else:
+				for ws_name, sheet in wb.items():
+					if set(SOE_COLUMNS).issubset(sheet.columns):
+						df = sheet[sheet['Time stamp'].notnull()].fillna('')
+						break
 		except (ValueError, ImportError):
 			try:
 				# Retry to open file with xml format
-				df = read_xml(wb_path)
+				df = read_xml(filepath, **kwargs)
 			except (ValueError, ImportError):
 				print('\tNOK!\nGagal membuka file.')
 		except FileNotFoundError:
 			print('\tNOK!\nFile tidak ditemukan.')
-		
-		if type(df)==pd.DataFrame:
+
+		if isinstance(df, pd.DataFrame):
 			if pd.api.types.is_object_dtype(df['Time stamp']) or pd.api.types.is_object_dtype(df['System time stamp']):
 				df['Time stamp'] = df['Time stamp'].map(lambda x: test_datetime_format(x))
 				df['System time stamp'] = df['System time stamp'].map(lambda x: test_datetime_format(x))
@@ -104,6 +103,17 @@ class SpectrumFileReader:
 			df['B2'] = df['B2'].map(lambda x: re.sub(r'\.\d+', '', str(x)))
 
 			print('\tOK!')
+
+		xls['SOE'] = df
+		if 'RC_ONLY' in wb:
+			try:
+				wsrc = wb['RC_ONLY']
+				xls['RCD'] = wsrc.loc[wsrc['Order Time'].notnull(), RCD_COLUMNS]
+			except KeyError:
+				# print('Warning! Kolom pada sheet "RC_ONLY" tidak sesuai')
+				pass
+
+		self.cached_file[filepath] = xls
 
 		return df
 	
@@ -119,7 +129,7 @@ class SpectrumFileReader:
 			if pd.api.types.is_object_dtype(df[col]): df[col] = df[col].str.strip()
 
 		# Filter new DataFrame
-		new_df = df.loc[(df['A']=='') & (df['Time stamp']>=self.date_range[0]) & (df['Time stamp']<=self.date_range[1]), df_columns].copy()
+		new_df = df.loc[(df['A']=='') & (df['Time stamp']>=self.date_range[0]) & (df['Time stamp']<=self.date_range[1]), SOE_COLUMNS].copy()
 		new_dftype = {key: value for key, value in self.column_dtype.items() if key in new_df.columns}
 
 		new_df = new_df.astype(new_dftype).fillna('')
@@ -129,7 +139,8 @@ class SpectrumFileReader:
 		# Change B1, B2, B3 from description style into mnemonic style
 		if hasattr(self, 'cpoint_description'):
 			df_trans = self.cpoint_description.copy()
-			if new_df['B1'].str.len().max()>7 or new_df['B3'].str.len().max()>7:
+			is_longtext = new_df['B1'].str.len().max()>9 or new_df['B3'].str.len().max()>9
+			if is_longtext:
 				# Swap column labels, because exported His. Messages using description text
 				# ['B1', 'B2', 'B3', 'B1 text', 'B2 text', 'B3 text'] -> ['B1 text', 'B2 text', 'B3 text', 'B1', 'B2', 'B3']
 				df_trans.columns = col2 + col1
@@ -146,12 +157,11 @@ class SpectrumFileReader:
 				# Fill unknown (nan) Point Description B1, B2, B3 with its own text
 				new_df.loc[without_description, col2] = new_df.loc[without_description, col1].values
 
-			if new_df['B1'].str.len().max()>7 or new_df['B3'].str.len().max()>7:
+			if is_longtext:
 				# Swap column labels, because exported His. Messages using description text
-				# Swap columns name
 				new_df[col1 + col2] = new_df[col2 + col1]
 			# Rearrange columns
-			new_df = new_df[df_columns + col2]
+			new_df = new_df[SOE_COLUMNS + col2]
 
 		# Split into DataFrames for each purposes, not reset index
 		self._soe_control_disable = new_df[(new_df['Element']=='CD') & (new_df['Status'].isin(['Disable', 'Enable', 'Dist.']))].copy()
@@ -163,30 +173,7 @@ class SpectrumFileReader:
 
 		return new_df
 
-	def validate_cpoint(self, df:pd.DataFrame, verbose:bool=False):
-		"""
-		"""
 
-		columns_base = ['B1', 'B2', 'B3']
-		columns_text = ['B1 text', 'B2 text', 'B3 text']
-
-		new_df = df.copy().drop_duplicates(subset=columns_base+columns_text).sort_values(['B1', 'B2', 'B3'])
-		# similarity ratio to get better description and remove unwanted data
-		for col in columns_base:
-			new_df[f'{col} ratio'] = new_df.apply(lambda d: similarity_ratio(d[col], d[f'{col} text']), axis=1)
-
-		new_df['Ratio'] = new_df['B1 ratio'] * new_df['B2 ratio'] * new_df['B3 ratio']
-		# get highest similarity ratio
-		new_df = new_df[(new_df['B1']!='') & (new_df['Ratio']>0)]
-
-		filter_highest_ratio = new_df.groupby(columns_base, as_index=False)['Ratio'].transform('max')==new_df['Ratio']
-		new_df = new_df[filter_highest_ratio]
-
-		if verbose:
-			return new_df
-		else:
-			return new_df[columns_base + columns_text]
-	
 	@property
 	def date_range(self):
 		return self._date_range

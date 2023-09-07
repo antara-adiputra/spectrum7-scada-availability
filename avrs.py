@@ -5,7 +5,7 @@ import xlsxwriter
 from datetime import date, datetime, timedelta
 from filereader import SpectrumFileReader
 from glob import glob
-from global_parameters import avremote_sheet_param
+from global_parameters import RTU_BOOK_PARAM
 from lib import read_xls, join_datetime, immutable_dict, progress_bar, timedelta_split
 from ofdb import SpectrumOfdbClient
 from pathlib import Path
@@ -14,7 +14,7 @@ from xlsxwriter.utility import xl_col_to_name
 
 
 class AvRemoteStation:
-	_sheet_parameter = immutable_dict(avremote_sheet_param)
+	_sheet_parameter = immutable_dict(RTU_BOOK_PARAM)
 	table_size = 50
 	table_columns = ['Down Time', 'Up Time', 'RTU', 'Long Name', 'Duration', 'Annotations']
 	maintenance_mark = '**maintenance**'
@@ -318,7 +318,7 @@ class AvRemoteStation:
 		down_count = df[groupby_columns].groupby(columns, as_index=False).count().rename(columns={'Duration': 'Downtime Occurences'})
 		down_agg = df[groupby_columns].groupby(columns).agg(['sum', 'mean', 'max']).reset_index()
 		down_agg.columns = ['RTU', 'Long Name', 'Total Downtime', 'Average Downtime', 'Longest Downtime']
-		filter_max_downtime = df.groupby(columns, as_index=False)['Duration'].transform(max)==df['Duration']
+		filter_max_downtime = df.groupby(columns, as_index=False)['Duration'].transform('max')==df['Duration']
 		down_max_t = df[columns + ['Down Time']][filter_max_downtime].rename(columns={'Down Time': 'Longest Downtime Date'})
 
 		# Merge table and fill NaN Downtime Occurences to 0

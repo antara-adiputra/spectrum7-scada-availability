@@ -4,7 +4,7 @@ import sqlalchemy as sa
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher, get_close_matches
 from glob import glob
-from global_parameters import df_columns
+from global_parameters import SOE_COLUMNS
 from lxml import etree as et
 from types import MappingProxyType
 
@@ -83,6 +83,41 @@ def join_datetime(dt:pd.Series, ms:pd.Series):
 	"""Combine His. Messages style of separated datetime timestamp and milliseconds"""
 
 	return pd.to_datetime(dt) + pd.to_timedelta(ms, unit='ms')
+
+def load_cpoint(path:str):
+	"""
+	"""
+	
+	# Load point description
+	print('\nMemuat data "Point Name Description"...', end='', flush=True)
+	try:
+		# Open first sheet
+		df_cpoint = pd.read_excel(path, sheet_name=0).fillna('')
+		# Remove duplicates to prevent duplication in merge process
+		cpoint = validate_cpoint(df_cpoint)
+		print('\tOK!')
+	except FileNotFoundError:
+		raise FileNotFoundError(f'\tNOK!\nFile "{path}" tidak ditemukan.')
+	except Exception:
+		raise ValueError(f'\tNOK!\nGagal membuka file "{path}".')
+	
+	return cpoint
+	
+def load_workbook(filepath:str):
+	"""
+	Load whole excel file as dict of worksheets.
+	"""
+
+	wb = {}
+
+	try:
+		wb = pd.read_excel(filepath, sheet_name=None)
+	except FileNotFoundError:
+		raise FileNotFoundError
+	except Exception:
+		raise ImportError
+	
+	return wb
 	
 def progress_bar(value:float, width:int=0, style:str='full-block'):
 	symbol = {'full-block': '█', 'left-half-block': '▌', 'right-half-block': '▐'}
@@ -96,36 +131,31 @@ def progress_bar(value:float, width:int=0, style:str='full-block'):
 		print(f'\r {"Selesai... 100%".ljust(width, " ")}', flush=True)
 
 def read_xls(filepath:str, sheet:str=None, is_soe:bool=True, **kwargs):
-	try:
-		wb = pd.read_excel(filepath, sheet_name=None)
-	except FileNotFoundError:
-		raise FileNotFoundError
-	except Exception:
-		raise ImportError
+	"""
+	"""
+
+	wb = load_workbook(filepath)
 
 	if sheet:
 		if sheet in wb:
 			df = wb[sheet]
 		else:
-			raise KeyError(f'Nama sheet "{sheet}" tidak ditemukan.')
+			raise KeyError(f'Sheet "{sheet}" tidak ditemukan.')
 	else:
 		if is_soe:
 			for ws_name, sheet in wb.items():
-				if set(df_columns).issubset(sheet.columns):
-					# print(f'\rMembuka file "{filepath}" sheet {ws_name}', end='', flush=True)
+				if set(SOE_COLUMNS).issubset(sheet.columns):
 					df = sheet[sheet['Time stamp'].notnull()].fillna('')
 					break
 		else:
 			df = list(wb.values())[0]
 
 	if df.shape[0]>0:
-		# print(f'\tOK!', flush=True)
 		return df
 	else:
-		# print(f'\tNOK!', flush=True)
 		raise ValueError
 
-def read_xml(filepath:str):
+def read_xml(filepath:str, **kwargs):
 	columns, rows = [], []
 	
 	try:
@@ -185,6 +215,31 @@ def timedelta_split(td:timedelta):
 
 def test():
 	pass
+
+def validate_cpoint(df:pd.DataFrame, verbose:bool=False):
+	"""
+	"""
+
+	columns_base = ['B1', 'B2', 'B3']
+	columns_text = ['B1 text', 'B2 text', 'B3 text']
+
+	new_df = df.copy().drop_duplicates(subset=columns_base+columns_text).sort_values(['B1', 'B2', 'B3'])
+	# similarity ratio to get better description and remove unwanted data
+	for col in columns_base:
+		new_df[f'{col} ratio'] = new_df.apply(lambda d: similarity_ratio(d[col], d[f'{col} text']), axis=1)
+
+	new_df['Ratio'] = new_df['B1 ratio'] * new_df['B2 ratio'] * new_df['B3 ratio']
+	# get highest similarity ratio
+	new_df = new_df[(new_df['B1']!='') & (new_df['Ratio']>0)]
+
+	filter_highest_ratio = new_df.groupby(columns_base, as_index=False)['Ratio'].transform('max')==new_df['Ratio']
+	new_df = new_df[filter_highest_ratio]
+
+	if verbose:
+		return new_df
+	else:
+		return new_df[columns_base + columns_text]
+
 	
 if __name__ == '__main__':
 	test()

@@ -3,8 +3,8 @@ import socket
 import sqlalchemy as sa
 from configparser import ConfigParser
 from datetime import datetime, timedelta
-from global_parameters import df_columns, df_columns_dtype
-from lib import calc_time, immutable_dict, read_xls, similarity_ratio
+from global_parameters import SOE_COLUMNS, SOE_COLUMNS_DTYPE
+from lib import calc_time, immutable_dict, load_cpoint, validate_cpoint
 from typing import Union
 
 
@@ -17,7 +17,7 @@ class SpectrumOfdbClient:
 		self._dbotbl_hismsg = 'dbo.scd_his_message'
 		# Timezone for Asia/Makassar
 		self.tzone = timedelta(hours=8)
-		self.column_dtype = immutable_dict(df_columns_dtype)
+		self.column_dtype = immutable_dict(SOE_COLUMNS_DTYPE)
 		self.cpoint_file = 'cpoint.xlsx'
 		self.keep_duplicate = 'last'
 		self.his_filter = {
@@ -54,19 +54,10 @@ class SpectrumOfdbClient:
 
 		# Automatically update Point Description
 		if self.check():
-			print('Mengupdate "Point Name Description"...')
 			self.dump_point_description()
 		else:
 			# Load point description
-			print('Memuat data "Point Name Description"...', end='', flush=True)
-			try:
-				df = read_xls(self.cpoint_file, is_soe=False).fillna('')
-				self._cpoint_description = self.validate_cpoint(df)
-				print('\tOK!')
-			except FileNotFoundError:
-				raise FileNotFoundError(f'\tNOK!\nFile "{self.cpoint_file}" tidak ditemukan.')
-			except Exception:
-				raise ValueError(f'\tNOK!\nGagal membuka file "{self.cpoint_file}".')
+			self.cpoint_description = load_cpoint(self.cpoint_file)
 	
 	def all(self, force:bool=False, **kwargs):
 		"""
@@ -109,12 +100,13 @@ class SpectrumOfdbClient:
 		Store point name description.
 		"""
 
+		print('\nMengupdate "Point Name Description"...')
 		if force:
 			df = self.read_query_cpoint(force=True)
 		else:
 			df = self.cpoint_description
 
-		self._cpoint_description = self.validate_cpoint(df)
+		self._cpoint_description = validate_cpoint(df)
 
 		print('Menyimpan kedalam file...', end='', flush=True)
 		self.cpoint_description.to_excel(self.cpoint_file, index=False)
@@ -279,7 +271,7 @@ class SpectrumOfdbClient:
 		col1 = ['B1', 'B2', 'B3']
 		col2 = ['B1 text', 'B2 text', 'B3 text']
 
-		new_df = pd.DataFrame(columns=df_columns)
+		new_df = pd.DataFrame(columns=SOE_COLUMNS)
 
 		for col in df.columns:
 			new_col = columns_name[col]
@@ -563,30 +555,6 @@ class SpectrumOfdbClient:
 		self._conn_user = connection_conf.get('user')
 		self._conn_pswd = connection_conf.get('pass')
 		self.database_driver = connection_conf.get('driver', 'SQL Server')
-
-	def validate_cpoint(self, df:pd.DataFrame, verbose:bool=False):
-		"""
-		"""
-
-		columns_base = ['B1', 'B2', 'B3']
-		columns_text = ['B1 text', 'B2 text', 'B3 text']
-
-		new_df = df.copy().drop_duplicates(subset=columns_base+columns_text).sort_values(['B1', 'B2', 'B3'])
-		# similarity ratio to get better description and remove unwanted data
-		for col in columns_base:
-			new_df[f'{col} ratio'] = new_df.apply(lambda d: similarity_ratio(d[col], d[f'{col} text']), axis=1)
-
-		new_df['Ratio'] = new_df['B1 ratio'] * new_df['B2 ratio'] * new_df['B3 ratio']
-		# get highest similarity ratio
-		new_df = new_df[(new_df['B1']!='') & (new_df['Ratio']>0)]
-
-		filter_highest_ratio = new_df.groupby(columns_base, as_index=False)['Ratio'].transform(max)==new_df['Ratio']
-		new_df = new_df[filter_highest_ratio]
-
-		if verbose:
-			return new_df
-		else:
-			return new_df[columns_base + columns_text]
 
 
 	@property
