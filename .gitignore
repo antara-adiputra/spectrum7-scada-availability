@@ -162,6 +162,7 @@ cython_debug/
 # Additional user file
 .conf
 .config
+.default
 .setting
 cpoint.xlsx
 output/
