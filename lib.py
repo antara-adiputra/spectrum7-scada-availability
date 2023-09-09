@@ -1,12 +1,12 @@
 import os, time
-import pandas as pd
-import sqlalchemy as sa
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher, get_close_matches
 from glob import glob
-from global_parameters import SOE_COLUMNS
-from lxml import etree as et
 from types import MappingProxyType
+
+import pandas as pd
+from lxml import etree as et
+from global_parameters import SOE_COLUMNS
 
 
 # decorator to calculate duration
@@ -87,7 +87,7 @@ def join_datetime(dt:pd.Series, ms:pd.Series):
 def load_cpoint(path:str):
 	"""
 	"""
-	
+
 	# Load point description
 	print('\nMemuat data "Point Name Description"...', end='', flush=True)
 	try:

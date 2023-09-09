@@ -1,16 +1,20 @@
-import pandas as pd
 import socket
-import sqlalchemy as sa
 from configparser import ConfigParser
 from datetime import datetime, timedelta
+from typing import Union
+
+import pandas as pd
+import pyodbc
+import sqlalchemy as sa
 from global_parameters import SOE_COLUMNS, SOE_COLUMNS_DTYPE
 from lib import calc_time, immutable_dict, load_cpoint, validate_cpoint
-from typing import Union
 
 
 class SpectrumOfdbClient:
+	__slot__ = ['connection_driver', 'switching_element']
 
-	def __init__(self, setting:dict={}, **kwargs):
+	def __init__(self, host:str=None, port:str=None, user:str=None, pswd:str=None, database:str=None, **kwargs):
+		self._conf_path = '.config'
 		self._dbotbl_analog = 'dbo.scd_his_10_anat'
 		self._dbotbl_cpoint = 'dbo.scd_c_point'
 		self._dbotbl_digital = 'dbo.scd_his_11_digitalt'
@@ -32,17 +36,23 @@ class SpectrumOfdbClient:
 			'path4': 'IFS-RTU'
 		}
 
-		if 'host' in setting and 'port' in setting and 'user' in setting and 'pswd' in setting and 'database' in setting:
-			self._conn_host = setting['host']
-			self._conn_port = setting['port']
-			self._conn_dtbs = setting['database']
-			self._conn_user = setting['user']
-			self._conn_pswd = setting['pswd']
-			self.database_driver = 'SQL Server'
-		else:
-			self.use_default_setting()
+		# Load configuration
+		self.setting = ConfigParser(default_section='GENERAL')
+		self.setting.read(self._conf_path)
 
-		self.sources = f'DRIVER={"SQL Server"};SERVER={self._conn_host};PORT={self._conn_port};'
+		if self.setting.has_section('CONNECTION'):
+			c = self.setting['CONNECTION']
+			odbc_driver = c.get('DRIVER')
+			if host is not None and port is not None and user is not None and pswd is not None and database is not None:
+				self.use_connection(host=host, port=port, user=user, pswd=pswd, database=database, driver=odbc_driver)
+			else:
+				self.use_connection(host=c.get('HOST'), port=c.get('PORT'), user=c.get('USER'), pswd=c.get('PSWD'), database=c.get('DATABASE'), driver=odbc_driver)
+		else:
+			# .config file can be not exist or no connection section
+			self.setting.add_section('CONNECTION')
+			self.use_connection()
+
+		self.sources = f'DRIVER={self._conn_driver};SERVER={self._conn_host};PORT={self._conn_port};'
 		self.switching_element = kwargs['switching_element'] if 'switching_element' in kwargs else ['CB']
 
 		# Set date_range if defined in kwargs
@@ -57,7 +67,13 @@ class SpectrumOfdbClient:
 			self.dump_point_description()
 		else:
 			# Load point description
-			self.cpoint_description = load_cpoint(self.cpoint_file)
+			self._cpoint_description = load_cpoint(self.cpoint_file)
+
+		# Dynamically update defined variable
+		# This code should be placed at the end of __init__
+		for key, value in kwargs.items():
+			if key in self.__slot__:
+				setattr(self, key, value)
 	
 	def all(self, force:bool=False, **kwargs):
 		"""
@@ -334,7 +350,7 @@ class SpectrumOfdbClient:
 
 		if self.check():
 			# Server connection OK
-			connection_string = f'DRIVER={self.database_driver};SERVER={self._conn_host};PORT={self._conn_port};DATABASE={self._conn_dtbs};UID={self._conn_user};PWD={self._conn_pswd};Trusted_Connection=No;'
+			connection_string = f'DRIVER={self._conn_driver};SERVER={self._conn_host};PORT={self._conn_port};DATABASE={self._conn_database};UID={self._conn_user};PWD={self._conn_pswd};Trusted_Connection=No;'
 			connection_url = sa.engine.URL.create('mssql+pyodbc', query={"odbc_connect": connection_string})
 			engine = sa.create_engine(connection_url)
 
@@ -514,6 +530,79 @@ class SpectrumOfdbClient:
 			
 			return df_list
 
+	def save_connection(self, prompt:bool=True):
+		"""
+		"""
+
+		__slot__ = ['host', 'port', 'user', 'pswd', 'database', 'driver']
+
+		commit = False
+
+		if prompt:
+			if input('Simpan konfigurasi? [yes/no] ').lower() in ['yes', 'y']:
+				commit = True
+		else:
+			commit = True
+
+		if commit:
+			for opt in __slot__:
+				self.setting.set('CONNECTION', opt.upper(), getattr(self, f'_conn_{opt}', ''))
+
+			# Save config file
+			with open(self._conf_path, 'w') as conf:
+				self.setting.write(conf)
+
+	def select_driver(self):
+		"""
+		"""
+
+		retry = 0
+		drivers = pyodbc.drivers()
+		if drivers:
+			valid = False
+			print('List driver ODBC yang terinstall :')
+			
+			for i, d in enumerate(drivers):
+				print(f'{i+1}. {d}')
+			
+			while not valid:
+				sel = input(f'\nPilih driver (1-{len(drivers)}) : ')
+				try:
+					odbc_driver = drivers[int(sel)-1]
+					valid = True
+				except Exception:
+					retry += 1
+
+				if retry>=3:
+					raise ValueError('Program terhenti. Gagal 3 kali percobaan.')
+			
+			return odbc_driver
+		else:
+			raise ImportError('Tidak ada driver ODBC yang terinstall!')
+
+	def use_connection(self, **conf):
+		"""
+		"""
+
+		__slot__ = ['host', 'port', 'user', 'pswd', 'database', 'driver']
+
+		if conf:
+			# Set connection parameter
+			for opt, val in conf.items():
+				if opt in __slot__:
+					setattr(self, f'_conn_{opt.lower()}', str(val))
+				else:
+					raise KeyError(f'Variabel {opt} tidak dikenal!')
+		else:
+			self._conn_host = input('Host\t\t: ')
+			self._conn_port = input('Port\t\t: ')
+			self._conn_user = input('User\t\t: ')
+			self._conn_pswd = input('Password\t: ')
+			self._conn_database = input('Database\t: ')
+			print('')
+			self._conn_driver = self.select_driver()
+			self.save_connection(prompt=False)
+
 	def set_date_range(self, date_start:datetime, date_stop:datetime=None):
 		"""
 		Set start and stop date of query data.
@@ -544,17 +633,6 @@ class SpectrumOfdbClient:
 		self.date_isset = True
 
 		return dt0, dt1
-
-	def use_default_setting(self):
-		conf = ConfigParser()
-		conf.read('.default.ini')
-		connection_conf = conf['CONNECTION']
-		self._conn_host = connection_conf.get('host')
-		self._conn_port = connection_conf.get('port')
-		self._conn_dtbs = connection_conf.get('database')
-		self._conn_user = connection_conf.get('user')
-		self._conn_pswd = connection_conf.get('pass')
-		self.database_driver = connection_conf.get('driver', 'SQL Server')
 
 
 	@property

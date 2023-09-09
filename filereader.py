@@ -1,14 +1,15 @@
-import pandas as pd
 import re
-from datetime import datetime
+from configparser import ConfigParser
 from glob import glob
+from typing import Union
+
+import pandas as pd
 from global_parameters import RCD_COLUMNS, SOE_COLUMNS, SOE_COLUMNS_DTYPE
 from lib import calc_time, immutable_dict, load_cpoint, load_workbook, read_xml, test_datetime_format
-from pathlib import Path
-from typing import Union
 
 
 class SpectrumFileReader:
+	__slot__ = ['switching_element']
 	
 	def __init__(self, filepaths:Union[str, list], **kwargs):
 		self.column_dtype = immutable_dict(SOE_COLUMNS_DTYPE)
@@ -35,6 +36,12 @@ class SpectrumFileReader:
 			self._date_range = (kwargs['date_start'].replace(hour=0, minute=0, second=0, microsecond=0), kwargs['date_stop'].replace(hour=23, minute=59, second=59, microsecond=999999))
 		else:
 			self._date_range = None
+
+		# Dynamically update defined variable
+		# This code should be placed at the end of __init__
+		for key, value in kwargs.items():
+			if key in self.__slot__:
+				setattr(self, key, value)
 
 	@calc_time
 	def load(self, force:bool=False, **kwargs):
