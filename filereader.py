@@ -8,17 +8,19 @@ from global_parameters import RCD_COLUMNS, SOE_COLUMNS, SOE_COLUMNS_DTYPE
 from lib import calc_time, immutable_dict, load_cpoint, load_workbook, read_xml, test_datetime_format
 
 
-class SpectrumFileReader:
+class _FileReader:
 	__slot__ = ['switching_element']
-	
+	column_list = []
+	keep_duplicate = 'last'
+	sheet_name = 'Sheet1'
+	time_series_column = 'Timestamp'
+
 	def __init__(self, filepaths:Union[str, list], **kwargs):
-		self.column_dtype = immutable_dict(SOE_COLUMNS_DTYPE)
-		self.cpoint_file = 'cpoint.xlsx'
-		self.keep_duplicate = 'last'
+		self._date_range = None
 		self.cached_file = {}
+		self.filepaths = []
 
 		if isinstance(filepaths, str):
-			self.filepaths = []
 			for f in filepaths.split(','):
 				if '*' in f:
 					self.filepaths += glob(f.strip())
@@ -26,16 +28,15 @@ class SpectrumFileReader:
 					self.filepaths.append(f.strip())
 		elif isinstance(filepaths, list):
 			self.filepaths = filepaths
-		else:
-			self.filepaths = None
 
 		self.switching_element = kwargs['switching_element'] if 'switching_element' in kwargs else ['CB']
 			
 		# Set date_range if defined in kwargs
 		if 'date_start' in kwargs and 'date_stop' in kwargs:
-			self._date_range = (kwargs['date_start'].replace(hour=0, minute=0, second=0, microsecond=0), kwargs['date_stop'].replace(hour=23, minute=59, second=59, microsecond=999999))
-		else:
-			self._date_range = None
+			self.set_date_range(
+				date_start=kwargs['date_start'].replace(hour=0, minute=0, second=0, microsecond=0),
+				date_stop=kwargs['date_stop'].replace(hour=23, minute=59, second=59, microsecond=999999)
+			)
 
 		# Dynamically update defined variable
 		# This code should be placed at the end of __init__
@@ -43,56 +44,71 @@ class SpectrumFileReader:
 			if key in self.__slot__:
 				setattr(self, key, value)
 
+		df = self.load()
+		self.post_load(df)
+		# Need this for cooperative multiple-inheritance
+		super().__init__(**kwargs)
+
 	@calc_time
-	def load(self, force:bool=False, **kwargs):
+	def load(self, **kwargs):
 		"""
 		Load every file in filepaths.
 		"""
 
-		if force or not hasattr(self, '_soe_all'):
-			data = []
+		data = []
 
-			if self.filepaths:
-				# If paths is not None
-				for file in self.filepaths:
-					df = self.load_file(file)
-					if isinstance(df, pd.DataFrame):
-						data.append(df)
-					else:
-						return print('Gagal.', end='', flush=True)
+		if self.filepaths:
+			# If paths is not None
+			for file in self.filepaths:
+				df = self.open_file(filepath=file)
+				if isinstance(df, pd.DataFrame):
+					df = self.post_open_file(df)
+					data.append(df)
+				else:
+					print('Gagal.', end='', flush=True)
+					raise ValueError('Gagal mengimport file.')
 
 			# Combine each Dataframe in data list into one and eleminate duplicated rows
-			df = pd.concat(data).drop_duplicates(keep=self.keep_duplicate)
-			# Load point description
-			self.cpoint_description = load_cpoint(self.cpoint_file)
-
-			if self._date_range==None: self._date_range = (df['Time stamp'].min(), df['Time stamp'].max())
+			df_merged = pd.concat(data).drop_duplicates(keep=self.keep_duplicate)
+		
 			self.sources = ',\n'.join(self.filepaths)
-			
-			self._soe_all = self.prepare_data(df, **kwargs)
 			print('Selesai.', end='', flush=True)
+			return df_merged
+		else:
+			raise FileExistsError('Error lokasi file.')
 
-	def load_file(self, filepath:str, **kwargs):
+	def post_load(self, df:pd.DataFrame):
+		"""
+		Executed after load completed.
+		"""
+
+		if self._date_range==None: self.set_date_range(date_start=df[self.time_series_column].min(), date_stop=df[self.time_series_column].max())
+
+	def open_file(self, filepath:str, **kwargs):
 		"""
 		Loads single excel file into pandas Dataframe.
 		"""
 
-		xls = {'SOE': None, 'RCD': None}
 		wb = {}
 		df = None
 
 		print(f'Membuka file "{filepath}"...', end='', flush=True)
 		try:
 			wb = load_workbook(filepath)
-			if 'HIS_MESSAGES' in wb:
-				ws = wb['HIS_MESSAGES']
-				if set(SOE_COLUMNS).issubset(ws.columns):
-					df = ws[ws['Time stamp'].notnull()].fillna('')
+			if self.sheet_name in wb:
+				ws = wb[self.sheet_name]
+				if set(self.column_list).issubset(ws.columns):
+					df = ws[ws[self.time_series_column].notnull()].fillna('')
+					print('\tOK!')
 			else:
 				for ws_name, sheet in wb.items():
-					if set(SOE_COLUMNS).issubset(sheet.columns):
-						df = sheet[sheet['Time stamp'].notnull()].fillna('')
+					if set(self.column_list).issubset(sheet.columns):
+						df = sheet[sheet[self.time_series_column].notnull()].fillna('')
+						print('\tOK!')
 						break
+				
+				if df==None: print(f'\nData "{self.sheet_name}" tidak ditemukan!')
+
 		except (ValueError, ImportError):
 			try:
 				# Retry to open file with xml format
@@ -102,28 +118,75 @@ class SpectrumFileReader:
 		except FileNotFoundError:
 			print('\tNOK!\nFile tidak ditemukan.')
 
-		if isinstance(df, pd.DataFrame):
-			if pd.api.types.is_object_dtype(df['Time stamp']) or pd.api.types.is_object_dtype(df['System time stamp']):
-				df['Time stamp'] = df['Time stamp'].map(lambda x: test_datetime_format(x))
-				df['System time stamp'] = df['System time stamp'].map(lambda x: test_datetime_format(x))
-			# Format B2 as string value
-			df['B2'] = df['B2'].map(lambda x: re.sub(r'\.\d+', '', str(x)))
-
-			print('\tOK!')
-
-		xls['SOE'] = df
-		if 'RC_ONLY' in wb:
-			try:
-				wsrc = wb['RC_ONLY']
-				xls['RCD'] = wsrc.loc[wsrc['Order Time'].notnull(), RCD_COLUMNS]
-			except KeyError:
-				# print('Warning! Kolom pada sheet "RC_ONLY" tidak sesuai')
-				pass
-
-		self.cached_file[filepath] = xls
+		self.cached_file[filepath] = df
 
 		return df
-	
+
+	def post_open_file(self, df:pd.DataFrame):
+		"""
+		Post processing after file opened.
+		"""
+
+		return df
+
+	def set_date_range(self, date_start, date_stop):
+		"""
+		"""
+
+		dtstart = date_start.to_pydatetime() if isinstance(date_start, pd.Timestamp) else date_start
+		dtstop = date_stop.to_pydatetime() if isinstance(date_stop, pd.Timestamp) else date_stop
+
+		self._date_start = dtstart
+		self._date_stop = dtstop
+		self._date_range = (dtstart, dtstop)
+
+
+	@property
+	def date_range(self):
+		return self._date_range
+
+	@property
+	def date_start(self):
+		return self._date_start
+
+	@property
+	def date_stop(self):
+		return self._date_stop
+
+
+class SpectrumFileReader(_FileReader):
+	column_dtype = immutable_dict(SOE_COLUMNS_DTYPE)
+	column_list = SOE_COLUMNS
+	sheet_name = 'HIS_MESSAGES'
+	time_series_column = 'Time stamp'
+	cpoint_file = 'cpoint.xlsx'
+
+	def __init__(self, filepaths:Union[str, list], **kwargs):
+		# Need this for cooperative multiple-inheritance
+		super().__init__(filepaths, **kwargs)
+		# Load point description
+		self.cpoint_description = load_cpoint(self.cpoint_file)
+
+	def post_load(self, df:pd.DataFrame):
+		"""
+		Executed after load completed.
+		"""
+
+		super().post_load(df)
+		self._soe_all = self.prepare_data(df)
+
+	def post_open_file(self, df:pd.DataFrame):
+		"""
+		"""
+
+		if pd.api.types.is_object_dtype(df['Time stamp']) or pd.api.types.is_object_dtype(df['System time stamp']):
+			df['Time stamp'] = df['Time stamp'].map(lambda x: test_datetime_format(x))
+			df['System time stamp'] = df['System time stamp'].map(lambda x: test_datetime_format(x))
+		# Format B2 as string value
+		df['B2'] = df['B2'].map(lambda x: re.sub(r'\.\d+', '', str(x)))
+
+		return super().post_open_file(df)
+
 	def prepare_data(self, df:pd.DataFrame, **kwargs):
 		"""
 		"""
@@ -136,7 +199,7 @@ class SpectrumFileReader:
 			if pd.api.types.is_object_dtype(df[col]): df[col] = df[col].str.strip()
 
 		# Filter new DataFrame
-		new_df = df.loc[(df['A']=='') & (df['Time stamp']>=self.date_range[0]) & (df['Time stamp']<=self.date_range[1]), SOE_COLUMNS].copy()
+		new_df = df.loc[(df['A']=='') & (df[self.time_series_column]>=self.date_range[0]) & (df[self.time_series_column]<=self.date_range[1]), self.column_list].copy()
 		new_dftype = {key: value for key, value in self.column_dtype.items() if key in new_df.columns}
 
 		new_df = new_df.astype(new_dftype).fillna('')
@@ -182,10 +245,6 @@ class SpectrumFileReader:
 
 
 	@property
-	def date_range(self):
-		return self._date_range
-
-	@property
 	def soe_all(self):
 		return self._soe_all if hasattr(self, '_soe_all') else self.load()
 
@@ -213,6 +272,48 @@ class SpectrumFileReader:
 	def soe_trip(self):
 		return self._soe_trip if hasattr(self, '_soe_trip') else self.load()
 	
+
+class RCFileReader(_FileReader):
+	column_list = RCD_COLUMNS
+	sheet_name = 'RC_ONLY'
+	time_series_column = 'Order Time'
+
+	def __init__(self, filepaths:Union[str, list], **kwargs):
+		# Need this for cooperative multiple-inheritance
+		super().__init__(filepaths, **kwargs)
+
+	def post_load(self, df:pd.DataFrame):
+		"""
+		Executed after load completed.
+		"""
+
+		super().post_load(df)
+		self._rcd_all = self.prepare_data(df)
+
+	def post_open_file(self, df:pd.DataFrame):
+		"""
+		"""
+
+		# Format B2 as string value
+		df['B2'] = df['B2'].map(lambda x: re.sub(r'\.\d+', '', str(x)))
+
+		return super().post_open_file(df)
+
+	def prepare_data(self, df:pd.DataFrame, **kwargs):
+		"""
+		"""
+
+		# Filter new DataFrame
+		new_df = df.loc[(df[self.time_series_column]>=self.date_range[0]) & (df[self.time_series_column]<=self.date_range[1]), self.column_list].copy()
+		new_df = new_df.sort_values([self.time_series_column], ascending=[True]).reset_index(drop=True)
+
+		return new_df
+
+
+	@property
+	def rcd_all(self):
+		return self._rcd_all if hasattr(self, '_rcd_all') else self.load()
+
 
 def main():
 	pass
