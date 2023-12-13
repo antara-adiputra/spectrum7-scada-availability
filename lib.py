@@ -1,10 +1,13 @@
-import os, time
+import os, platform, time
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher, get_close_matches
 from glob import glob
+from pathlib import Path
 from types import MappingProxyType
 
 import pandas as pd
+import xlsxwriter
+from xlsxwriter.utility import xl_col_to_name
 from lxml import etree as et
 from global_parameters import SOE_COLUMNS
 
@@ -239,6 +242,137 @@ def validate_cpoint(df:pd.DataFrame, verbose:bool=False):
 		return new_df
 	else:
 		return new_df[columns_base + columns_text]
+
+
+class BaseExportMixin:
+	_sheet_parameter = immutable_dict({})
+	base_dir = Path(__file__).parent.resolve()
+	output_dir = base_dir / 'output'
+	output_extension = 'xlsx'
+	output_prefix = ''
+
+	def _worksheet_writer(self, workbook:xlsxwriter.Workbook, sheet_name:str, sheet_data:pd.DataFrame, *extra_data):
+		"""
+		"""
+
+		ws = workbook.add_worksheet(sheet_name)
+		# Worksheet formatting
+		format_header = {'num_format': '@', 'border': 1, 'bold': True, 'align': 'center', 'valign': 'top', 'bg_color': '#ededed'}
+		format_base = {'valign': 'vcenter'}
+		format_footer = {'bold': True, 'bg_color': '#dcdcdc'}
+
+		nrow, ncol = sheet_data.shape
+		tbl_header = sheet_data.columns.to_list()
+
+		for x, col in enumerate(tbl_header):
+			# Write table header
+			ws.write(0, x, col, workbook.add_format({**self._sheet_parameter['format'].get(col, {}), **format_header}))
+			# Write table body
+			ws.write_column(1, x, sheet_data[col].fillna(''), workbook.add_format({**self._sheet_parameter['format'].get(col, {}), **format_base}))
+			# Append row if any
+			if extra_data:
+				try:
+					# Extra data must be in DataFrame type
+					ext_row = extra_data[0].shape[0]
+					if col in extra_data[0].columns:
+						ws.write_column(nrow+1, x, extra_data[0][col], workbook.add_format({**self._sheet_parameter['format'].get(col, {}), **format_footer}))
+					else:
+						ws.write_column(nrow+1, x, ['']*ext_row, workbook.add_format({**self._sheet_parameter['format'].get(col, {}), **format_footer}))
+				except Exception:
+					print(f'ERROR! Footer kolom "{col}"')
+
+		# Set worksheet general parameter
+		ws.set_paper(9)	# 9 = A4
+		ws.set_landscape()
+		ws.set_margins(0.25)
+		ws.center_horizontally()
+		ws.print_area(0, 0, nrow, ncol-1)
+		ws.autofilter(0, 0, 0, ncol-1)
+		ws.autofit()
+		ws.freeze_panes(1, 0)
+		ws.ignore_errors({'number_stored_as_text': f'A:{xl_col_to_name(ncol-1)}'})
+
+		# Set columns width
+		for x1, col1 in enumerate(tbl_header):
+			if col1 in self._sheet_parameter['width']: ws.set_column(x1, x1, self._sheet_parameter['width'].get(col1))
+
+	def get_xls_properties(self):
+		"""
+		"""
+
+		return {
+			'title': f'Hasil kalkulasi {self.name} tanggal {self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")}',
+			'subject': f'{self.name}',
+			'author': f'Python {platform.python_version()}',
+			'manager': 'Fasop SCADA',
+			'company': 'PLN UP2B Sistem Makassar',
+			'category': 'Excel Automation',
+			'comments': f'File digenerate otomatis oleh program {self.name}'
+		}
+
+	def get_xls_filename(self):
+		"""
+		"""
+
+		return f'{self.output_prefix}_Output_{self.t0.strftime("%Y%m%d")}-{self.t1.strftime("%Y%m%d")}'
+
+	def get_sheet_info_data(self, **kwargs):
+		"""
+		"""
+
+		return [
+			('Source File', self.sources),
+			('Output File', f'{kwargs.get("filepath", "")}'),
+			('RC Date Range', f'{self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")}'),
+			('Processed Date', self.process_date.strftime('%d-%m-%Y %H:%M:%S')),
+			('Execution Time', f'{self.process_duration}s'),
+			('PC', platform.node()),
+			('User', os.getlogin())
+		]
+
+	def prepare_export(self, **kwargs):
+		return super().prepare_export(**kwargs)
+
+	def to_excel(self, **kwargs):
+		"""
+		"""
+
+		sheets_data = self.prepare_export(generate_formula=True, **kwargs)
+
+		# Check target directory of output file
+		if not os.path.isdir(self.output_dir): os.mkdir(self.output_dir)
+
+		filename = self.get_xls_filename()
+		file_list = glob(f'{self.output_dir}/{filename}*.{self.output_extension}')
+
+		if len(file_list)>0: filename += f'_rev{len(file_list)}'
+
+		output_file_properties = self.get_xls_properties()
+		output_filepath = self.output_dir / f'{filename}.{self.output_extension}'
+
+		# Create excel file
+		with xlsxwriter.Workbook(output_filepath) as wb:
+			# Set excel workbook file properties
+			wb.set_properties(output_file_properties)
+
+			for name, sheet in sheets_data.items():
+				if isinstance(sheet, (tuple, list)):
+					self._worksheet_writer(wb, name, sheet[0], *sheet[1:])
+				else:
+					self._worksheet_writer(wb, name, sheet)
+
+			# Write worksheet info
+			ws_info = wb.add_worksheet('Info')
+			rows = self.get_sheet_info_data(filepath=output_filepath)
+
+			for i, row in enumerate(rows):
+				ws_info.write_row(i, 0, row)
+
+			ws_info.autofit()
+			ws_info.set_column(0, 0, None, wb.add_format({'valign': 'vcenter', 'num_format': '@', 'bold': True}))
+			ws_info.set_column(1, 1, 100, wb.add_format({'valign': 'vcenter', 'num_format': '@', 'text_wrap': True}))
+
+		print(f'Data berhasil di-export pada "{self.output_dir / filename}.{self.output_extension}".')
 
 	
 if __name__ == '__main__':

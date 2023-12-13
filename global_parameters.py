@@ -1,6 +1,71 @@
-SOE_COLUMNS = ['A', 'Time stamp', 'Milliseconds', 'System time stamp', 'System milliseconds', 'B1', 'B2', 'B3', 'Element', 'Status', 'Tag', 'Operator', 'Comment', 'User comment']
-SOE_COLUMNS_DTYPE = {'A': 'str', 'Time stamp': 'datetime64[s]', 'Milliseconds': 'float32', 'System time stamp': 'datetime64[s]', 'System milliseconds': 'float32', 'B1': 'str', 'B2': 'str', 'B3': 'str', 'Element': 'str', 'Description': 'str', 'Status': 'str', 'Priority': 'uint16', 'Tag': 'str', 'Operator': 'str', 'Message class': 'str', 'Comment': 'str', 'User comment': 'str', 'SoE': 'str'}
-RCD_COLUMNS = ['Order Time', 'Feedback Time', 'B1', 'B2', 'B3', 'Element', 'Status', 'Tag', 'Operator', 'Pre Result', 'Execution (s)', 'Termination (s)', 'TxRx (s)', 'Rep. Flag', 'Marked Unused', 'Marked Success', 'Marked Failed', 'Final Result', 'Annotations']
+SOE_COLUMNS = [
+    'A',
+    'Time stamp',
+    'Milliseconds',
+    'System time stamp',
+	'System milliseconds',
+	'B1',
+	'B2',
+	'B3',
+	'Element',
+	'Status',
+	'Tag',
+	'Operator',
+	'Comment',
+	'User comment'
+]
+SOE_COLUMNS_DTYPE = {
+    'A': 'str',
+	'Time stamp': 'datetime64[s]',
+	'Milliseconds': 'float32',
+	'System time stamp': 'datetime64[s]',
+	'System milliseconds': 'float32',
+	'B1': 'str',
+	'B2': 'str',
+	'B3': 'str',
+	'Element': 'str',
+	'Description': 'str',
+	'Status': 'str',
+	'Priority': 'uint16',
+	'Tag': 'str',
+	'Operator': 'str',
+	'Message class': 'str',
+	'Comment': 'str',
+	'User comment': 'str',
+	'SoE': 'str'
+}
+RCD_COLUMNS = [
+    'Order Time',
+	'Feedback Time',
+	'B1',
+	'B2',
+	'B3',
+	'Element',
+	'Status',
+	'Tag',
+	'Operator',
+	'Pre Result',
+	'Execution (s)',
+	'Termination (s)',
+	'TxRx (s)',
+	'Rep. Flag',
+	'Marked Unused',
+	'Marked Success',
+	'Marked Failed',
+	'Final Result',
+	'Annotations'
+]
+RTU_COLUMNS = [
+    'Down Time',
+    'Up Time',
+    'RTU',
+    'Long Name',
+    'Duration',
+    'Marked Maintenance',
+    'Marked Comm. Failure',
+    'Marked Other Failure',
+    'Annotations'
+]
 HIS_SHEET_PARAM = {
 	'format': {
 		'A': {'num_format': '@'},
@@ -37,28 +102,28 @@ RCD_SHEET_PARAM = {
 		'Order Time': {'num_format': 'dd-mm-yyyy hh:mm:ss.000', 'align': 'center'},
 		'Feedback Time': {'num_format': 'dd-mm-yyyy hh:mm:ss.000', 'align': 'center'},
 		'Pre Result': {'num_format': '@', 'align': 'center'},
-		'Execution (s)': {'num_format': '0.000', 'align': 'center'},
-		'Termination (s)': {'num_format': '0.000', 'align': 'center'},
-		'TxRx (s)': {'num_format': '0.000', 'align': 'center'},
+		'Execution (s)': {'num_format': '0.000', 'align': 'center', 'text_wrap': True},
+		'Termination (s)': {'num_format': '0.000', 'align': 'center', 'text_wrap': True},
+		'TxRx (s)': {'num_format': '0.000', 'align': 'center', 'text_wrap': True},
 		'Annotations': {'num_format': '@', 'text_wrap': True},
-		'Rep. Flag': {'num_format': '@', 'align': 'center'},
-		'Marked Unused': {'num_format': '@', 'align': 'center'},
-		'Marked Success': {'num_format': '@', 'align': 'center'},
-		'Marked Failed': {'num_format': '@', 'align': 'center'},
+		'Rep. Flag': {'num_format': '@', 'align': 'center', 'text_wrap': True},
+		'Marked Unused': {'num_format': '@', 'align': 'center', 'text_wrap': True},
+		'Marked Success': {'num_format': '@', 'align': 'center', 'text_wrap': True},
+		'Marked Failed': {'num_format': '@', 'align': 'center', 'text_wrap': True},
 		'Final Result': {'align': 'center'},
         'Navigation': {'bold': True, 'font_color': 'blue', 'align': 'center', 'border': 1, 'bg_color': '#dcdcdc'}
 	},
 	'width': {
-		'Order Time': 23,
-		'Feedback Time': 23,
+		'Order Time': 25,
+		'Feedback Time': 25,
 		'Annotations': 28,
-        'Execution (s)': 10,
+        'Execution (s)': 12,
         'Termination (s)': 12,
-        'TxRx (s)': 10,
-        'Rep. Flag': 8,
-		'Marked Unused': 8,
-		'Marked Success': 8,
-		'Marked Failed': 8,
+        'TxRx (s)': 9,
+        'Rep. Flag': 4,
+		'Marked Unused': 12,
+		'Marked Success': 12,
+		'Marked Failed': 12,
 	}
 }
 RCDGROUP_SHEET_PARAM = {
@@ -87,6 +152,9 @@ RTUDOWN_SHEET_PARAM = {
 		'RTU': {'num_format': '@'},
 		'Long Name': {'num_format': '@'},
 		'Duration': {'num_format': '[hh]:mm:ss', 'align': 'center'},
+		'Marked Maintenance': {'num_format': '@', 'align': 'center', 'text_wrap': True},
+		'Marked Comm. Failure': {'num_format': '@', 'align': 'center', 'text_wrap': True},
+		'Marked Other Failure': {'num_format': '@', 'align': 'center', 'text_wrap': True},
 		'Annotations': {'num_format': '@', 'text_wrap': True},
         'Navigation': {'bold': True, 'font_color': 'blue', 'align': 'center', 'valign': 'vcenter', 'border': 1, 'bg_color': '#dcdcdc'}
 	},
@@ -94,35 +162,61 @@ RTUDOWN_SHEET_PARAM = {
 		'Down Time': 23,
 		'Up Time': 23,
 		'Duration': 16,
+		'Marked Maintenance': 16,
+		'Marked Comm. Failure': 12,
+		'Marked Other Failure': 12,
 		'Annotations': 28
 	}
 }
 RTUGROUP_SHEET_PARAM = {
 	'format': {
-		'Downtime Occurences': {'num_format': '0', 'align': 'center'},
-		'Total Downtime': {'num_format': '[hh]:mm:ss', 'align': 'center'},
-		'Average Downtime': {'num_format': '[hh]:mm:ss', 'align': 'center'},
-		'Longest Downtime': {'num_format': '[hh]:mm:ss', 'align': 'center'},
-		'Longest Downtime Date': {'num_format': 'dd-mm-yyyy hh:mm:ss.000', 'align': 'center'},
-		'Time Range': {'num_format': '[hh]:mm:ss', 'align': 'center'},
+		'Downtime Occurences': {'num_format': '0', 'align': 'center', 'text_wrap': True},
+		'Total Downtime': {'num_format': '[hh]:mm:ss', 'align': 'center', 'text_wrap': True},
+		'Average Downtime': {'num_format': '[hh]:mm:ss', 'align': 'center', 'text_wrap': True},
+		'Longest Downtime': {'num_format': '[hh]:mm:ss', 'align': 'center', 'text_wrap': True},
+		'Longest Downtime Date': {'num_format': 'dd-mm-yyyy hh:mm:ss.000', 'align': 'center', 'text_wrap': True},
+		'Time Range': {'num_format': '[hh]:mm:ss', 'align': 'center', 'text_wrap': True},
 		'Uptime': {'num_format': '[hh]:mm:ss', 'align': 'center'},
-		'Maintenance': {'num_format': '[hh]:mm:ss', 'align': 'center'},
-		'Calculated Availability': {'num_format': '0.00%', 'align': 'center'},
+		'Non-RTU Downtime': {'num_format': '[hh]:mm:ss', 'align': 'center', 'text_wrap': True},
+		'Calculated Availability': {'num_format': '0.00%', 'align': 'center', 'text_wrap': True},
 		'Quality': {'num_format': '0', 'align': 'center'},
 		'Availability': {'num_format': '0.00%', 'align': 'center'}
 	},
 	'width': {
+		'Downtime Occurences': 15,
+		'Total Downtime': 13,
+		'Average Downtime': 13,
+		'Longest Downtime': 13,
 		'Longest Downtime Date': 23,
-		'Time Range': 16,
-		'Uptime': 16
+		'Time Range': 13,
+		'Uptime': 11,
+		'Non-RTU Downtime': 13,
+		'Calculated Availability': 17,
+		'Availability': 17
 	}
 }
 
 RCD_BOOK_PARAM = {
-	'format': {**HIS_SHEET_PARAM['format'], **RCD_SHEET_PARAM['format'], **RCDGROUP_SHEET_PARAM['format']},
-	'width': {**HIS_SHEET_PARAM['width'], **RCD_SHEET_PARAM['width'], **RCDGROUP_SHEET_PARAM['width']}
+	'format': {
+        **HIS_SHEET_PARAM['format'],
+        **RCD_SHEET_PARAM['format'],
+        **RCDGROUP_SHEET_PARAM['format']
+    },
+	'width': {
+        **HIS_SHEET_PARAM['width'],
+        **RCD_SHEET_PARAM['width'],
+        **RCDGROUP_SHEET_PARAM['width']
+    }
 }
 RTU_BOOK_PARAM = {
-	'format': {**HIS_SHEET_PARAM['format'], **RTUDOWN_SHEET_PARAM['format'], **RTUGROUP_SHEET_PARAM['format']},
-	'width': {**HIS_SHEET_PARAM['width'], **RTUDOWN_SHEET_PARAM['width'], **RTUGROUP_SHEET_PARAM['width']}
+	'format': {
+        **HIS_SHEET_PARAM['format'],
+        **RTUDOWN_SHEET_PARAM['format'],
+        **RTUGROUP_SHEET_PARAM['format']
+    },
+	'width': {
+        **HIS_SHEET_PARAM['width'],
+        **RTUDOWN_SHEET_PARAM['width'],
+        **RTUGROUP_SHEET_PARAM['width']
+    }
 }

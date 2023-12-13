@@ -4,7 +4,7 @@ from glob import glob
 from typing import Union
 
 import pandas as pd
-from global_parameters import RCD_COLUMNS, SOE_COLUMNS, SOE_COLUMNS_DTYPE
+from global_parameters import RCD_COLUMNS, RTU_COLUMNS, SOE_COLUMNS, SOE_COLUMNS_DTYPE
 from lib import calc_time, immutable_dict, load_cpoint, load_workbook, read_xml, test_datetime_format
 
 
@@ -37,12 +37,6 @@ class _FileReader:
 				date_start=kwargs['date_start'].replace(hour=0, minute=0, second=0, microsecond=0),
 				date_stop=kwargs['date_stop'].replace(hour=23, minute=59, second=59, microsecond=999999)
 			)
-
-		# Dynamically update defined variable
-		# This code should be placed at the end of __init__
-		for key, value in kwargs.items():
-			if key in self.__slot__:
-				setattr(self, key, value)
 
 		df = self.load()
 		self.post_load(df)
@@ -162,10 +156,10 @@ class SpectrumFileReader(_FileReader):
 	cpoint_file = 'cpoint.xlsx'
 
 	def __init__(self, filepaths:Union[str, list], **kwargs):
-		# Need this for cooperative multiple-inheritance
-		super().__init__(filepaths, **kwargs)
 		# Load point description
 		self.cpoint_description = load_cpoint(self.cpoint_file)
+		# Need this for cooperative multiple-inheritance
+		super().__init__(filepaths, **kwargs)
 
 	def post_load(self, df:pd.DataFrame):
 		"""
@@ -271,7 +265,7 @@ class SpectrumFileReader(_FileReader):
 	@property
 	def soe_trip(self):
 		return self._soe_trip if hasattr(self, '_soe_trip') else self.load()
-	
+
 
 class RCFileReader(_FileReader):
 	column_list = RCD_COLUMNS
@@ -313,6 +307,48 @@ class RCFileReader(_FileReader):
 	@property
 	def rcd_all(self):
 		return self._rcd_all if hasattr(self, '_rcd_all') else self.load()
+
+
+class AvFileReader(_FileReader):
+	column_list = RTU_COLUMNS
+	sheet_name = 'DOWNTIME'
+	time_series_column = 'Down Time'
+
+	def __init__(self, filepaths:Union[str, list], **kwargs):
+		# Need this for cooperative multiple-inheritance
+		super().__init__(filepaths, **kwargs)
+
+	def post_load(self, df:pd.DataFrame):
+		"""
+		Executed after load completed.
+		"""
+
+		super().post_load(df)
+		self._rtudown_all = self.prepare_data(df)
+
+	def post_open_file(self, df:pd.DataFrame):
+		"""
+		"""
+
+		# Format B2 as string value
+		df['B2'] = df['B2'].map(lambda x: re.sub(r'\.\d+', '', str(x)))
+
+		return super().post_open_file(df)
+
+	def prepare_data(self, df:pd.DataFrame, **kwargs):
+		"""
+		"""
+
+		# Filter new DataFrame
+		new_df = df.loc[(df[self.time_series_column]>=self.date_range[0]) & (df[self.time_series_column]<=self.date_range[1]), self.column_list].copy()
+		new_df = new_df.sort_values([self.time_series_column], ascending=[True]).reset_index(drop=True)
+
+		return new_df
+
+
+	@property
+	def rtudown_all(self):
+		return self._rtudown_all if hasattr(self, '_updown_all') else self.load()
 
 
 def main():

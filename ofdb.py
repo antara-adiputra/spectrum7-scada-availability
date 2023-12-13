@@ -12,18 +12,20 @@ from lib import calc_time, immutable_dict, load_cpoint, validate_cpoint
 
 class SpectrumOfdbClient:
 	__slot__ = ['connection_driver', 'switching_element']
+	_dbotbl_analog = 'dbo.scd_his_10_anat'
+	_dbotbl_cpoint = 'dbo.scd_c_point'
+	_dbotbl_digital = 'dbo.scd_his_11_digitalt'
+	_dbotbl_hismsg = 'dbo.scd_his_message'
+	_conf_path = '.config'
+	column_dtype = immutable_dict(SOE_COLUMNS_DTYPE)
+	column_list = SOE_COLUMNS
+	cpoint_file = 'cpoint.xlsx'
+	# Timezone for Asia/Makassar
+	tzone = timedelta(hours=8)
+	keep_duplicate = 'last'
 
-	def __init__(self, host:str=None, port:str=None, user:str=None, pswd:str=None, database:str=None, **kwargs):
-		self._conf_path = '.config'
-		self._dbotbl_analog = 'dbo.scd_his_10_anat'
-		self._dbotbl_cpoint = 'dbo.scd_c_point'
-		self._dbotbl_digital = 'dbo.scd_his_11_digitalt'
-		self._dbotbl_hismsg = 'dbo.scd_his_message'
-		# Timezone for Asia/Makassar
-		self.tzone = timedelta(hours=8)
-		self.column_dtype = immutable_dict(SOE_COLUMNS_DTYPE)
-		self.cpoint_file = 'cpoint.xlsx'
-		self.keep_duplicate = 'last'
+	def __init__(self, date_start:datetime=None, date_stop:datetime=None, **kwargs):
+		self.available_drivers = pyodbc.drivers()
 		self.his_filter = {
 			'ack': '',
 			'path4': 'CB',
@@ -36,57 +38,68 @@ class SpectrumOfdbClient:
 			'path4': 'IFS-RTU'
 		}
 
+		self._init_connection()
+		self.sources = f'DRIVER={self._conn_driver};SERVER={self._conn_host};PORT={self._conn_port};'
+		self.switching_element = kwargs['switching_element'] if 'switching_element' in kwargs else ['CB']
+
+		# Set date_range if defined in kwargs
+		if date_start is not None:
+			self.set_date_range(date_start, date_stop)
+		else:
+			self._date_range = None
+			self.date_isset = False
+
+		# Automatically update Point Description
+		if self.test_server():
+			self.dump_point_description()
+		else:
+			# Load point description
+			self._cpoint_description = load_cpoint(self.cpoint_file)
+
+	def _init_connection(self):
+		"""
+		"""
+
 		# Load configuration
 		self.setting = ConfigParser(default_section='GENERAL')
 		self.setting.read(self._conf_path)
 
 		if self.setting.has_section('CONNECTION'):
 			c = self.setting['CONNECTION']
-			odbc_driver = c.get('DRIVER')
-			if host is not None and port is not None and user is not None and pswd is not None and database is not None:
-				self.use_connection(host=host, port=port, user=user, pswd=pswd, database=database, driver=odbc_driver)
-			else:
-				self.use_connection(host=c.get('HOST'), port=c.get('PORT'), user=c.get('USER'), pswd=c.get('PSWD'), database=c.get('DATABASE'), driver=odbc_driver)
+			self.set_connection(host=c.get('HOST'), port=c.get('PORT'), user=c.get('USER'), pswd=c.get('PSWD'), database=c.get('DATABASE'), driver=c.get('DRIVER'))
 		else:
 			# .config file can be not exist or no connection section
 			self.setting.add_section('CONNECTION')
-			self.use_connection()
+			self.set_connection()
 
-		self.sources = f'DRIVER={self._conn_driver};SERVER={self._conn_host};PORT={self._conn_port};'
-		self.switching_element = kwargs['switching_element'] if 'switching_element' in kwargs else ['CB']
+	def _run_task(self, **kwargs):
+		"""
+		"""
 
-		# Set date_range if defined in kwargs
-		if 'date_start' in kwargs:
-			self.set_date_range(kwargs.get('date_start'), kwargs.get('date_stop'))
-		else:
-			self._date_range = None
-			self.date_isset = False
+		if len(kwargs)>0:
+			df_list = [
+				self.read_query_control_disable(**kwargs),
+				self.read_query_local_remote(**kwargs),
+				self.read_query_rtu_updown(**kwargs),
+				self.read_query_switching(**kwargs),
+				self.read_query_synchro(**kwargs),
+				self.read_query_trip(**kwargs)
+			]
+			
+			return df_list
 
-		# Automatically update Point Description
-		if self.check():
-			self.dump_point_description()
-		else:
-			# Load point description
-			self._cpoint_description = load_cpoint(self.cpoint_file)
-
-		# Dynamically update defined variable
-		# This code should be placed at the end of __init__
-		for key, value in kwargs.items():
-			if key in self.__slot__:
-				setattr(self, key, value)
-	
 	def all(self, force:bool=False, **kwargs):
 		"""
 		Concatenate all soe data into single DataFrame.
 		"""
 
 		if force or not hasattr(self, '_soe_all'):
-			df_list = self.run_task(force=True)
+			df_list = self._run_task(force=True)
 
 			if all([type(x)==pd.DataFrame for x in df_list]):
 				df = pd.concat(df_list).drop_duplicates(keep=self.keep_duplicate).sort_values(['System time stamp', 'System milliseconds', 'Time stamp', 'Milliseconds'], ascending=[True, True, True, True]).reset_index(drop=True)
 
-				df_list = self.run_task(query=df, reset_index=True)
+				df_list = self._run_task(query=df, reset_index=True)
 			else:
 				df = None
 				print('Gagal memuat data dari server.')
@@ -95,7 +108,7 @@ class SpectrumOfdbClient:
 		
 		return self._soe_all
 
-	def check(self, timeout:int=5):
+	def test_server(self, timeout:int=5):
 		"""
 		Check connection to host.
 		"""
@@ -348,7 +361,7 @@ class SpectrumOfdbClient:
 		Create instance of database connection and execute query
 		"""
 
-		if self.check():
+		if self.test_server():
 			# Server connection OK
 			connection_string = f'DRIVER={self._conn_driver};SERVER={self._conn_host};PORT={self._conn_port};DATABASE={self._conn_database};UID={self._conn_user};PWD={self._conn_pswd};Trusted_Connection=No;'
 			connection_url = sa.engine.URL.create('mssql+pyodbc', query={"odbc_connect": connection_string})
@@ -514,28 +527,11 @@ class SpectrumOfdbClient:
 
 		return self._soe_trip
 
-	def run_task(self, **kwargs):
-		"""
-		"""
-
-		if len(kwargs)>0:
-			df_list = [
-				self.read_query_control_disable(**kwargs),
-				self.read_query_local_remote(**kwargs),
-				self.read_query_rtu_updown(**kwargs),
-				self.read_query_switching(**kwargs),
-				self.read_query_synchro(**kwargs),
-				self.read_query_trip(**kwargs)
-			]
-			
-			return df_list
-
 	def save_connection(self, prompt:bool=True):
 		"""
 		"""
 
 		__slot__ = ['host', 'port', 'user', 'pswd', 'database', 'driver']
-
 		commit = False
 
 		if prompt:
@@ -557,30 +553,36 @@ class SpectrumOfdbClient:
 		"""
 
 		retry = 0
-		drivers = pyodbc.drivers()
-		if drivers:
+		count = len(self.available_drivers)
+
+		if count>0:
 			valid = False
 			print('List driver ODBC yang terinstall :')
 			
-			for i, d in enumerate(drivers):
+			for i, d in enumerate(self.available_drivers):
 				print(f'{i+1}. {d}')
-			
+
 			while not valid:
-				sel = input(f'\nPilih driver (1-{len(drivers)}) : ')
 				try:
-					odbc_driver = drivers[int(sel)-1]
-					valid = True
-				except Exception:
+					index = int(input(f'\nPilih driver (1-{count}) : ')) - 1
+				except ValueError:
+					index = -1
 					retry += 1
 
-				if retry>=3:
+				if index in range(count):
+					driver = self.available_drivers[index]
+					valid = True
+				else:
+					retry += 1
+
+				if retry>3:
 					raise ValueError('Program terhenti. Gagal 3 kali percobaan.')
-			
-			return odbc_driver
+
+			return driver
 		else:
 			raise ImportError('Tidak ada driver ODBC yang terinstall!')
 
-	def use_connection(self, **conf):
+	def set_connection(self, **conf):
 		"""
 		"""
 
@@ -629,6 +631,8 @@ class SpectrumOfdbClient:
 				dt0 = date_start.replace(hour=0, minute=0, second=0, microsecond=0)
 				dt1 = date_stop.replace(hour=23, minute=59, second=59, microsecond=999999)
 
+		self._date_start = dt0
+		self._date_stop = dt1
 		self._date_range = (dt0, dt1)
 		self.date_isset = True
 
@@ -646,9 +650,17 @@ class SpectrumOfdbClient:
 	@property
 	def date_range_utc(self):
 		if self.date_range:
-			return (self._date_range[0] - self.tzone, self._date_range[1] - self.tzone)
+			return (self._date_start - self.tzone, self._date_stop - self.tzone)
 		else:
 			return None
+
+	@property
+	def date_start(self):
+		return self._date_start
+
+	@property
+	def date_stop(self):
+		return self._date_stop
 
 	@property
 	def soe_all(self):

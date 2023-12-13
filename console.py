@@ -1,37 +1,32 @@
 import os
-from avrs import AvRemoteStation
+from datetime import datetime
+from glob import glob
+
+from avrs import AVRSCollective, AVRSFromFile, AVRSFromOFDB
 from consolemenu import *
 from consolemenu.items import *
-from datetime import datetime
-from filereader import SpectrumFileReader
-from glob import glob
-from ofdb import SpectrumOfdbClient
-from pathlib import Path
-from rcd import RCAnalyzer
+from rcd import RCDCollective, RCDFromFile, RCDFromOFDB
 
 
 class ConsoleApp:
+	title = 'Aplikasi SCADA'
+	subtitle = ''
+	prologue = ''
+	dimension = (80, 30)
+	exit_text = 'Keluar'
+	back_text = 'Kembali'
 
 	def __init__(self):
 		self.screen = Screen()
-		self.title = 'Aplikasi SCADA'
-		self.subtitle = ''
-		self.prologue = ''
-		self.dimension = (80, 30)
-		self.exit_text = 'Keluar'
 		self.buffer = []
+		self.setup()
 
 	def from_ofdb(self, *args, **kwargs):
+		instance = args[0]
+		reff_menu = kwargs['menu']
+
 		pu = PromptUtils(screen=self.screen)
 		pu.println('')
-		# print(args, kwargs)
-		reff_menu = kwargs['menu']
-		proc = kwargs['processor']
-
-		if args[0]=='rcd':
-			title = 'RC Sukses'
-		elif args[0]=='avrs':
-			title = 'Availability Remote Station'
 
 		dt0 = pu.input('Tanggal mulai (dd-mm-yyyy) : ')
 		dt1 = pu.input('Tanggal akhir (dd-mm-yyyy) : ')
@@ -44,84 +39,70 @@ class ConsoleApp:
 			pu.clear()
 			reff_menu.show()
 
-		if pu.confirm_answer('y', f'\nHitung "{title}" ({dt0.input_string} s/d {dt1.input_string}).\nLanjutkan?'):
+		if pu.confirm_answer('y', f'\nHitung "{reff_menu.title}" ({dt0.input_string} s/d {dt1.input_string}).\nLanjutkan?'):
 			pu.clear()
-			c = SpectrumOfdbClient(date_start=date_start, date_stop=date_stop)
-			ps = proc(c)
-			ps.calculate()
-		else:
-			pu.clear()
-			reff_menu.show()
+			calc = instance(date_start=date_start, date_stop=date_stop)
+			calc.calculate()
 
-		if pu.confirm_answer('y', f'\nExport hasil?'):
-			ps.export_result()
+			if pu.confirm_answer('y', f'\nExport hasil?'):
+				calc.to_excel()
 
-		pu.enter_to_continue('\n>> Klik [Enter] untuk lanjut')
+		pu.enter_to_continue('\n\n>> Klik [Enter] untuk lanjut')
 		pu.clear()
 
 	def from_file(self, *args, **kwargs):
+		instance = args[0]
+		reff_menu = kwargs['menu']
+		filepaths = []
+
 		pu = PromptUtils(screen=self.screen)
 		pu.println('')
-		# print(args, kwargs)
-		reff_menu = kwargs['menu']
-		proc = kwargs['processor']
 
-		if args[0]=='rcd':
-			title = 'RC Sukses'
-		elif args[0]=='avrs':
-			title = 'Availability Remote Station'
+		files = pu.input('Gunakan tanda koma (,) untuk menginput lebih dari satu file, atau tanda bintang (*) untuk file dengan nama serupa.\nLokasi file : ')
 
-		filepaths = pu.input('Gunakan tanda koma (,) untuk menginput lebih dari satu file, atau tanda bintang (*) untuk file dengan nama serupa.\nLokasi file : ')
-		f = SpectrumFileReader(filepaths.input_string)
+		for f in files.input_string.split(','):
+			if '*' in f:
+				filepaths += glob(f.strip())
+			elif f.strip():
+				filepaths.append(f.strip())
 
-		if f.filepaths:
-			if pu.confirm_answer('y', f'\nAnda menginput {len(f.filepaths)} file:\n{print_list(f.filepaths)}\nLanjutkan?'):
+		if filepaths:
+			if pu.confirm_answer('y', f'\nAnda menginput {len(filepaths)} file:\n{print_list(filepaths)}\nLanjutkan?'):
 				pu.clear()
-				f.load()
-				ps = proc(f)
-				ps.calculate()
-			else:
-				pu.clear()
-				reff_menu.show()
-		else:
-			pu.enter_to_continue('Lokasi file tidak valid!')
-			pu.clear()
-			reff_menu.show()
+				calc = instance(filepaths)
+				calc.calculate()
 
-		if pu.confirm_answer('y', f'\nExport hasil?'):
-			ps.export_result()
+				if pu.confirm_answer('y', f'\nExport hasil?'):
+					calc.to_excel()
 
-		pu.enter_to_continue('\n>> Klik [Enter] untuk lanjut')
+		pu.enter_to_continue('\n\n>> Klik [Enter] untuk lanjut')
 		pu.clear()
 
 	def setup(self):
 		os.system(f'title {self.title}')
 		os.system(f'mode {self.dimension}')
-		self.menu = ConsoleMenu(title=self.title, subtitle=self.subtitle, exit_option_text='Keluar', screen=self.screen)
-		
-		self.menu_rcd = ConsoleMenu(title='Kalkulasi RC', clear_screen=False, exit_option_text='Kembali', screen=self.screen)
-		self.menu_avrs = ConsoleMenu(title='Availability Remote Station', clear_screen=False, exit_option_text='Kembali', screen=self.screen)
-
-		submenu = [
-			{'menu': self.menu_rcd, 'args': ['rcd'], 'kwargs': {'processor': RCAnalyzer}},
-			{'menu': self.menu_avrs, 'args': ['avrs'], 'kwargs': {'processor': AvRemoteStation}}
-		]
-
-		for sm in submenu:
-			item1 = FunctionItem('Dari database', function=self.from_ofdb, menu=sm['menu'], args=sm['args'], kwargs={'menu': sm['menu'], **sm['kwargs']})
-			item2 = FunctionItem('Dari file', function=self.from_file, menu=sm['menu'], args=sm['args'], kwargs={'menu': sm['menu'], **sm['kwargs']})
-			sm['menu'].items = [item1, item2]
-
-		submenu1 = SubmenuItem('Kalkulasi RC', menu=self.menu, submenu=self.menu_rcd)
-		submenu2 = SubmenuItem('Availability Remote Station', menu=self.menu, submenu=self.menu_avrs)
-
+		# Create main menu screen
+		self.menu = ConsoleMenu(title=self.title, subtitle=self.subtitle, exit_option_text=self.exit_text, screen=self.screen)
+		# Define submenu RCD
+		menu_rcd = ConsoleMenu(title='Remote Control SCADA', clear_screen=False, exit_option_text=self.back_text, screen=self.screen)
+		item_rcd1 = FunctionItem('Dari database', function=self.from_ofdb, menu=menu_rcd, args=[RCDFromOFDB], kwargs={'menu': menu_rcd})
+		item_rcd2 = FunctionItem('Dari file', function=self.from_file, menu=menu_rcd, args=[RCDFromFile], kwargs={'menu': menu_rcd})
+		item_rcd3 = FunctionItem('Rangkum beberapa file', function=self.from_file, menu=menu_rcd, args=[RCDCollective], kwargs={'menu': menu_rcd})
+		menu_rcd.items = [item_rcd1, item_rcd2, item_rcd3]
+		submenu1 = SubmenuItem('Remote Control SCADA', menu=self.menu, submenu=menu_rcd)
+		# Define submenu AVRS
+		menu_avrs = ConsoleMenu(title='Availability Remote Station', clear_screen=False, exit_option_text=self.back_text, screen=self.screen)
+		item_avrs1 = FunctionItem('Dari database', function=self.from_ofdb, menu=menu_avrs, args=[AVRSFromOFDB], kwargs={'menu': menu_avrs})
+		item_avrs2 = FunctionItem('Dari file', function=self.from_file, menu=menu_avrs, args=[AVRSFromFile], kwargs={'menu': menu_avrs})
+		item_avrs3 = FunctionItem('Rangkum beberapa file', function=self.from_file, menu=menu_avrs, args=[AVRSCollective], kwargs={'menu': menu_avrs})
+		menu_avrs.items = [item_avrs1, item_avrs2, item_avrs3]
+		submenu2 = SubmenuItem('Availability Remote Station', menu=self.menu, submenu=menu_avrs)
+		# Append submenu
 		self.menu.items = [submenu1, submenu2]
 
+	def start(self):
 		self.menu.start()
 		self.menu.join()
-
-	def start(self):
-		self.setup()
 
 
 def print_list(arr:list):
@@ -139,10 +120,10 @@ def input_file_his():
 	if len(file_list)>0:
 		if pu.confirm_answer('y', f'\n\nAnda menginput {len(file_list)} file:\n{print_list(file_list)}\nApakah sudah benar?'):
 			pu.clear()
-			rc = RCAnalyzer(file_list)
+			rc = RCDFromFile(file_list)
 			rc.calculate()
 			rc.print_result()
-			rc.export_result()
+			rc.to_excel()
 			pu.enter_to_continue('>> Klik [Enter] untuk lanjut')
 			pu.clear()
 		else:
