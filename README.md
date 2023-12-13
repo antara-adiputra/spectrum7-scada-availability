@@ -19,12 +19,12 @@ Aplikasi yang digunakan untuk penghitungan availability SCADA pada bagian Fasili
      - [x] Analisa & hipotesis awal gagal kontrol
      - [x] Rekomendasi tagging untuk bay berdasarkan kontribusi pengurangan Sukses RC
      - [x] _Single-run-only_, cukup running program sekali, file output sudah dapat otomatis menghitung perubahan dari user
-     - [ ] Menggabungkan dan merekap beberapa output file (soon)
+     - [x] Menggabungkan dan merekap beberapa output file (soon)
   1. Availability RTU
      - [x] Memilah dan menghitung downtime RTU
      - [x] Tabel maintenance untuk menganulir event down yang disebabkan selain dari permasalahan peralatan (ex. down Pemeliharaan atau shutdown oleh user)
      - [x] _Single-run-only_, cukup running program sekali, file output sudah dapat otomatis menghitung perubahan dari user
-     - [ ] Menggabungkan dan merekap beberapa output file (soon)
+     - [x] Menggabungkan dan merekap beberapa output file (soon)
 
 
 ### Contributor
