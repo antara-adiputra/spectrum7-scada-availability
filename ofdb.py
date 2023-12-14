@@ -41,20 +41,20 @@ class SpectrumOfdbClient:
 		self._init_connection()
 		self.sources = f'DRIVER={self._conn_driver};SERVER={self._conn_host};PORT={self._conn_port};'
 		self.switching_element = kwargs['switching_element'] if 'switching_element' in kwargs else ['CB']
-
 		# Set date_range if defined in kwargs
 		if date_start is not None:
 			self.set_date_range(date_start, date_stop)
 		else:
 			self._date_range = None
 			self.date_isset = False
-
 		# Automatically update Point Description
 		if self.test_server():
 			self.dump_point_description()
 		else:
 			# Load point description
 			self._cpoint_description = load_cpoint(self.cpoint_file)
+		# Need this for cooperative multiple-inheritance
+		super().__init__(**kwargs)
 
 	def _init_connection(self):
 		"""

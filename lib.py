@@ -321,7 +321,7 @@ class BaseExportMixin:
 		"""
 
 		return [
-			('Source File', self.sources),
+			('Source File', getattr(self, 'sources', '')),
 			('Output File', f'{kwargs.get("filepath", "")}'),
 			('RC Date Range', f'{self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")}'),
 			('Processed Date', self.process_date.strftime('%d-%m-%Y %H:%M:%S')),

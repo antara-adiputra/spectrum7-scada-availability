@@ -6,7 +6,6 @@ from typing import Union
 
 import numpy as np
 import pandas as pd
-import xlsxwriter
 from xlsxwriter.utility import xl_col_to_name
 from filereader import RCFileReader, SpectrumFileReader
 from global_parameters import RCD_BOOK_PARAM, RCD_COLUMNS
@@ -1331,7 +1330,9 @@ class RCDCollective(RCFileReader, RCD):
 
 
 class RCDFromOFDB(SpectrumOfdbClient, SOEtoRCD):
-	pass
+
+	def __init__(self, date_start:datetime, date_stop:datetime=None, **kwargs):
+		super().__init__(date_start, date_stop, **kwargs)
 
 
 class RCDFromFile(SpectrumFileReader, SOEtoRCD):
