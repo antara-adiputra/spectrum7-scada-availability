@@ -1,4 +1,4 @@
-import os, platform, time
+import os, platform, time, warnings
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher, get_close_matches
 from glob import glob
@@ -11,6 +11,8 @@ from xlsxwriter.utility import xl_col_to_name
 from lxml import etree as et
 from global_parameters import SOE_COLUMNS
 
+
+warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 
 # decorator to calculate duration
 # taken by any function.
@@ -114,7 +116,7 @@ def load_workbook(filepath:str):
 	wb = {}
 
 	try:
-		wb = pd.read_excel(filepath, sheet_name=None)
+		wb = pd.read_excel(filepath, sheet_name=None, engine='openpyxl')
 	except FileNotFoundError:
 		raise FileNotFoundError
 	except Exception:

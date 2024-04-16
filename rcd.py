@@ -1,13 +1,11 @@
-import os, platform, re, time
-from datetime import date, datetime, timedelta
-from glob import glob
-from pathlib import Path
+import os, re, time
+from datetime import datetime
 from typing import Union
 
 import numpy as np
 import pandas as pd
 from xlsxwriter.utility import xl_col_to_name
-from filereader import RCFileReader, SpectrumFileReader
+from filereader import RCFileReader, SpectrumFileReader, SurvalentFileReader
 from global_parameters import RCD_BOOK_PARAM, RCD_COLUMNS
 from lib import BaseExportMixin, get_datetime, get_execution_duration, get_termination_duration, join_datetime, immutable_dict, progress_bar
 from ofdb import SpectrumOfdbClient
@@ -1114,7 +1112,7 @@ class _RCDBaseCalculation:
 					f'=COUNTA(${xr["Pre Result"]}$2:${xr["Pre Result"]}${rlen+1})',
 					f'=COUNTIF(${xr["Pre Result"]}2:{xr["Pre Result"]}${rlen+1}, "SUCCESS")',
 					f'=COUNTIF(${xr["Pre Result"]}2:{xr["Pre Result"]}${rlen+1}, "FAILED")',
-					f'=ROUND(${xr["Pre Result"]}${rlen+3}/${xr["Pre Result"]}${rlen+2}*100, 2)'
+					f'=ROUND(IFERROR(${xr["Pre Result"]}${rlen+3}/${xr["Pre Result"]}${rlen+2}, 0)*100, 2)'
 				]
 			}
 			df_rc_result = pd.DataFrame(data=rc_result)
@@ -1129,7 +1127,7 @@ class _RCDBaseCalculation:
 				gi_update['RC Occurences'].append('=' + countifs(*rules))
 				gi_update['RC Success'].append('=' + countifs(*rules, rule_lookup('Final Result', '"SUCCESS"')))
 				gi_update['RC Failed'].append('=' + countifs(*rules, rule_lookup('Final Result', '"FAILED"')))
-				gi_update['Success Rate'].append(f'=${xg["RC Success"]}{rowg+2}/${xg["RC Occurences"]}{rowg+2}')
+				gi_update['Success Rate'].append(f'=IFERROR(${xg["RC Success"]}{rowg+2}/${xg["RC Occurences"]}{rowg+2}, 0)')
 				gi_update['Execution Avg.'].append(f'=IF(${xg["RC Success"]}{rowg+2}=0, 0, ' + averageifs(rule_lookup('Execution (s)'), *rules, rule_lookup('Final Result', '"SUCCESS"')) + ')')
 				gi_update['Termination Avg.'].append(f'=IF(${xg["RC Success"]}{rowg+2}=0, 0, ' + averageifs(rule_lookup('Termination (s)'), *rules, rule_lookup('Final Result', '"SUCCESS"')) + ')')
 				gi_update['TxRx Avg.'].append(f'=IF(${xg["RC Success"]}{rowg+2}=0, 0,  ' + averageifs(rule_lookup('TxRx (s)'), *rules, rule_lookup('Final Result', '"SUCCESS"')) + ')')
@@ -1138,7 +1136,7 @@ class _RCDBaseCalculation:
 				'RC Occurences': [f'=SUM(${xg["RC Occurences"]}$2:${xg["RC Occurences"]}${glen+1})'],
 				'RC Success': [f'=SUM(${xg["RC Success"]}$2:${xg["RC Success"]}${glen+1})'],
 				'RC Failed': [f'=SUM(${xg["RC Failed"]}$2:${xg["RC Failed"]}${glen+1})'],
-				'Success Rate': [f'=${xg["RC Success"]}{glen+2}/${xg["RC Occurences"]}{glen+2}'],
+				'Success Rate': [f'=IFERROR(${xg["RC Success"]}{glen+2}/${xg["RC Occurences"]}{glen+2}, 0)'],
 			}
 			df_gi_result = pd.DataFrame(data=gi_result)
 			# Sheet BAY
@@ -1150,11 +1148,11 @@ class _RCDBaseCalculation:
 				bay_update['RC Occurences'].append('=' + countifs(*rules))
 				bay_update['RC Success'].append('=' + countifs(*rules, rule_lookup('Final Result', '"SUCCESS"')))
 				bay_update['RC Failed'].append('=' + countifs(*rules, rule_lookup('Final Result', '"FAILED"')))
-				bay_update['Success Rate'].append(f'=${xb["RC Success"]}{rowb+2}/${xb["RC Occurences"]}{rowb+2}')
+				bay_update['Success Rate'].append(f'=IFERROR(${xb["RC Success"]}{rowb+2}/${xb["RC Occurences"]}{rowb+2}, 0)')
 				for status in ['Open', 'Close']:
 					for result in ['Success', 'Failed']:
 						bay_update[f'{status} {result}'].append('=' + countifs(*rules, rule_lookup('Status', f'"{status}"'), rule_lookup('Final Result', f'"{result.upper()}"')))
-				bay_update['Contribution'].append(f'=${xb["RC Occurences"]}{rowb+2}/${xb["RC Occurences"]}${blen+2}')	# <rc occur>/<total rc occur>
+				bay_update['Contribution'].append(f'=IFERROR(${xb["RC Occurences"]}{rowb+2}/${xb["RC Occurences"]}${blen+2}, 0)')	# <rc occur>/<total rc occur>
 				bay_update['Reduction'].append(f'=${xb["RC Failed"]}{rowb+2}/${xb["RC Occurences"]}${blen+2}')	# <rc failed>/<total rc occur>
 				bay_update['Tagging'].append(f'=IF(IFERROR(${xb["Open Failed"]}{rowb+2}^2/(${xb["Open Failed"]}{rowb+2}+${xb["Open Success"]}{rowb+2}), 0)>{thd_var}, "O", "") & IF(IFERROR(${xb["Close Failed"]}{rowb+2}^2/(${xb["Close Failed"]}{rowb+2}+${xb["Close Success"]}{rowb+2}), 0)>{thd_var}, "C", "")')
 
@@ -1162,7 +1160,7 @@ class _RCDBaseCalculation:
 				'RC Occurences': [f'=SUM(${xb["RC Occurences"]}$2:${xb["RC Occurences"]}${blen+1})'],
 				'RC Success': [f'=SUM(${xb["RC Success"]}$2:${xb["RC Success"]}${blen+1})'],
 				'RC Failed': [f'=SUM(${xb["RC Failed"]}$2:${xb["RC Failed"]}${blen+1})'],
-				'Success Rate': [f'=${xb["RC Success"]}{blen+2}/${xb["RC Occurences"]}{blen+2}'],
+				'Success Rate': [f'=IFERROR(${xb["RC Success"]}{blen+2}/${xb["RC Occurences"]}{blen+2}, 0)'],
 				'Open Success': [f'=SUM(${xb["Open Success"]}$2:${xb["Open Success"]}${blen+1})'],
 				'Open Failed': [f'=SUM(${xb["Open Failed"]}$2:${xb["Open Failed"]}${blen+1})'],
 				'Close Success': [f'=SUM(${xb["Close Success"]}$2:${xb["Close Success"]}${blen+1})'],
@@ -1176,13 +1174,13 @@ class _RCDBaseCalculation:
 				opr_update['RC Occurences'].append('=' + countifs(*rules))
 				opr_update['RC Success'].append('=' + countifs(*rules, rule_lookup('Final Result', '"SUCCESS"')))
 				opr_update['RC Failed'].append('=' + countifs(*rules, rule_lookup('Final Result', '"FAILED"')))
-				opr_update['Success Rate'].append(f'=${xo["RC Success"]}{rowo+2}/${xo["RC Occurences"]}{rowo+2}')
+				opr_update['Success Rate'].append(f'=IFERROR(${xo["RC Success"]}{rowo+2}/${xo["RC Occurences"]}{rowo+2}, 0)')
 
 			opr_result = {
 				'RC Occurences': [f'=SUM(${xo["RC Occurences"]}$2:${xo["RC Occurences"]}${olen+1})'],
 				'RC Success': [f'=SUM(${xo["RC Success"]}$2:${xo["RC Success"]}${olen+1})'],
 				'RC Failed': [f'=SUM(${xo["RC Failed"]}$2:${xo["RC Failed"]}${olen+1})'],
-				'Success Rate': [f'=${xo["RC Success"]}{olen+2}/${xo["RC Occurences"]}{olen+2}'],
+				'Success Rate': [f'=IFERROR(${xo["RC Success"]}{olen+2}/${xo["RC Occurences"]}{olen+2}, 0)'],
 			}
 			df_opr_result = pd.DataFrame(data=opr_result)
 
@@ -1198,8 +1196,8 @@ class _RCDBaseCalculation:
 			self.result['statistic']['marked']['success'] = f'=COUNTIF(RC_ONLY!${xr["Marked Success"]}$2:{xr["Marked Success"]}${rlen+1}, "*")'
 			self.result['statistic']['marked']['failed'] = f'=COUNTIF(RC_ONLY!${xr["Marked Failed"]}$2:{xr["Marked Failed"]}${rlen+1}, "*")'
 			self.result['statistic']['marked']['total'] = f'=COUNTIF(RC_ONLY!${xr["Marked Unused"]}$2:{xr["Marked Failed"]}${rlen+1}, "*")'
-			self.result['statistic']['operation']['close_success_percentage'] = f'=ROUND(BAY!${xb["Close Success"]}${blen+2}/(BAY!${xb["Close Success"]}${blen+2}+BAY!${xb["Close Failed"]}${blen+2})*100, 2) & "%"'
-			self.result['statistic']['operation']['open_success_percentage'] = f'=ROUND(BAY!${xb["Open Success"]}${blen+2}/(BAY!${xb["Open Success"]}${blen+2}+BAY!${xb["Open Failed"]}${blen+2})*100, 2) & "%"'
+			self.result['statistic']['operation']['close_success_percentage'] = f'=ROUND(IFERROR(BAY!${xb["Close Success"]}${blen+2}/(BAY!${xb["Close Success"]}${blen+2}+BAY!${xb["Close Failed"]}${blen+2}), 0)*100, 2) & "%"'
+			self.result['statistic']['operation']['open_success_percentage'] = f'=ROUND(IFERROR(BAY!${xb["Open Success"]}${blen+2}/(BAY!${xb["Open Success"]}${blen+2}+BAY!${xb["Open Failed"]}${blen+2}), 0)*100, 2) & "%"'
 			self.result['overall']['percentage'] = f'=ROUND(BAY!${xb["Success Rate"]}${blen+2}*100, 2) & "%"'
 
 		return {
@@ -1336,6 +1334,12 @@ class RCDFromOFDB(SpectrumOfdbClient, SOEtoRCD):
 
 
 class RCDFromFile(SpectrumFileReader, SOEtoRCD):
+
+	def __init__(self, filepaths:Union[str, list], **kwargs):
+		super().__init__(filepaths, **kwargs)
+
+
+class RCDFromFile2(SurvalentFileReader, SOEtoRCD):
 
 	def __init__(self, filepaths:Union[str, list], **kwargs):
 		super().__init__(filepaths, **kwargs)

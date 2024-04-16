@@ -1,11 +1,10 @@
 import re
-from configparser import ConfigParser
 from glob import glob
 from typing import Union
 
 import pandas as pd
 from global_parameters import RCD_COLUMNS, RTU_COLUMNS, SOE_COLUMNS, SOE_COLUMNS_DTYPE
-from lib import calc_time, immutable_dict, load_cpoint, load_workbook, read_xml, test_datetime_format
+from lib import calc_time, immutable_dict, join_datetime, load_cpoint, load_workbook, read_xml, test_datetime_format
 
 
 class _FileReader:
@@ -351,8 +350,170 @@ class AvFileReader(_FileReader):
 		return self._rtudown_all if hasattr(self, '_updown_all') else self.load()
 
 
+class SurvalentFileReader(_FileReader):
+	column_dtype = immutable_dict(SOE_COLUMNS_DTYPE)
+	column_list = ['Time', 'Point', 'Message', 'Operator']
+	sheet_name = 'Report'
+	time_series_column = 'Time'
+	datetime_format = '%Y-%m-%d %H:%M:%S.%f'
+	elements = ['CBTR', 'CD', 'CSO', 'LR', 'MTO']
+	statuses = {'opened': 'Open', 'closed': 'Close', 'enabled': 'Enable', 'disabled': 'Disable', 'appear': 'Appeared'}
+	b3_dict = dict()
+	cmd_order = list()
+	cmd_neg_feedback = list()
+
+	def post_load(self, df:pd.DataFrame):
+		"""
+		Executed after load completed.
+		"""
+
+		df_extracted = self.extractor(df)
+		self._soe_all = df_extracted
+		# Change time series reference
+		self.time_series_column = 'Time stamp'
+		super().post_load(df_extracted)
+
+	def find_cmd_status(self, df:pd.DataFrame, feedback_index:int):
+		"""
+		Find negative feedback "status" parameter from previous command.
+		"""
+
+		cmd_status = ''
+		dt0, ms0, b3, elm = df.loc[feedback_index, ['Time stamp', 'Milliseconds', 'B3', 'Element']]
+		df_cmd = df[(df['B3']==b3) & (df['Element']==elm) & (df['Operator']!='')]
+
+		if df_cmd[(df_cmd['Tag']=='OR') & (join_datetime(df_cmd['Time stamp'], df_cmd['Milliseconds'])<join_datetime(dt0, ms0))].shape[0]>0:
+			# Check previous command order
+			cmd_order = df_cmd[(df_cmd['Tag']=='OR') & (join_datetime(df_cmd['Time stamp'], df_cmd['Milliseconds'])<join_datetime(dt0, ms0))].iloc[-1]
+			cmd_status = cmd_order['Status']
+
+		return cmd_status
+
+	def extractor(self, df:pd.DataFrame):
+		"""
+		Extract columns into standardized columns.
+		"""
+
+		columns = SOE_COLUMNS
+		# Copy and reorder Dataframe
+		df0 = df.copy().sort_values('Time')
+		df0[['Point B3', 'Element']] = df0['Point'].str.split(',', expand=True)
+
+		# Filter only required element
+		df0 = df0[(df0['Element'].isin(self.elements + self.switching_element)) & ~((df0['Message'].str.contains('Put in scan')) | (df0['Message'].str.contains('ALL ALARMS BLOCKED')))].reset_index(drop=True)
+		df0['A'] = ''
+		df0[['Time stamp', 'Milliseconds']] = df0['Time'].str.split('.', expand=True)
+		df0[['System time stamp', 'System milliseconds']] = df0[['Time stamp', 'Milliseconds']]
+		df0['B1'] = ''
+		df0['B2'] = '150'	# assumming all bay is 150kV
+		df0['B3'] = ''
+		df0['Status'] = ''
+		df0['Tag'] = ''
+		df0['Comment'] = ''
+		df0['User comment'] = ''
+		df0['RTU ID'] = ''
+
+		dftype = {key: value for key, value in self.column_dtype.items() if key in df0.columns}
+		df0 = df0.astype(dftype)
+
+		# Modify columns for statuses
+		for elm1 in self.elements + self.switching_element:
+			self.extract_status(df0, elm1)
+
+		# Update b3_dict
+		# Used in defining command's B1 column
+		b3_unique = df0.loc[df0['B1']!='', ['B1', 'B3']].drop_duplicates(keep='first').values
+		for vb1, vb3 in b3_unique:
+			if vb3!='': self.b3_dict[vb3] = vb1
+
+		# Modify columns for commands
+		for elm2 in self.switching_element:
+			self.extract_command(df0, elm2)
+
+		# Modify columns for negative feedback
+		for ind in self.cmd_neg_feedback:
+			cmd_sts = self.find_cmd_status(df0, ind)
+			df0.loc[ind, 'Status'] = cmd_sts
+
+		return df0[columns + ['RTU ID', 'Point', 'Message']]
+
+	def extract_status(self, df:pd.DataFrame, element:str):
+		"""
+		Extract parameters of status events from "Message".
+		Format :
+		  - *<RTU ID> <B1> <B3> <Element> <Status> <Ext. Information>	>> Normal status
+		"""
+
+		index = df[(df['Element']==element) & (df['Operator']=='')].index
+
+		for i in index:
+			msg, pb3, elm = df.loc[i, ['Message', 'Point B3', 'Element']]
+			msg = str(msg).replace(' 20 ', ' ')
+			_splitted = msg.split(' '.join((pb3, elm)))
+
+			if len(_splitted)==2:
+				_lstr, _rstr = _splitted
+				_lsplit = _lstr.strip().split(' ')
+				_rsplit = _rstr.strip().split(' ')
+				pointid = _lsplit.pop(0).replace('*', '')
+				b1 = ' '.join(_lsplit)
+				b3 = '' if elm=='CD' else pb3
+				sts = self.statuses[_rsplit[0].lower()] if _rsplit[0].lower() in self.statuses else _rsplit[0].title()
+			elif len(_splitted)==3:
+				_lstr, _rstr = _splitted[0], _splitted[2]
+				_rsplit = _rstr.strip().split(' ')
+				pointid = _lstr.strip().split(' ')[0].replace('*', '')
+				b1 = pb3
+				b3 = ''
+				sts = self.statuses[_rsplit[0].lower()] if _rsplit[0].lower() in self.statuses else _rsplit[0].title()
+			else:
+				raise IndexError(f'Error extracting value! key="{msg}", string=[{pb3}, {elm}]')
+			
+			df.loc[i, ['B1', 'B3', 'Status', 'RTU ID']] = [b1, b3, sts, pointid]
+
+	def extract_command(self, df:pd.DataFrame, element:str):
+		"""
+		Extract parameters of command events from "Message".
+		Format :
+		  - *<Status> <B3>,<Element> FROM <UI Dispatcher>::<User>	>>	Normal command
+		  - *<B3>,<Element>***<RTU ID> <B1> CONTROL ECHO FAILURE	>>	Negative feedback
+		"""
+
+		index = df[(df['Element']==element) & (df['Operator']!='')].index
+
+		for i in index:
+			msg, poi, b3, elm = df.loc[i, ['Message', 'Point', 'Point B3', 'Element']]
+			msg = str(msg).replace(' 20 ', ' ')
+			_splitted = msg.split(poi)
+
+			if len(_splitted)==2:
+				_lstr, _rstr = _splitted
+				_lsplit = _lstr.strip().split(' ')
+				if 'CONTROL ECHO FAILURE' in _rstr:
+					tag = 'NE'
+					sts = ''
+					self.cmd_neg_feedback.append(i)
+				else:
+					tag = 'OR'
+					sts = _lsplit[0].replace('*', '')
+					self.cmd_order.append(i)
+				b1 = self.b3_dict.get(b3, '')
+			else:
+				raise IndexError(f'Error extracting value! key="{msg}", string=[{b3}, {elm}]')
+
+			df.loc[i, ['B1', 'B3', 'Status', 'Tag']] = [b1, b3, sts, tag]
+
+
+	@property
+	def soe_all(self):
+		return self._soe_all if hasattr(self, '_soe_all') else self.load()
+
+
 def main():
 	pass
 
 if __name__=='__main__':
-	main()
+	ans = input('Confirm troubleshooting? [y/n]\t')
+	if ans=='y':
+		f = SurvalentFileReader('/media/shared-ntfs/1-scada-makassar/AVAILABILITY/2024/RCD/Kendari/EVENT_RC202403*.XLSX')
+		f._soe_all.to_excel('test_rcd_kendari.xlsx', index=False)
