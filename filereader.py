@@ -22,7 +22,11 @@ class _FileReader:
 		if isinstance(filepaths, str):
 			for f in filepaths.split(','):
 				if '*' in f:
-					self.filepaths += glob(f.strip())
+					g = glob(f.strip())
+					if len(g)>0:
+						self.filepaths += g
+					else:
+						print(f'Warning: File yang menyerupai "{f}" tidak ditemukan.')
 				elif f.strip():
 					self.filepaths.append(f.strip())
 		elif isinstance(filepaths, list):
@@ -87,7 +91,7 @@ class _FileReader:
 
 		if self._date_range==None: self.set_date_range(date_start=df[self.time_series_column].min(), date_stop=df[self.time_series_column].max())
 
-	def open_file(self, filepath:str, **kwargs):
+	def open_file(self, filepath:str, sheet_name:str=None, table_header:Union[list, tuple]=None, base_column:str=None, **kwargs):
 		"""
 		Loads single excel file into pandas Dataframe.
 		"""
@@ -95,9 +99,6 @@ class _FileReader:
 		wb = {}
 		df = None
 		first_sheet = False
-		sheet_name = kwargs.get('sheet_name')
-		table_header = kwargs.get('table_header')
-		base_column = kwargs.get('base_column')
 
 		if sheet_name is None and table_header is None: first_sheet = True		# Sheet name & header not defined, load first sheet
 
@@ -107,7 +108,7 @@ class _FileReader:
 
 			if first_sheet:
 				# Get first sheet name in workbook
-				sheet_name = wb.keys()[0]
+				sheet_name = tuple(wb.keys())[0]
 
 			if sheet_name in wb:
 				ws = wb[sheet_name]
@@ -524,11 +525,63 @@ class SurvalentFileReader(_FileReader):
 		return self._soe_all if hasattr(self, '_soe_all') else self.load()
 
 
-def main():
-	pass
+def test_random_file(**params):
+	print(' TEST OPEN RANDOM FILE '.center(80, '#'))
+	print('## Dummy load ##')
+	f = SpectrumFileReader('sample/sample_rcd_2024_01.xlsx')
+	file = input('\r\nMasukkan lokasi file :  ')
+	if file:
+		f1 = f.open_file(file)
+	else:
+		f1 = None
+	return f1
+
+def test_file_not_exist(**params):
+	print(' TEST FILE NOT FOUND '.center(80, '#'))
+	f = SpectrumFileReader('sample/file_not_existed.xlsx')
+	return f
+
+def test_wrong_file(**params):
+	print(' TEST WRONG FILE '.center(80, '#'))
+	f = SpectrumFileReader('sample/wrong_file_1.xlsx')
+	return f
+
+def test_file_spectrum(**params):
+	print(' TEST FILE SOE SPECTRUM '.center(80, '#'))
+	f = SpectrumFileReader('sample/sample_rcd*.xlsx')
+	return f
+
+def test_file_survalent(**params):
+	print(' TEST FILE SOE SURVALENT '.center(80, '#'))
+	f = SurvalentFileReader('sample/survalent/sample_soe*.XLSX')
+	return f
+
+def test_file_rcd_collective(**params):
+	print(' TEST FILE RCD COLLECTIVE '.center(80, '#'))
+	f = RCFileReader('sample/sample_rcd*.xlsx')
+	return f
+
+def test_file_rtu_collective(**params):
+	print(' TEST FILE RTU COLLECTIVE '.center(80, '#'))
+	f = AvFileReader('sample/sample_rcd*.xlsx')
+	return f
 
 if __name__=='__main__':
+	test_list = [
+		('Test file bebas', test_random_file),
+		('Test file tidak ditemukan', test_file_not_exist),
+		('Test file salah format', test_wrong_file),
+		('Test file SOE Spectrum', test_file_spectrum),
+		('Test file SOE Survalent', test_file_survalent),
+		('Test file RCD gabungan', test_file_rcd_collective),
+		('Test file RTU gabungan', test_file_rtu_collective)
+	]
 	ans = input('Confirm troubleshooting? [y/n]  ')
 	if ans=='y':
-		f = SurvalentFileReader('/media/shared-ntfs/1-scada-makassar/AVAILABILITY/2024/RCD/Kendari/EVENT_RC202403*.XLSX')
-		f._soe_all.to_excel('test_rcd_kendari.xlsx', index=False)
+		print('\r\n'.join([f'  {no+1}.'.ljust(6) + tst[0] for no, tst in enumerate(test_list)]))
+		choice = int(input(f'\r\nPilih modul test [1-{len(test_list)}] :  ')) - 1
+		if choice in range(len(test_list)):
+			print()
+			test = test_list[choice][1]()
+		else:
+			print('Pilihan tidak valid!')

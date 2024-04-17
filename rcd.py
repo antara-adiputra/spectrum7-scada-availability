@@ -1385,26 +1385,26 @@ Rangkuman RC {kwargs.get('element')} tanggal {kwargs.get('date_start')} s/d {kwa
 """
 
 def test_analyze_file(**params):
-	print(' TEST ANALYZE RCD '.center(60, '#'))
-	rc = RCDFromFile('sample/sample_rc*.xlsx')
+	print(' TEST ANALYZE RCD '.center(80, '#'))
+	rc = RCDFromFile('sample/sample_rcd*.xlsx')
 	rc.calculate()
-	if 'y' in input('Export hasil test? [y/n]'):
+	if 'y' in input('Export hasil test? [y/n]  '):
 		rc.to_excel('test_analyze_rcd_spectrum')
 	return rc
 
 def test_analyze_file2(**params):
-	print(' TEST ANALYZE RCD '.center(60, '#'))
-	rc = RCDFromFile2('sample/survalent/sample_soe*.xlsx')
+	print(' TEST ANALYZE RCD '.center(80, '#'))
+	rc = RCDFromFile2('sample/survalent/sample_soe*.XLSX')
 	rc.calculate()
-	if 'y' in input('Export hasil test? [y/n]'):
+	if 'y' in input('Export hasil test? [y/n]  '):
 		rc.to_excel('test_analyze_rcd_survalent')
 	return rc
 
 def test_collective_file(**params):
-	print(' TEST COLLECTIVE RCD '.center(60, '#'))
-	rc = RCDCollective('sample/sample_rc*.xlsx')
+	print(' TEST COLLECTIVE RCD '.center(80, '#'))
+	rc = RCDCollective('sample/sample_rcd*.xlsx')
 	rc.calculate()
-	if 'y' in input('Export hasil test? [y/n]'):
+	if 'y' in input('Export hasil test? [y/n]  '):
 		rc.to_excel('test_collective_rcd')
 	return rc
 
@@ -1420,6 +1420,7 @@ if __name__=='__main__':
 		print('\r\n'.join([f'  {no+1}.'.ljust(6) + tst[0] for no, tst in enumerate(test_list)]))
 		choice = int(input(f'\r\nPilih modul test [1-{len(test_list)}] :  ')) - 1
 		if choice in range(len(test_list)):
-			rc = test_list[choice][1]()
+			print()
+			test = test_list[choice][1]()
 		else:
 			print('Pilihan tidak valid!')
