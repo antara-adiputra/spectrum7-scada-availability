@@ -9,7 +9,6 @@ import pandas as pd
 import xlsxwriter
 from xlsxwriter.utility import xl_col_to_name
 from lxml import etree as et
-from global_parameters import SOE_COLUMNS
 
 
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
@@ -105,9 +104,9 @@ def load_cpoint(path:str):
 		raise FileNotFoundError(f'\tNOK!\nFile "{path}" tidak ditemukan.')
 	except Exception:
 		raise ValueError(f'\tNOK!\nGagal membuka file "{path}".')
-	
+
 	return cpoint
-	
+
 def load_workbook(filepath:str):
 	"""
 	Load whole excel file as dict of worksheets.
@@ -121,9 +120,9 @@ def load_workbook(filepath:str):
 		raise FileNotFoundError
 	except Exception:
 		raise ImportError
-	
+
 	return wb
-	
+
 def progress_bar(value:float, width:int=0, style:str='full-block'):
 	symbol = {'full-block': '█', 'left-half-block': '▌', 'right-half-block': '▐'}
 	if width==0: width = os.get_terminal_size()[0]-1
@@ -135,34 +134,9 @@ def progress_bar(value:float, width:int=0, style:str='full-block'):
 	else:
 		print(f'\r {"Selesai... 100%".ljust(width, " ")}', flush=True)
 
-def read_xls(filepath:str, sheet:str=None, is_soe:bool=True, **kwargs):
-	"""
-	"""
-
-	wb = load_workbook(filepath)
-
-	if sheet:
-		if sheet in wb:
-			df = wb[sheet]
-		else:
-			raise KeyError(f'Sheet "{sheet}" tidak ditemukan.')
-	else:
-		if is_soe:
-			for ws_name, sheet in wb.items():
-				if set(SOE_COLUMNS).issubset(sheet.columns):
-					df = sheet[sheet['Time stamp'].notnull()].fillna('')
-					break
-		else:
-			df = list(wb.values())[0]
-
-	if df.shape[0]>0:
-		return df
-	else:
-		raise ValueError
-
 def read_xml(filepath:str, **kwargs):
 	columns, rows = [], []
-	
+
 	try:
 		xml = et.parse(filepath)
 	except FileNotFoundError:
@@ -184,10 +158,10 @@ def read_xml(filepath:str, **kwargs):
 		return pd.DataFrame(data=rows, columns=columns).fillna('')
 	else:
 		raise ValueError
-	
+
 def similarity_ratio(str1:str, str2:str):
 	return SequenceMatcher(None, str1, str2).ratio()
-	
+
 def test_datetime_format(x):
 	if type(x)!=str: return x
 
@@ -312,11 +286,15 @@ class BaseExportMixin:
 			'comments': f'File digenerate otomatis oleh program {self.name}'
 		}
 
-	def get_xls_filename(self):
+	def get_xls_filename(self, **kwargs):
 		"""
 		"""
 
-		return f'{self.output_prefix}_Output_{self.t0.strftime("%Y%m%d")}-{self.t1.strftime("%Y%m%d")}'
+		filename = kwargs.get('filename')
+		if filename:
+			return filename
+		else:
+			return f'{self.output_prefix}_Output_{self.t0.strftime("%Y%m%d")}-{self.t1.strftime("%Y%m%d")}'
 
 	def get_sheet_info_data(self, **kwargs):
 		"""
@@ -325,7 +303,7 @@ class BaseExportMixin:
 		return [
 			('Source File', getattr(self, 'sources', '')),
 			('Output File', f'{kwargs.get("filepath", "")}'),
-			('RC Date Range', f'{self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")}'),
+			('Date Range', f'{self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")}'),
 			('Processed Date', self.process_date.strftime('%d-%m-%Y %H:%M:%S')),
 			('Execution Time', f'{self.process_duration}s'),
 			('PC', platform.node()),
@@ -344,7 +322,7 @@ class BaseExportMixin:
 		# Check target directory of output file
 		if not os.path.isdir(self.output_dir): os.mkdir(self.output_dir)
 
-		filename = self.get_xls_filename()
+		filename = self.get_xls_filename(**kwargs)
 		file_list = glob(f'{self.output_dir}/{filename}*.{self.output_extension}')
 
 		if len(file_list)>0: filename += f'_rev{len(file_list)}'

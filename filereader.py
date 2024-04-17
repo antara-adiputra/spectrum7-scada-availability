@@ -49,26 +49,36 @@ class _FileReader:
 		"""
 
 		data = []
+		errors = 0
 
 		if self.filepaths:
-			# If paths is not None
+			# If paths defined
 			for file in self.filepaths:
-				df = self.open_file(filepath=file)
+				df = self.open_file(filepath=file, sheet_name=self.sheet_name, table_header=self.column_list, base_column=self.time_series_column)
 				if isinstance(df, pd.DataFrame):
 					df = self.post_open_file(df)
 					data.append(df)
 				else:
-					print('Gagal.', end='', flush=True)
-					raise ValueError('Gagal mengimport file.')
+					errors += 1
+					# print('\r\nGagal!')
+					# raise ValueError('Gagal mengimport file.')
+
+			if errors:
+				choice = input(f'Terdapat {errors} error, tetap lanjutkan? [y/n]\t')
+				if 'y' in choice:
+					# Continue
+					pass
+				else:
+					raise RuntimeError(f'Proses dihentikan oleh user. (Error={errors})')
 
 			# Combine each Dataframe in data list into one and eleminate duplicated rows
 			df_merged = pd.concat(data).drop_duplicates(keep=self.keep_duplicate)
-		
+
 			self.sources = ',\n'.join(self.filepaths)
-			print('Selesai.', end='', flush=True)
+			print(f'Selesai. (Error={errors})', end='', flush=True)
 			return df_merged
 		else:
-			raise FileExistsError('Error lokasi file.')
+			raise SyntaxError('Input file belum ditentukan!')
 
 	def post_load(self, df:pd.DataFrame):
 		"""
@@ -84,32 +94,54 @@ class _FileReader:
 
 		wb = {}
 		df = None
+		first_sheet = False
+		sheet_name = kwargs.get('sheet_name')
+		table_header = kwargs.get('table_header')
+		base_column = kwargs.get('base_column')
+
+		if sheet_name is None and table_header is None: first_sheet = True		# Sheet name & header not defined, load first sheet
 
 		print(f'Membuka file "{filepath}"...', end='', flush=True)
 		try:
 			wb = load_workbook(filepath)
-			if self.sheet_name in wb:
-				ws = wb[self.sheet_name]
-				if set(self.column_list).issubset(ws.columns):
-					df = ws[ws[self.time_series_column].notnull()].fillna('')
+
+			if first_sheet:
+				# Get first sheet name in workbook
+				sheet_name = wb.keys()[0]
+
+			if sheet_name in wb:
+				ws = wb[sheet_name]
+				if table_header is None:
+					df = ws
 					print('\tOK!')
+				else:
+					if set(table_header).issubset(ws.columns):
+						df = ws
+						print('\tOK!')
+					else:
+						print(f'\tNOK!\r\nHeader tabel tidak sesuai.')
 			else:
 				for ws_name, sheet in wb.items():
-					if set(self.column_list).issubset(sheet.columns):
-						df = sheet[sheet[self.time_series_column].notnull()].fillna('')
+					# Loop through workbook sheets & match header
+					if set(table_header).issubset(sheet.columns):
+						df = sheet
 						print('\tOK!')
 						break
-				
-				if df==None: print(f'\nData "{self.sheet_name}" tidak ditemukan!')
+
+				if df is None: print(f'\tNOK!\r\nData tidak ditemukan!')
+
+			if isinstance(df, pd.DataFrame) and base_column is not None:
+				# Neglect null value on base column
+				df = df[df[base_column].notnull()]
 
 		except (ValueError, ImportError):
 			try:
-				# Retry to open file with xml format
+				# Attempting to open file with xml format
 				df = read_xml(filepath, **kwargs)
 			except (ValueError, ImportError):
-				print('\tNOK!\nGagal membuka file.')
+				print('\tNOK!\r\nGagal membuka file.')
 		except FileNotFoundError:
-			print('\tNOK!\nFile tidak ditemukan.')
+			print('\tNOK!\r\nFile tidak ditemukan.')
 
 		self.cached_file[filepath] = df
 
@@ -165,20 +197,14 @@ class SpectrumFileReader(_FileReader):
 		Executed after load completed.
 		"""
 
-		super().post_load(df)
-		self._soe_all = self.prepare_data(df)
-
-	def post_open_file(self, df:pd.DataFrame):
-		"""
-		"""
-
 		if pd.api.types.is_object_dtype(df['Time stamp']) or pd.api.types.is_object_dtype(df['System time stamp']):
 			df['Time stamp'] = df['Time stamp'].map(lambda x: test_datetime_format(x))
 			df['System time stamp'] = df['System time stamp'].map(lambda x: test_datetime_format(x))
 		# Format B2 as string value
 		df['B2'] = df['B2'].map(lambda x: re.sub(r'\.\d+', '', str(x)))
 
-		return super().post_open_file(df)
+		super().post_load(df)
+		self._soe_all = self.prepare_data(df)
 
 	def prepare_data(self, df:pd.DataFrame, **kwargs):
 		"""
@@ -191,11 +217,12 @@ class SpectrumFileReader(_FileReader):
 			# Remove unnecessary spaces on begining and or trailing string object
 			if pd.api.types.is_object_dtype(df[col]): df[col] = df[col].str.strip()
 
+		new_df = df.copy().fillna('')
 		# Filter new DataFrame
-		new_df = df.loc[(df['A']=='') & (df[self.time_series_column]>=self.date_range[0]) & (df[self.time_series_column]<=self.date_range[1]), self.column_list].copy()
+		new_df = new_df.loc[(new_df['A']=='') & (new_df[self.time_series_column]>=self.date_range[0]) & (new_df[self.time_series_column]<=self.date_range[1]), self.column_list]
 		new_dftype = {key: value for key, value in self.column_dtype.items() if key in new_df.columns}
 
-		new_df = new_df.astype(new_dftype).fillna('')
+		new_df = new_df.astype(new_dftype)
 		new_df = new_df.sort_values(['System time stamp', 'System milliseconds', 'Time stamp', 'Milliseconds'], ascending=[True, True, True, True]).reset_index(drop=True)
 		new_df['Status'] = new_df['Status'].str.title()
 
@@ -280,17 +307,11 @@ class RCFileReader(_FileReader):
 		Executed after load completed.
 		"""
 
-		super().post_load(df)
-		self._rcd_all = self.prepare_data(df)
-
-	def post_open_file(self, df:pd.DataFrame):
-		"""
-		"""
-
 		# Format B2 as string value
 		df['B2'] = df['B2'].map(lambda x: re.sub(r'\.\d+', '', str(x)))
 
-		return super().post_open_file(df)
+		super().post_load(df)
+		self._rcd_all = self.prepare_data(df)
 
 	def prepare_data(self, df:pd.DataFrame, **kwargs):
 		"""
@@ -298,7 +319,7 @@ class RCFileReader(_FileReader):
 
 		# Filter new DataFrame
 		new_df = df.loc[(df[self.time_series_column]>=self.date_range[0]) & (df[self.time_series_column]<=self.date_range[1]), self.column_list].copy()
-		new_df = new_df.sort_values([self.time_series_column], ascending=[True]).reset_index(drop=True)
+		new_df = new_df.fillna('').sort_values([self.time_series_column], ascending=[True]).reset_index(drop=True)
 
 		return new_df
 
@@ -322,17 +343,11 @@ class AvFileReader(_FileReader):
 		Executed after load completed.
 		"""
 
-		super().post_load(df)
-		self._rtudown_all = self.prepare_data(df)
-
-	def post_open_file(self, df:pd.DataFrame):
-		"""
-		"""
-
 		# Format B2 as string value
 		df['B2'] = df['B2'].map(lambda x: re.sub(r'\.\d+', '', str(x)))
 
-		return super().post_open_file(df)
+		super().post_load(df)
+		self._rtudown_all = self.prepare_data(df)
 
 	def prepare_data(self, df:pd.DataFrame, **kwargs):
 		"""
@@ -340,7 +355,7 @@ class AvFileReader(_FileReader):
 
 		# Filter new DataFrame
 		new_df = df.loc[(df[self.time_series_column]>=self.date_range[0]) & (df[self.time_series_column]<=self.date_range[1]), self.column_list].copy()
-		new_df = new_df.sort_values([self.time_series_column], ascending=[True]).reset_index(drop=True)
+		new_df = new_df.fillna('').sort_values([self.time_series_column], ascending=[True]).reset_index(drop=True)
 
 		return new_df
 
@@ -396,7 +411,7 @@ class SurvalentFileReader(_FileReader):
 
 		columns = SOE_COLUMNS
 		# Copy and reorder Dataframe
-		df0 = df.copy().sort_values('Time')
+		df0 = df.copy().sort_values('Time').fillna('')
 		df0[['Point B3', 'Element']] = df0['Point'].str.split(',', expand=True)
 
 		# Filter only required element
@@ -468,7 +483,7 @@ class SurvalentFileReader(_FileReader):
 				sts = self.statuses[_rsplit[0].lower()] if _rsplit[0].lower() in self.statuses else _rsplit[0].title()
 			else:
 				raise IndexError(f'Error extracting value! key="{msg}", string=[{pb3}, {elm}]')
-			
+
 			df.loc[i, ['B1', 'B3', 'Status', 'RTU ID']] = [b1, b3, sts, pointid]
 
 	def extract_command(self, df:pd.DataFrame, element:str):
@@ -499,7 +514,7 @@ class SurvalentFileReader(_FileReader):
 					self.cmd_order.append(i)
 				b1 = self.b3_dict.get(b3, '')
 			else:
-				raise IndexError(f'Error extracting value! key="{msg}", string=[{b3}, {elm}]')
+				raise IndexError(f'Error extracting value! index={i} key="{msg}", string=[{b3}, {elm}]')
 
 			df.loc[i, ['B1', 'B3', 'Status', 'Tag']] = [b1, b3, sts, tag]
 
@@ -513,7 +528,7 @@ def main():
 	pass
 
 if __name__=='__main__':
-	ans = input('Confirm troubleshooting? [y/n]\t')
+	ans = input('Confirm troubleshooting? [y/n]  ')
 	if ans=='y':
 		f = SurvalentFileReader('/media/shared-ntfs/1-scada-makassar/AVAILABILITY/2024/RCD/Kendari/EVENT_RC202403*.XLSX')
 		f._soe_all.to_excel('test_rcd_kendari.xlsx', index=False)

@@ -5,7 +5,7 @@ from glob import glob
 from avrs import AVRSCollective, AVRSFromFile, AVRSFromOFDB
 from consolemenu import *
 from consolemenu.items import *
-from rcd import RCDCollective, RCDFromFile, RCDFromOFDB
+from rcd import RCDCollective, RCDFromFile, RCDFromFile2, RCDFromOFDB
 
 
 class ConsoleApp:
@@ -86,14 +86,15 @@ class ConsoleApp:
 		# Define submenu RCD
 		menu_rcd = ConsoleMenu(title='Remote Control SCADA', clear_screen=False, exit_option_text=self.back_text, screen=self.screen)
 		item_rcd1 = FunctionItem('Dari database', function=self.from_ofdb, menu=menu_rcd, args=[RCDFromOFDB], kwargs={'menu': menu_rcd})
-		item_rcd2 = FunctionItem('Dari file', function=self.from_file, menu=menu_rcd, args=[RCDFromFile], kwargs={'menu': menu_rcd})
-		item_rcd3 = FunctionItem('Rangkum beberapa file', function=self.from_file, menu=menu_rcd, args=[RCDCollective], kwargs={'menu': menu_rcd})
-		menu_rcd.items = [item_rcd1, item_rcd2, item_rcd3]
+		item_rcd2 = FunctionItem('Dari file SOE (Spectrum)', function=self.from_file, menu=menu_rcd, args=[RCDFromFile], kwargs={'menu': menu_rcd})
+		item_rcd3 = FunctionItem('Dari file SOE (Survalent)', function=self.from_file, menu=menu_rcd, args=[RCDFromFile2], kwargs={'menu': menu_rcd})
+		item_rcd4 = FunctionItem('Rangkum beberapa file', function=self.from_file, menu=menu_rcd, args=[RCDCollective], kwargs={'menu': menu_rcd})
+		menu_rcd.items = [item_rcd1, item_rcd2, item_rcd3, item_rcd4]
 		submenu1 = SubmenuItem('Remote Control SCADA', menu=self.menu, submenu=menu_rcd)
 		# Define submenu AVRS
 		menu_avrs = ConsoleMenu(title='Availability Remote Station', clear_screen=False, exit_option_text=self.back_text, screen=self.screen)
 		item_avrs1 = FunctionItem('Dari database', function=self.from_ofdb, menu=menu_avrs, args=[AVRSFromOFDB], kwargs={'menu': menu_avrs})
-		item_avrs2 = FunctionItem('Dari file', function=self.from_file, menu=menu_avrs, args=[AVRSFromFile], kwargs={'menu': menu_avrs})
+		item_avrs2 = FunctionItem('Dari file SOE (Spectrum)', function=self.from_file, menu=menu_avrs, args=[AVRSFromFile], kwargs={'menu': menu_avrs})
 		item_avrs3 = FunctionItem('Rangkum beberapa file', function=self.from_file, menu=menu_avrs, args=[AVRSCollective], kwargs={'menu': menu_avrs})
 		menu_avrs.items = [item_avrs1, item_avrs2, item_avrs3]
 		submenu2 = SubmenuItem('Availability Remote Station', menu=self.menu, submenu=menu_avrs)

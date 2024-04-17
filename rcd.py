@@ -14,7 +14,7 @@ from ofdb import SpectrumOfdbClient
 class _Export(BaseExportMixin):
 	_sheet_parameter = immutable_dict(RCD_BOOK_PARAM)
 	output_prefix = 'RCD'
-	
+
 	def get_sheet_info_data(self, **kwargs):
 		"""
 		"""
@@ -821,6 +821,19 @@ class _RCDBaseCalculation:
 		operator : Dataframe of grouped by Dispatcher (Operator)
 		"""
 
+		def div(x, y, default:int=0):
+			"""
+			Formula : <x>/<y>, if error return <default> value
+			"""
+			try:
+				if y==0:
+					z = default
+				else:
+					z = x / y
+			except Exception:
+				z = default
+			return z
+
 		if isinstance(self.rcd_all, pd.DataFrame):
 			# Can be filtered with date
 			if isinstance(start, datetime) and isinstance(stop, datetime):
@@ -855,9 +868,9 @@ class _RCDBaseCalculation:
 		rc_success = self.bay['RC Success'].sum()
 		rc_success_close = self.bay['Close Success'].sum()
 		rc_success_open = self.bay['Open Success'].sum()
-		rc_percentage = round(rc_success/rc_valid*100, 2)
-		rc_percentage_close = round(rc_success_close/rc_close*100, 2)
-		rc_percentage_open = round(rc_success_open/rc_open*100, 2)
+		rc_percentage = round(div(rc_success, rc_valid)*100, 2)
+		rc_percentage_close = round(div(rc_success_close, rc_close)*100, 2)
+		rc_percentage_open = round(div(rc_success_open, rc_open)*100, 2)
 
 		return {
 			'overall': {
@@ -1217,7 +1230,7 @@ class _RCDBaseCalculation:
 		# Check if RC Event has been analyzed
 		if self.calculated==False:
 			return print('Tidak dapat menampilkan hasil Kalkulasi RC. Jalankan fungsi "calculate()" terlebih dahulu.')
-		
+
 		df_gi = self.station.copy()
 		df_gi['Success Rate'] = df_gi['Success Rate'].map(lambda x: round(x*100, 2))
 		df_bay = self.bay.copy()
@@ -1371,12 +1384,42 @@ Rangkuman RC {kwargs.get('element')} tanggal {kwargs.get('date_start')} s/d {kwa
 
 """
 
-def main():
-	filepaths = input('Lokasi file : ')
-	rc = RCDFromFile(filepaths)
+def test_analyze_file(**params):
+	print(' TEST ANALYZE RCD '.center(60, '#'))
+	rc = RCDFromFile('sample/sample_rc*.xlsx')
 	rc.calculate()
-	rc.to_excel()
+	if 'y' in input('Export hasil test? [y/n]'):
+		rc.to_excel('test_analyze_rcd_spectrum')
+	return rc
+
+def test_analyze_file2(**params):
+	print(' TEST ANALYZE RCD '.center(60, '#'))
+	rc = RCDFromFile2('sample/survalent/sample_soe*.xlsx')
+	rc.calculate()
+	if 'y' in input('Export hasil test? [y/n]'):
+		rc.to_excel('test_analyze_rcd_survalent')
+	return rc
+
+def test_collective_file(**params):
+	print(' TEST COLLECTIVE RCD '.center(60, '#'))
+	rc = RCDCollective('sample/sample_rc*.xlsx')
+	rc.calculate()
+	if 'y' in input('Export hasil test? [y/n]'):
+		rc.to_excel('test_collective_rcd')
+	return rc
 
 
 if __name__=='__main__':
-	main()
+	test_list = [
+		('Test analisa file SOE Spectrum', test_analyze_file),
+		('Test analisa file SOE Survalent', test_analyze_file2),
+		('Test menggabungkan file', test_collective_file)
+	]
+	ans = input('Confirm troubleshooting? [y/n]  ')
+	if ans=='y':
+		print('\r\n'.join([f'  {no+1}.'.ljust(6) + tst[0] for no, tst in enumerate(test_list)]))
+		choice = int(input(f'\r\nPilih modul test [1-{len(test_list)}] :  ')) - 1
+		if choice in range(len(test_list)):
+			rc = test_list[choice][1]()
+		else:
+			print('Pilihan tidak valid!')

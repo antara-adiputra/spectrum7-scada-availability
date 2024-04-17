@@ -166,4 +166,5 @@ cython_debug/
 .setting
 cpoint.xlsx
 output/
+sample/
 *.bak

@@ -7,7 +7,7 @@ import pandas as pd
 from xlsxwriter.utility import xl_col_to_name
 from filereader import AvFileReader, SpectrumFileReader
 from global_parameters import RTU_BOOK_PARAM
-from lib import BaseExportMixin, read_xls, join_datetime, immutable_dict, load_cpoint, progress_bar, timedelta_split
+from lib import BaseExportMixin, join_datetime, immutable_dict, load_cpoint, progress_bar, timedelta_split
 from ofdb import SpectrumOfdbClient
 
 
