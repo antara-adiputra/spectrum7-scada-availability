@@ -111,7 +111,9 @@ RCD_SHEET_PARAM = {
 		'Marked Success': {'num_format': '@', 'align': 'center', 'text_wrap': True},
 		'Marked Failed': {'num_format': '@', 'align': 'center', 'text_wrap': True},
 		'Final Result': {'align': 'center'},
-        'Navigation': {'bold': True, 'font_color': 'blue', 'align': 'center', 'border': 1, 'bg_color': '#dcdcdc'}
+        'Navigation': {'bold': True, 'font_color': 'blue', 'align': 'center', 'border': 1, 'bg_color': '#dcdcdc'},
+        'Order Row (Helper)': {'num_format': 0, 'align': 'center', 'text_wrap': True},
+        'Feedback Row (Helper)': {'num_format': 0, 'align': 'center', 'text_wrap': True}
 	},
 	'width': {
 		'Order Time': 25,
@@ -124,6 +126,8 @@ RCD_SHEET_PARAM = {
 		'Marked Unused': 12,
 		'Marked Success': 12,
 		'Marked Failed': 12,
+        'Order Row (Helper)': 10,
+        'Feedback Row (Helper)': 10
 	}
 }
 RCDGROUP_SHEET_PARAM = {

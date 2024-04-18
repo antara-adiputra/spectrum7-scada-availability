@@ -795,6 +795,7 @@ class _RCDBaseCalculation:
 	threshold_variable = 1
 
 	def __init__(self, data:pd.DataFrame=None, calculate_bi:bool=False, check_repetition:bool=True, **kwargs):
+		self._mro = self.__class__.__mro__
 		self._calculated = False
 		self.check_repetition = check_repetition
 		self.station = None
@@ -1037,10 +1038,17 @@ class _RCDBaseCalculation:
 
 		if not self.calculated: raise SyntaxError('Jalankan calculate() terlebih dahulu!')
 
+		forsurvalent = SurvalentFileReader in self.mro
+		# print(f'Debug: Survalent mode={"YES" if forsurvalent else "NO"}')
 		df_rc = self.pre_process.copy()
 		df_gi = self.station.copy()
 		df_bay = self.bay.copy()
 		df_opr = self.operator.copy()
+
+		if forsurvalent:
+			# Applied only on Survalent SOE
+			df_rc['Order Row (Helper)'] = ''
+			df_rc['Feedback Row (Helper)'] = ''
 
 		if generate_formula:
 			rc_columns = df_rc.columns.to_list()
@@ -1076,6 +1084,10 @@ class _RCDBaseCalculation:
 			xb = {col: xl_col_to_name(bay_columns.index(col)) for col in bay_columns}
 			xo = {col: xl_col_to_name(opr_columns.index(col)) for col in opr_columns}
 
+			rc_update = {
+				'Execution (s)': [],
+				'Final Result': []
+			}
 			gi_update = {
 				'RC Occurences': [],
 				'RC Success': [],
@@ -1104,16 +1116,35 @@ class _RCDBaseCalculation:
 				'RC Failed': [],
 				'Success Rate': []
 			}
-			
+
 			# Define excel formula rule
 			rule_repetition = rule_lookup('Rep. Flag', '""')
 			rule_unused = rule_lookup('Marked Unused', '""')
 
 			# Apply excel formula as string
 			# Sheet RC_ONLY
-			df_rc['Final Result'] = np.array([f'=IF(${xr["Marked Success"]}{row+2}="*", "SUCCESS",' +
-						f'IF(${xr["Marked Failed"]}{row+2}="*", "FAILED",' +
-						f'${xr["Pre Result"]}{row+2}))' for row in range(rlen)])
+			if 'Navigation' in rc_columns and not forsurvalent:
+				# Apply navigation hyperlink on sheet RC_ONLY
+				rc_update['Navigation'] = self.generate_reference(soe=kwargs.get('soe'), rcd=df_rc)
+
+			if forsurvalent:
+				# Applied only on Survalent SOE
+				rc_update['Feedback Time'] = []
+				rc_update['Navigation'] = []
+				rc_update['Order Row (Helper)'] = []
+				rc_update['Feedback Row (Helper)'] = []
+
+			for rowr in range(rlen):
+				ir = rowr + 2
+				rc_update['Execution (s)'].append(f'=(${xr["Feedback Time"]}{ir}-${xr["Order Time"]}{ir})*24*3600')
+				rc_update['Final Result'].append(f'=IF(${xr["Marked Success"]}{ir}="*", "SUCCESS", IF(${xr["Marked Failed"]}{ir}="*", "FAILED", ${xr["Pre Result"]}{ir}))')
+
+				if forsurvalent:
+					rc_update['Feedback Time'].append(f'=INDIRECT("\'HIS_MESSAGES\'!B"&${xr["Feedback Row (Helper)"]}{ir})+(INDIRECT("\'HIS_MESSAGES\'!C"&${xr["Feedback Row (Helper)"]}{ir})/86400000)')
+					rc_update['Navigation'].append(f'=HYPERLINK("#HIS_MESSAGES!A"&{xr["Order Row (Helper)"]}{ir}&":T"&{xr["Feedback Row (Helper)"]}{ir},"CARI >>")')
+					rc_update['Order Row (Helper)'].append(kwargs.get('soe').index.get_loc(df_rc.loc[rowr, 'Navigation'][0]) + 2)
+					rc_update['Feedback Row (Helper)'].append(kwargs.get('soe').index.get_loc(df_rc.loc[rowr, 'Navigation'][1]) + 2)
+
 			rc_result = {
 				'Operator': [
 					'TOTAL RC (RAW)',
@@ -1129,21 +1160,18 @@ class _RCDBaseCalculation:
 				]
 			}
 			df_rc_result = pd.DataFrame(data=rc_result)
-
-			if 'Navigation' in rc_columns:
-				# Apply navigation hyperlink on sheet RC_ONLY
-				df_rc['Navigation'] = self.generate_reference(soe=kwargs.get('soe'), rcd=df_rc)
 			# Sheet GI
 			for rowg in range(glen):
-				rule_b1 = rule_lookup('B1', f'${xg["B1"]}{rowg+2}')
+				ig = rowg + 2
+				rule_b1 = rule_lookup('B1', f'${xg["B1"]}{ig}')
 				rules = [rule_b1, rule_repetition, rule_unused]
 				gi_update['RC Occurences'].append('=' + countifs(*rules))
 				gi_update['RC Success'].append('=' + countifs(*rules, rule_lookup('Final Result', '"SUCCESS"')))
 				gi_update['RC Failed'].append('=' + countifs(*rules, rule_lookup('Final Result', '"FAILED"')))
-				gi_update['Success Rate'].append(f'=IFERROR(${xg["RC Success"]}{rowg+2}/${xg["RC Occurences"]}{rowg+2}, 0)')
-				gi_update['Execution Avg.'].append(f'=IF(${xg["RC Success"]}{rowg+2}=0, 0, ' + averageifs(rule_lookup('Execution (s)'), *rules, rule_lookup('Final Result', '"SUCCESS"')) + ')')
-				gi_update['Termination Avg.'].append(f'=IF(${xg["RC Success"]}{rowg+2}=0, 0, ' + averageifs(rule_lookup('Termination (s)'), *rules, rule_lookup('Final Result', '"SUCCESS"')) + ')')
-				gi_update['TxRx Avg.'].append(f'=IF(${xg["RC Success"]}{rowg+2}=0, 0,  ' + averageifs(rule_lookup('TxRx (s)'), *rules, rule_lookup('Final Result', '"SUCCESS"')) + ')')
+				gi_update['Success Rate'].append(f'=IFERROR(${xg["RC Success"]}{ig}/${xg["RC Occurences"]}{ig}, 0)')
+				gi_update['Execution Avg.'].append(f'=IF(${xg["RC Success"]}{ig}=0, 0, ' + averageifs(rule_lookup('Execution (s)'), *rules, rule_lookup('Final Result', '"SUCCESS"')) + ')')
+				gi_update['Termination Avg.'].append(f'=IF(${xg["RC Success"]}{ig}=0, 0, ' + averageifs(rule_lookup('Termination (s)'), *rules, rule_lookup('Final Result', '"SUCCESS"')) + ')')
+				gi_update['TxRx Avg.'].append(f'=IF(${xg["RC Success"]}{ig}=0, 0,  ' + averageifs(rule_lookup('TxRx (s)'), *rules, rule_lookup('Final Result', '"SUCCESS"')) + ')')
 
 			gi_result = {
 				'RC Occurences': [f'=SUM(${xg["RC Occurences"]}$2:${xg["RC Occurences"]}${glen+1})'],
@@ -1154,20 +1182,21 @@ class _RCDBaseCalculation:
 			df_gi_result = pd.DataFrame(data=gi_result)
 			# Sheet BAY
 			for rowb in range(blen):
-				rule_b1 = rule_lookup('B1', f'${xb["B1"]}{rowb+2}')
-				rule_b2 = rule_lookup('B2', f'${xb["B2"]}{rowb+2}')
-				rule_b3 = rule_lookup('B3', f'${xb["B3"]}{rowb+2}')
+				ib = rowb + 2
+				rule_b1 = rule_lookup('B1', f'${xb["B1"]}{ib}')
+				rule_b2 = rule_lookup('B2', f'${xb["B2"]}{ib}')
+				rule_b3 = rule_lookup('B3', f'${xb["B3"]}{ib}')
 				rules = [rule_b1, rule_b2, rule_b3, rule_repetition, rule_unused]
 				bay_update['RC Occurences'].append('=' + countifs(*rules))
 				bay_update['RC Success'].append('=' + countifs(*rules, rule_lookup('Final Result', '"SUCCESS"')))
 				bay_update['RC Failed'].append('=' + countifs(*rules, rule_lookup('Final Result', '"FAILED"')))
-				bay_update['Success Rate'].append(f'=IFERROR(${xb["RC Success"]}{rowb+2}/${xb["RC Occurences"]}{rowb+2}, 0)')
+				bay_update['Success Rate'].append(f'=IFERROR(${xb["RC Success"]}{ib}/${xb["RC Occurences"]}{ib}, 0)')
 				for status in ['Open', 'Close']:
 					for result in ['Success', 'Failed']:
 						bay_update[f'{status} {result}'].append('=' + countifs(*rules, rule_lookup('Status', f'"{status}"'), rule_lookup('Final Result', f'"{result.upper()}"')))
-				bay_update['Contribution'].append(f'=IFERROR(${xb["RC Occurences"]}{rowb+2}/${xb["RC Occurences"]}${blen+2}, 0)')	# <rc occur>/<total rc occur>
-				bay_update['Reduction'].append(f'=${xb["RC Failed"]}{rowb+2}/${xb["RC Occurences"]}${blen+2}')	# <rc failed>/<total rc occur>
-				bay_update['Tagging'].append(f'=IF(IFERROR(${xb["Open Failed"]}{rowb+2}^2/(${xb["Open Failed"]}{rowb+2}+${xb["Open Success"]}{rowb+2}), 0)>{thd_var}, "O", "") & IF(IFERROR(${xb["Close Failed"]}{rowb+2}^2/(${xb["Close Failed"]}{rowb+2}+${xb["Close Success"]}{rowb+2}), 0)>{thd_var}, "C", "")')
+				bay_update['Contribution'].append(f'=IFERROR(${xb["RC Occurences"]}{ib}/${xb["RC Occurences"]}${blen+2}, 0)')	# <rc occur>/<total rc occur>
+				bay_update['Reduction'].append(f'=${xb["RC Failed"]}{ib}/${xb["RC Occurences"]}${blen+2}')	# <rc failed>/<total rc occur>
+				bay_update['Tagging'].append(f'=IF(IFERROR(${xb["Open Failed"]}{ib}^2/(${xb["Open Failed"]}{ib}+${xb["Open Success"]}{ib}), 0)>{thd_var}, "O", "") & IF(IFERROR(${xb["Close Failed"]}{ib}^2/(${xb["Close Failed"]}{ib}+${xb["Close Success"]}{ib}), 0)>{thd_var}, "C", "")')
 
 			bay_result = {
 				'RC Occurences': [f'=SUM(${xb["RC Occurences"]}$2:${xb["RC Occurences"]}${blen+1})'],
@@ -1182,12 +1211,13 @@ class _RCDBaseCalculation:
 			df_bay_result = pd.DataFrame(data=bay_result)
 			# Sheet DISPATCHER
 			for rowo in range(olen):
-				rule_operator = rule_lookup('Operator', f'${xo["Operator"]}{rowo+2}')
+				io = rowo + 2
+				rule_operator = rule_lookup('Operator', f'${xo["Operator"]}{io}')
 				rules = [rule_operator, rule_repetition, rule_unused]
 				opr_update['RC Occurences'].append('=' + countifs(*rules))
 				opr_update['RC Success'].append('=' + countifs(*rules, rule_lookup('Final Result', '"SUCCESS"')))
 				opr_update['RC Failed'].append('=' + countifs(*rules, rule_lookup('Final Result', '"FAILED"')))
-				opr_update['Success Rate'].append(f'=IFERROR(${xo["RC Success"]}{rowo+2}/${xo["RC Occurences"]}{rowo+2}, 0)')
+				opr_update['Success Rate'].append(f'=IFERROR(${xo["RC Success"]}{io}/${xo["RC Occurences"]}{io}, 0)')
 
 			opr_result = {
 				'RC Occurences': [f'=SUM(${xo["RC Occurences"]}$2:${xo["RC Occurences"]}${olen+1})'],
@@ -1198,6 +1228,7 @@ class _RCDBaseCalculation:
 			df_opr_result = pd.DataFrame(data=opr_result)
 
 			# Update new DataFrame
+			df_rc.update(pd.DataFrame(rc_update))
 			df_gi.update(pd.DataFrame(gi_update))
 			df_bay.update(pd.DataFrame(bay_update))
 			df_opr.update(pd.DataFrame(opr_update))
@@ -1258,6 +1289,10 @@ class _RCDBaseCalculation:
 	@property
 	def calculated(self):
 		return self._calculated
+
+	@property
+	def mro(self):
+		return self._mro
 
 	@property
 	def process_begin(self):
@@ -1389,7 +1424,7 @@ def test_analyze_file(**params):
 	rc = RCDFromFile('sample/sample_rcd*.xlsx')
 	rc.calculate()
 	if 'y' in input('Export hasil test? [y/n]  '):
-		rc.to_excel('test_analyze_rcd_spectrum')
+		rc.to_excel(filename='test_analyze_rcd_spectrum')
 	return rc
 
 def test_analyze_file2(**params):
@@ -1397,7 +1432,7 @@ def test_analyze_file2(**params):
 	rc = RCDFromFile2('sample/survalent/sample_soe*.XLSX')
 	rc.calculate()
 	if 'y' in input('Export hasil test? [y/n]  '):
-		rc.to_excel('test_analyze_rcd_survalent')
+		rc.to_excel(filename='test_analyze_rcd_survalent')
 	return rc
 
 def test_collective_file(**params):
@@ -1405,7 +1440,7 @@ def test_collective_file(**params):
 	rc = RCDCollective('sample/sample_rcd*.xlsx')
 	rc.calculate()
 	if 'y' in input('Export hasil test? [y/n]  '):
-		rc.to_excel('test_collective_rcd')
+		rc.to_excel(filename='test_collective_rcd')
 	return rc
 
 

@@ -244,7 +244,7 @@ class _AvBaseCalculation:
 
 		if data is not None: self.rtudown_all = data
 
-		cpoint = getattr(self, 'cpoint_description')
+		cpoint = getattr(self, 'cpoint_description', None)
 		if isinstance(cpoint, pd.DataFrame):
 			self.cpoint_ifs = cpoint[(cpoint['B1']=='IFS') & (cpoint['B2']=='RTU_P1')]
 		else:
@@ -259,7 +259,7 @@ class _AvBaseCalculation:
 		"""
 
 		prepared = df.copy()
-
+		prepared['Duration'] = prepared['Duration'].map(lambda time: pd.Timedelta(time.hour*3600 + time.minute*60 + time.second + time.microsecond/10**6, unit='s'))
 		# Filter only rows with not unused-marked
 		prepared = prepared.loc[(prepared['Marked Maintenance']=='') & (prepared['Marked Comm. Failure']=='') & (prepared['Marked Other Failure']=='')]
 
@@ -394,7 +394,7 @@ class _AvBaseCalculation:
 		"""
 		Return DataFrameGroupBy Class of aggregation values which used in all grouped Dataframe with groupby_columns as columns parameter.
 		"""
-		
+
 		columns = ['RTU', 'Long Name']
 		groupby_columns = columns + ['Duration']
 		output_columns = [
@@ -413,7 +413,8 @@ class _AvBaseCalculation:
 			'Availability'
 		]
 
-		df_pre = self._avrs_setup(df)
+		df_pre = df.copy()
+		# df_pre = self._avrs_setup(df)
 		rtu_table = self.cpoint_ifs[['B3', 'B3 text']].rename(columns={'B3': 'RTU', 'B3 text': 'Long Name'})
 
 		down_count = df_pre[groupby_columns].groupby(columns, as_index=False).count().rename(columns={'Duration': 'Downtime Occurences'})
@@ -477,10 +478,14 @@ class _AvBaseCalculation:
 			xd = {col: xl_col_to_name(dt_columns.index(col)) for col in dt_columns}
 			xa = {col: xl_col_to_name(av_columns.index(col)) for col in av_columns}
 
+			dt_update = {
+				'Duration': []
+			}
 			av_update = {
 				'Downtime Occurences': [],
 				'Total Downtime': [],
 				'Average Downtime': [],
+				'Uptime': [],
 				'Non-RTU Downtime': [],
 				'Calculated Availability': [],
 				'Availability': []
@@ -496,6 +501,10 @@ class _AvBaseCalculation:
 			if 'Navigation' in dt_columns:
 				# Apply navigation hyperlink on sheet RC_ONLY
 				df_dt['Navigation'] = self.generate_reference(soe=kwargs.get('soe'), down=df_dt)
+
+			for rowd in range(dlen):
+				h = rowd + 2
+				dt_update['Duration'].append(f'=${xd["Up Time"]}{h}-${xd["Down Time"]}{h}')
 			# Sheet AVAILABILITY
 			for rowa in range(alen):
 				i = rowa + 2
@@ -507,6 +516,7 @@ class _AvBaseCalculation:
 				av_update['Downtime Occurences'].append('=' + countifs(*rules))
 				av_update['Total Downtime'].append('=' + sumifs(rule_lookup('Duration'), *rules))
 				av_update['Average Downtime'].append('=' + averageifs(rule_lookup('Duration'), *rules))
+				av_update['Uptime'].append(f'=${xa["Time Range"]}{i}-${xa["Total Downtime"]}{i}-${xa["Non-RTU Downtime"]}{i}')
 				av_update['Non-RTU Downtime'].append(f'={sum_maint}+{sum_telco}+{sum_other}')
 				av_update['Calculated Availability'].append(f'=ROUND((${xa["Uptime"]}{i}+${xa["Non-RTU Downtime"]}{i})/${xa["Time Range"]}{i}, 4)')
 				av_update['Availability'].append(f'=ROUND(${xa["Calculated Availability"]}{i}*${xa["Quality"]}{i}, 4)')
@@ -520,12 +530,14 @@ class _AvBaseCalculation:
 			df_av_result = pd.DataFrame(data=av_result)
 
 			# Update new DataFrame
+			df_dt.update(pd.DataFrame(dt_update))
 			df_av.update(pd.DataFrame(av_update))
 
 			# Update summary information
 			count_maint = 'COUNTIF(' + rule_lookup('Marked Maintenance', '"*"') + ')'
 			count_telco = 'COUNTIF(' + rule_lookup('Marked Comm. Failure', '"*"') + ')'
 			count_other = 'COUNTIF(' + rule_lookup('Marked Other Failure', '"*"') + ')'
+			self.result['overall']['total_rtu_down'] = f'=COUNTIF(AVAILABILITY!${xa["Downtime Occurences"]}$2:${xa["Downtime Occurences"]}${alen+1}, ">0")'
 			self.result['overall']['availability'] = f'=ROUND(AVAILABILITY!${xa["Availability"]}${alen+2}*100, 2) & "%"'
 			self.result['statistic']['marked']['maintenance'] = '=' + count_maint
 			self.result['statistic']['marked']['communication'] = '=' + count_telco
@@ -631,3 +643,36 @@ class AVRSFromFile(SpectrumFileReader, SOEtoAVRS):
 
 	def __init__(self, filepaths:Union[str, list], **kwargs):
 		super().__init__(filepaths, **kwargs)
+
+
+def test_analyze_file(**params):
+	print(' TEST ANALYZE AVRS '.center(80, '#'))
+	av = AVRSFromFile('sample/sample_rtu*.xlsx')
+	av.calculate()
+	if 'y' in input('Export hasil test? [y/n]  '):
+		av.to_excel(filename='test_analyze_rtu_spectrum')
+	return av
+
+def test_collective_file(**params):
+	print(' TEST COLLECTIVE AVRS '.center(80, '#'))
+	av = AVRSCollective('sample/sample_rtu*.xlsx')
+	av.calculate()
+	if 'y' in input('Export hasil test? [y/n]  '):
+		av.to_excel(filename='test_collective_rtu')
+	return av
+
+
+if __name__=='__main__':
+	test_list = [
+		('Test analisa file SOE Spectrum', test_analyze_file),
+		('Test menggabungkan file', test_collective_file)
+	]
+	ans = input('Confirm troubleshooting? [y/n]  ')
+	if ans=='y':
+		print('\r\n'.join([f'  {no+1}.'.ljust(6) + tst[0] for no, tst in enumerate(test_list)]))
+		choice = int(input(f'\r\nPilih modul test [1-{len(test_list)}] :  ')) - 1
+		if choice in range(len(test_list)):
+			print()
+			test = test_list[choice][1]()
+		else:
+			print('Pilihan tidak valid!')

@@ -230,11 +230,13 @@ class SpectrumFileReader(_FileReader):
 		# Change B1, B2, B3 from description style into mnemonic style
 		if hasattr(self, 'cpoint_description'):
 			df_trans = self.cpoint_description.copy()
-			is_longtext = new_df['B1'].str.len().max()>9 or new_df['B3'].str.len().max()>9
+			b1_avg_len, b3_avg_len = new_df['B1'].str.len().mean(), new_df['B3'].str.len().mean()
+			is_longtext = b1_avg_len>9 or b3_avg_len>9
 			if is_longtext:
 				# Swap column labels, because exported His. Messages using description text
 				# ['B1', 'B2', 'B3', 'B1 text', 'B2 text', 'B3 text'] -> ['B1 text', 'B2 text', 'B3 text', 'B1', 'B2', 'B3']
 				df_trans.columns = col2 + col1
+				print(f'Debug: b1_average_length={round(b1_avg_len, 1)}, b3_average_length={round(b3_avg_len, 1)}\t>> Swap kolom')
 			# Double check duplicated keys
 			df_trans.drop_duplicates(subset=col1, keep='first', inplace=True)
 			# Merge B1, B2, B3 translation with existing table
@@ -344,9 +346,6 @@ class AvFileReader(_FileReader):
 		Executed after load completed.
 		"""
 
-		# Format B2 as string value
-		df['B2'] = df['B2'].map(lambda x: re.sub(r'\.\d+', '', str(x)))
-
 		super().post_load(df)
 		self._rtudown_all = self.prepare_data(df)
 
@@ -363,7 +362,7 @@ class AvFileReader(_FileReader):
 
 	@property
 	def rtudown_all(self):
-		return self._rtudown_all if hasattr(self, '_updown_all') else self.load()
+		return self._rtudown_all if hasattr(self, '_rtudown_all') else self.load()
 
 
 class SurvalentFileReader(_FileReader):
@@ -563,7 +562,7 @@ def test_file_rcd_collective(**params):
 
 def test_file_rtu_collective(**params):
 	print(' TEST FILE RTU COLLECTIVE '.center(80, '#'))
-	f = AvFileReader('sample/sample_rcd*.xlsx')
+	f = AvFileReader('sample/sample_rtu*.xlsx')
 	return f
 
 if __name__=='__main__':

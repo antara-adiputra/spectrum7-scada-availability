@@ -233,9 +233,9 @@ class BaseExportMixin:
 
 		ws = workbook.add_worksheet(sheet_name)
 		# Worksheet formatting
-		format_header = {'num_format': '@', 'border': 1, 'bold': True, 'align': 'center', 'valign': 'top', 'bg_color': '#ededed'}
+		format_header = {'num_format': '@', 'border': 1, 'bold': True, 'align': 'center', 'valign': 'top', 'font_color': 'black', 'bg_color': '#ededed'}
 		format_base = {'valign': 'vcenter'}
-		format_footer = {'bold': True, 'bg_color': '#dcdcdc'}
+		format_footer = {'bold': True, 'border': 0, 'font_color': 'black', 'bg_color': '#dcdcdc'}
 
 		nrow, ncol = sheet_data.shape
 		tbl_header = sheet_data.columns.to_list()
@@ -354,7 +354,7 @@ class BaseExportMixin:
 
 		print(f'Data berhasil di-export pada "{self.output_dir / filename}.{self.output_extension}".')
 
-	
+
 if __name__ == '__main__':
 	test()
 	# print(glob('RC_Output_CB_20230301-20230331.xlsx', root_dir='E:/project/excel/output'))
