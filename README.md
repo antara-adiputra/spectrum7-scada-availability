@@ -1,4 +1,4 @@
-## Spectrum7 SCADA Availability
+# Spectrum7 SCADA Availability
 Aplikasi yang digunakan untuk penghitungan availability SCADA pada bagian Fasilitas Operasi PLN UP2B Sistem Makassar
 
 >Python3.9+, 
@@ -6,7 +6,7 @@ Aplikasi yang digunakan untuk penghitungan availability SCADA pada bagian Fasili
 >Xlsxwriter
 
 
-### Feature
+## Feature
   1. Read dari file
      - [x] Memuat data historical SCADA dari file
      - [x] Ekstensi yang disupport xls, xlsx, dan xml 
@@ -20,12 +20,20 @@ Aplikasi yang digunakan untuk penghitungan availability SCADA pada bagian Fasili
      - [x] Rekomendasi tagging untuk bay berdasarkan kontribusi pengurangan Sukses RC
      - [x] _Single-run-only_, cukup running program sekali, file output sudah dapat otomatis menghitung perubahan dari user
      - [x] Menggabungkan dan merekap beberapa output file
+     - [x] Support file historical Master Survalent (baru)
   1. Availability RTU
      - [x] Memilah dan menghitung downtime RTU
-     - [x] Tabel maintenance untuk menganulir event down yang disebabkan selain dari permasalahan peralatan (ex. down Pemeliharaan atau shutdown oleh user)
+     - [x] ~~Tabel maintenance untuk menganulir event down yang disebabkan selain dari permasalahan peralatan (ex. down Pemeliharaan atau shutdown oleh user)~~ (dihapus)
+     - [x] Klasifikasi downtime berdasarkan waktu untuk memudahkan filter dan analisa gangguan
      - [x] _Single-run-only_, cukup running program sekali, file output sudah dapat otomatis menghitung perubahan dari user
      - [x] Menggabungkan dan merekap beberapa output file
 
+#### Update 31-03-2024
+Pengembangan support untuk perhitungan RC dari file historical Master Survalent.
 
-### Contributor
+#### Update 30-04-2024 (Terbaru)
+Peningkatan performa dalam durasi membuka file maupun proses perhitungan hingga **4x** lebih cepat dari versi sebelumnya.
+
+
+## Contributor
 Putu Agus [(@antara-adiputra)](https://github.com/antara-adiputra/)
