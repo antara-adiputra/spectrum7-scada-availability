@@ -76,7 +76,7 @@ class ConsoleApp:
 					if pu.confirm_answer('y', f'\nExport hasil?'):
 						calc.to_excel()
 				except Exception as e:
-					print(f'Oops! Terjadi kesalahan. {"\n".join(e.args)}\n')
+					print('Oops! Terjadi kesalahan. ' + '\n'.join(e.args) + '\n')
 
 		pu.enter_to_continue('\n\n>> Klik [Enter] untuk lanjut')
 		pu.clear()
