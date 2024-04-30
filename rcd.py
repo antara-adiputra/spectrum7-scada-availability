@@ -1,5 +1,5 @@
-import os, re, time
-from datetime import datetime
+import datetime, gc, os, re, time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Union
 
 import numpy as np
@@ -7,7 +7,7 @@ import pandas as pd
 from xlsxwriter.utility import xl_col_to_name
 from filereader import RCFileReader, SpectrumFileReader, SurvalentFileReader
 from global_parameters import RCD_BOOK_PARAM, RCD_COLUMNS
-from lib import BaseExportMixin, get_datetime, get_execution_duration, get_termination_duration, join_datetime, immutable_dict, progress_bar
+from lib import CONSOLE_WIDTH, BaseExportMixin, calc_time, get_datetime, get_execution_duration, get_termination_duration, join_datetime, immutable_dict, progress_bar
 from ofdb import SpectrumOfdbClient
 
 
@@ -66,6 +66,366 @@ class _SOEAnalyzer:
 		self._soe_setup()
 		super().__init__(calculate_bi=calculate_bi, check_repetition=check_repetition, **kwargs)
 
+	def _analyze(self, start:datetime.datetime=None, stop:datetime.datetime=None):
+		"""
+		Loop through RC event to analyze set of probability and infromation about how every RC event occured (Failed or Success). In case of loop optimization, we split the main Dataframe (df) into parts of categories.
+		* INPUT
+		analyzed_rc_rows : list of tuple of analyzed RC event to create new Dataframe
+		note_list : list of annotation of each analyzed RC event
+		rc_order_index : list of index of RC order
+		multiple_rc_at_same_time : crossing of multiple RC Event
+		date_origin : date refference as comparator
+		buffer1 : buffer for storing index of df_rc, to get RC repetition in one day
+		buffer1 : buffer for storing index of df_result, to get RC repetition in one day
+		* OUTPUT
+		rcd
+		* SET
+		analyzed_rc_rows
+		soe
+		note_list
+		"""
+
+		rc_list = []
+		note_list = []
+		buffer1, buffer2 = {}, {}
+
+		orders = self.get_orders(start=start, stop=stop)
+		rc_order_index = orders.index.to_list()
+		date_origin = self.soe_ctrl.loc[rc_order_index[0], 'Time stamp']
+
+		print(f'\nMenganalisa {len(rc_order_index)} kejadian RC...')
+		for x, index in enumerate(rc_order_index):
+			progress_bar((x+1)/len(rc_order_index))
+
+			# index_0 = index of RC order Tag, index_1 = index of RC Feedback Tag, index_2 = index of next RC order Tag
+			rc_order = self.soe_ctrl.loc[index]
+			date_rc, b1, b2, b3, elm, sts = rc_order.loc[['Time stamp', 'B1', 'B2', 'B3', 'Element', 'Status']]
+			index_0 = index
+			index_2 = rc_order_index[x + 1] if x<len(rc_order_index)-1 else self.highest_index
+			index_1, result = self._check_events(rc_order, rc_list, note_list)
+			bufkey = (b1, b2, b3, elm, sts)
+
+			# if result in ['FAILED', 'UNCERTAIN']: print(x, bufkey)
+			# Check RC repetition
+			if self.check_repetition:
+				if (date_rc.year==date_origin.year and date_rc.month==date_origin.month and date_rc.day==date_origin.day) and x<len(rc_order_index)-1:
+					# If in the same day and not last iteration
+					if bufkey in buffer1:
+						# Bufkey already in buffer, append buffer
+						buffer1[bufkey] += [index_0]
+						buffer2[bufkey] += [x]
+
+						if result=='SUCCESS':
+							# Comment to mark as last RC repetition
+							for m in range(len(buffer1[bufkey])):
+								if m==len(buffer1[bufkey])-1:
+									comment_text = f'Percobaan RC ke-{m+1} (terakhir)'
+								else:
+									comment_text = f'Percobaan RC ke-{m+1}'
+									# Give flag
+									rc_list[buffer2[bufkey][m]]['Rep. Flag'] = '*'
+								self.soe_ctrl.at[buffer1[bufkey][m], 'Comment'] += f'{comment_text}\n'
+								note_list[buffer2[bufkey][m]].insert(0, comment_text)
+
+							del buffer1[bufkey]
+							del buffer2[bufkey]
+
+					else:
+						if result in ['FAILED', 'UNCERTAIN']:
+							buffer1[bufkey] = [index_0]
+							buffer2[bufkey] = [x]
+				else:
+					# If dates are different, set date_origin
+					date_origin = date_rc
+
+					for bkey, bval in buffer1.items():
+						if len(bval)>1:
+							# Comment to mark as multiple RC event in 1 day
+							for n in range(len(bval)):
+								if n==len(bval)-1:
+									comment_text = f'Percobaan RC ke-{n+1} (terakhir)'
+								else:
+									comment_text = f'Percobaan RC ke-{n+1}'
+									# Give flag
+									rc_list[buffer2[bkey][n]]['Rep. Flag'] = '*'
+								self.soe_ctrl.at[bval[n], 'Comment'] += f'{comment_text}\n'
+								note_list[buffer2[bkey][n]].insert(0, comment_text)
+
+					# Reset buffer
+					buffer1, buffer2 = {}, {}
+					# Insert into new buffer
+					if result in ['FAILED', 'UNCERTAIN']:
+						buffer1[bufkey] = [index_0]
+						buffer2[bufkey] = [x]
+
+			self._rc_indexes.append((index_0, index_1, result))
+
+		rcd = pd.DataFrame(data=rc_list)
+		rcd['Annotations'] = list(map(lambda x: '\n'.join(list(map(lambda y: f'- {y}', x))), note_list))
+		self.rc_list = rc_list
+		self.post_process = pd.concat([self.soe_ctrl, self.soe_lr, self.soe_cd, self.soe_sync, self.soe_prot, self.soe_ifs], copy=False).drop_duplicates(keep='first').sort_values(['Time stamp', 'Milliseconds'])
+		self._analyzed = True
+
+		return rcd[RCD_COLUMNS + ['Navigation']]
+
+	def _check_events(self, order:pd.Series, rc_list:list, note_list:list):
+		"""
+		Get result of RC Event execution ended within t_search duration.
+		* INPUT
+		index : index of RC Event with order tag
+		* OUTPUT
+		result_idx : index of RC Event with feedback tag
+		rc_result : RC Event result Success / Failed / Uncertain
+		* SET
+		analyzed_rc_rows
+		rcd
+		soe
+		note_list
+		"""
+		
+		order_idx = order.name
+		t_order, t_transmit = get_datetime(order)
+		# t_order, t_transmit = get_datetime(self.soe_ctrl.loc[index])
+		b1, b2, b3, elm, sts, tag, dis = order.loc[['B1', 'B2', 'B3', 'Element', 'Status', 'Tag', 'Operator']]
+		# b1, b2, b3, elm, sts, tag, dis = self.soe_ctrl.loc[index, ['B1', 'B2', 'B3', 'Element', 'Status', 'Tag', 'Operator']]
+		rc_result, t0, t1, t2 = 'UNCERTAIN', 0, 0, 0
+		t_feedback = t_transmit
+		prot_isactive = ''
+		annotation = []
+		mark_success, mark_failed, mark_unused = False, False, False
+
+		txt_cd_anomaly = 'Status CD anomali'
+		txt_lr_anomaly = 'Status LR anomali'
+		txt_timestamp_anomaly = 'Anomali timestamp RTU'
+
+		ifs_status_0, ifs_name_0 = self.check_ifs_status(**{'t1': t_order, 'b1': b1})
+		if ifs_status_0=='Down':
+			txt_ifs_before_rc = f'RC dalam kondisi IFS "{ifs_name_0}" {ifs_status_0}'
+			annotation.append(txt_ifs_before_rc)
+			self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_ifs_before_rc}\n'
+		
+		# TEST PROGRAMM
+		invert_status = {'Open': 'Close', 'Close': 'Open'}
+
+		# Notes for LR
+		lr_status_0, lr_quality_0 = self.check_remote_status(**{'t1': t_order, 'b1': b1, 'b2': b2, 'b3': b3})
+		if lr_quality_0=='good' and lr_status_0=='Local':
+			txt_rc_at_local = f'Status LR {lr_status_0}'
+			annotation.append(txt_rc_at_local)
+			if txt_rc_at_local not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_rc_at_local}\n'
+		elif lr_quality_0=='bad':
+			annotation.append(txt_lr_anomaly)
+			if txt_lr_anomaly not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_lr_anomaly}\n'
+
+		# Notes for CD
+		cd_status_0, cd_quality_0 = self.check_enable_status(**{'t1': t_order, 'b1': b1})
+		if cd_quality_0=='good' and cd_status_0=='Disable':
+			txt_rc_at_disable = f'Status CD {cd_status_0}'
+			annotation.append(txt_rc_at_disable)
+			if txt_rc_at_disable not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_rc_at_disable}\n'
+		elif cd_quality_0=='bad':
+			annotation.append(txt_cd_anomaly)
+			if txt_cd_anomaly not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_cd_anomaly}\n'
+			
+		# Notes for CSO and protection status
+		if sts=='Close':
+			cso_status_0, cso_quality_0 = self.check_synchro_interlock(**{'t1': t_order, 'b1': b1, 'b2': b2, 'b3': b3})
+			if cso_quality_0=='good':
+				txt_rc_at_cso = f'Status CSO {cso_status_0}'
+				annotation.append(txt_rc_at_cso)
+				if txt_rc_at_cso not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_rc_at_cso}\n'
+			elif cso_quality_0=='bad':
+				txt_cso_anomaly = 'Status CSO anomali'
+				annotation.append(txt_cso_anomaly)
+				if txt_cso_anomaly not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_cso_anomaly}\n'
+				
+			prot_isactive = self.check_protection_interlock(**{'t1': t_order, 'b1': b1, 'b2': b2, 'b3': b3})
+			if prot_isactive:
+				txt_prot_active = f'Proteksi {prot_isactive} sedang aktif'
+				annotation.append(txt_prot_active)
+				if txt_prot_active not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_prot_active}\n'
+
+		# Sampling dataframe within t_search time
+		df_range = self.soe_ctrl[(join_datetime(self.soe_ctrl['System time stamp'], self.soe_ctrl['System milliseconds'])>=t_order) & (join_datetime(self.soe_ctrl['System time stamp'], self.soe_ctrl['System milliseconds'])<=join_datetime(t_order, self.t_search*1000)) & (self.soe_ctrl['B1']==b1) & (self.soe_ctrl['B2']==b2) & (self.soe_ctrl['B3']==b3) & (self.soe_ctrl['Element']==elm)]
+
+		# Get first feedback
+		result_range = df_range[(df_range['Status']==sts) & (df_range['Tag'].isin(self.feedback_tags))][:1]
+
+		if result_range.shape[0]>0:
+			# Continue check feedback
+			result_row = result_range.iloc[0]
+			result_idx = result_row.name
+			if 'R' in result_row['Tag']:
+				rc_result = 'SUCCESS'
+			else:
+				rc_result = 'FAILED'
+
+			t_feedback, t_receive = get_datetime(result_row)
+			t0 = get_execution_duration(order, result_row)
+			t1 = get_termination_duration(order, result_row)
+			t2 = t1 - t0
+			last_idx = result_idx
+
+			# Check if t_feedback leading t_order
+			if t0<0 or t2<0:
+				annotation.append(txt_timestamp_anomaly)
+				if txt_timestamp_anomaly not in self.soe_ctrl.loc[result_idx, 'Comment']: self.soe_ctrl.at[result_idx, 'Comment'] += f'{txt_timestamp_anomaly}\n'
+		else:
+			# Cut operation if no feedback found
+			# Return order index with status UNCERTAIN
+			last_idx = order_idx
+			result_idx = order_idx
+
+		final_result = rc_result
+
+		if rc_result=='FAILED':
+			anomaly_status = False
+			no_status_changes = False
+
+			# Check for IFS
+			if ifs_status_0=='Up':
+				ifs_status1, ifs_name1 = self.check_ifs_status(**{'t1': t_feedback, 'b1': b1})
+				if ifs_status1=='Down':
+					txt_ifs_after_rc = f'IFS "{ifs_name1}" {ifs_status1} sesaat setelah RC'
+					annotation.append(txt_ifs_after_rc)
+					self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_ifs_after_rc}\n'
+
+			# Only Tag [OR, O*, RC, R*, ""] would pass
+			df_failed = df_range[(join_datetime(df_range['System time stamp'], df_range['System milliseconds'])>t_order) & ((df_range['Tag'].isin(self.order_tags + ['RC', 'R*'])) | (df_range['Tag']==''))]
+
+			# Check for normal status occurences
+			if df_failed[(df_failed['Status'].isin(['Close', 'Open'])) & (df_failed['Tag']=='')].shape[0]>0:
+				df_status_normal = df_failed[df_failed['Status'].isin(['Close', 'Open'])]
+				first_change = df_status_normal.iloc[0]
+				
+				if first_change['Tag']=='':
+					# Status changes after RC order
+					t_delta = get_execution_duration(df_range.loc[order_idx], first_change)
+
+					txt_list = []
+					t_executed = join_datetime(*first_change.loc[['Time stamp', 'Milliseconds']].to_list())
+					lr_status_1, lr_quality_1 = self.check_remote_status(**{'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
+					cd_status_1, cd_quality_1 = self.check_enable_status(**{'t1': t_executed, 'b1': b1})
+					# if cd_quality_1=='good': txt_list.append(f'CD={cd_status_1}')
+					
+					if sts=='Close':
+						cso_status_1, cso_quality_1 = self.check_synchro_interlock(**{'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
+						# if cso_quality_1=='good': txt_list.append(f'CSO={cso_status_1}')
+						prot_isactive = self.check_protection_interlock(**{'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
+						if prot_isactive: txt_list.append(f'{prot_isactive}=Appeared')
+
+					txt_additional = f' ({", ".join(txt_list)})' if len(txt_list)>0 else ''
+					
+					txt_status_result = ''
+					if first_change['Status']==sts:
+						# Valid status exists
+						if lr_status_1=='Remote' and t_delta<=self.t_monitor[elm]:
+							txt_status_result = f'Potensi RC sukses ({t_delta}s){txt_additional}'
+						else:
+							txt_status_result = f'Eksekusi lokal GI{txt_additional}'
+					else:
+						# Inverted status occured
+						if lr_status_1=='Remote' and t_delta<=self.t_monitor[elm]:
+							txt_status_result = f'RC {sts} tapi status balikan {first_change["Status"]}. Perlu ditelusuri!'
+						else:
+							anomaly_status = True
+
+					if first_change.name>result_idx: last_idx = first_change.name
+					if txt_status_result:
+						annotation.append(txt_status_result)
+						self.soe_ctrl.at[first_change.name, 'Comment'] += f'{txt_status_result}\n'
+				else:
+					# Another RC order tag
+					no_status_changes = True
+			else:
+				anomaly_status = True
+
+			# Check for anomaly status occurences
+			if (no_status_changes or anomaly_status) and df_failed[df_failed['Status']=='Dist.'].shape[0]>0:
+				isfeedback = True
+				first_dist_change = df_failed[df_failed['Status']=='Dist.'].iloc[0]
+
+				# Sampling for next order
+				df_next_order = df_failed[df_failed['Tag'].isin(self.order_tags)]
+
+				if df_next_order.shape[0]>0:
+					# Check if dist. status occured after another RC order
+					if df_next_order.iloc[0].name<first_dist_change.name: isfeedback = False
+
+				if isfeedback:
+					# Anomaly status occured
+					t_delta = get_execution_duration(df_range.loc[order_idx], first_dist_change)
+
+					txt_list = []
+					t_executed = join_datetime(*first_dist_change.loc[['Time stamp', 'Milliseconds']].to_list())
+					lr_status_1, lr_quality_1 = self.check_remote_status(**{'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
+					cd_status_1, cd_quality_1 = self.check_enable_status(**{'t1': t_executed, 'b1': b1})
+					# if cd_quality_1=='good': txt_list.append(f'CD={cd_status_1}')
+					
+					if sts=='Close':
+						cso_status_1, cso_quality_1 = self.check_synchro_interlock(**{'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
+						# if cso_quality_1=='good': txt_list.append(f'CSO={cso_status_1}')
+						prot_isactive = self.check_protection_interlock(**{'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
+						if prot_isactive: txt_list.append(f'{prot_isactive}=Appeared')
+
+					txt_additional = f' ({", ".join(txt_list)})' if len(txt_list)>0 else ''
+					
+					if lr_status_1=='Remote' and t_delta<=self.t_monitor[elm]:
+						txt_status_anomaly = f'Potensi RC sukses, tapi status {sts} anomali ({t_delta}s){txt_additional}'
+					else:
+						txt_status_anomaly = f'Eksekusi lokal GI, tapi status {sts} anomali{txt_additional}'
+
+					if first_dist_change.name>result_idx: last_idx = first_dist_change.name
+					annotation.append(txt_status_anomaly)
+					self.soe_ctrl.at[first_dist_change.name, 'Comment'] += f'{txt_status_anomaly}\n'
+
+		# Copy User Comment if any
+		user_comment = df_range.loc[df_range.index<=last_idx, 'User comment'].to_list()
+		for cmt in user_comment:
+			if cmt and '**' not in cmt:
+				# Eleminate unnecessary character
+				txt = re.sub('^\W*|\s*$', '', cmt)
+				annotation.append(txt)
+
+		# Event marked by user
+		if self.unused_mark in df_range['User comment'].to_list() or 'notused' in df_range['User comment'].to_list():
+			annotation.append('User menandai RC dianulir**')
+			mark_unused = True
+		elif self.success_mark in df_range['User comment'].to_list():
+			final_result = 'SUCCESS'
+			annotation.append('User menandai RC sukses**')
+			mark_success = True
+		elif self.failed_mark in df_range['User comment'].to_list():
+			final_result = 'FAILED'
+			annotation.append('User menandai RC gagal**')
+			mark_failed = True
+
+		self.soe_ctrl.loc[result_idx, 'RC Feedback'] = rc_result
+		note_list.append(annotation)
+		rc_list.append({
+			'Order Time': t_order,
+			'Feedback Time': t_feedback,
+			'B1': b1,
+			'B2': b2,
+			'B3': b3,
+			'Element': elm,
+			'Status': sts,
+			'Tag': tag,
+			'Operator': dis,
+			'Pre Result': rc_result,
+			'Execution (s)': t0,
+			'Termination (s)': t1,
+			'TxRx (s)': t2,
+			'Rep. Flag': '',
+			'Marked Unused': '*' if mark_unused else '',
+			'Marked Success': '*' if mark_success else '',
+			'Marked Failed': '*' if mark_failed else '',
+			'Final Result': final_result,
+			'Navigation': (order_idx, result_idx)
+		})
+
+		return result_idx, final_result
+
 	def _initialize(self):
 		"""
 		"""
@@ -76,7 +436,7 @@ class _SOEAnalyzer:
 		self._lr_qualities = {}
 		self._rc_indexes = []
 
-	def _set_range(self, start:datetime, stop:datetime):
+	def _set_range(self, start:datetime.datetime, stop:datetime.datetime):
 		"""
 		Set start and stop date of query data.
 		"""
@@ -148,109 +508,448 @@ class _SOEAnalyzer:
 			self._is_valid = False
 			raise ValueError('Dataframe tidak valid')
 
-	def analyze(self, start:datetime=None, stop:datetime=None):
+	def get_rcd_result(self, df:pd.DataFrame, bay:Union[list, tuple]):
 		"""
-		Loop through RC event to analyze set of probability and infromation about how every RC event occured (Failed or Success). In case of loop optimization, we split the main Dataframe (df) into parts of categories.
-		* INPUT
-		analyzed_rc_rows : list of tuple of analyzed RC event to create new Dataframe
-		note_list : list of annotation of each analyzed RC event
-		rc_order_index : list of index of RC order
-		multiple_rc_at_same_time : crossing of multiple RC Event
-		date_origin : date refference as comparator
-		buffer1 : buffer for storing index of df_rc, to get RC repetition in one day
-		buffer1 : buffer for storing index of df_result, to get RC repetition in one day
-		* OUTPUT
-		rcd
-		* SET
-		analyzed_rc_rows
-		soe
-		note_list
 		"""
 
-		rc_list = []
-		note_list = []
-		buffer1, buffer2 = {}, {}
+		b1, b2, b3 = bay
+		df_bay = df[(df['B1']==b1) & (df['B2']==b2) & (df['B3']==b3)]
+		iorder_list = df_bay.loc[df_bay['Tag'].isin(self.order_tags)].index.values
 
-		orders = self.get_orders(start=start, stop=stop)
-		rc_order_index = orders.index.to_list()
-		date_origin = self.soe_ctrl.loc[rc_order_index[0], 'Time stamp']
+		# No RCD for this bay, skip check
+		if len(iorder_list)==0: return bay_rcd
 
-		print(f'\nMenganalisa {len(rc_order_index)} kejadian RC...')
-		for x, index in enumerate(rc_order_index):
-			progress_bar((x+1)/len(rc_order_index))
+		date_origin = df_bay.loc[iorder_list[0], 'Time stamp']
+		bay_rcd = list()
+		soe_upd = dict()
+		buffer1 = dict()
+		buffer2 = dict()
 
-			# index_0 = index of RC order Tag, index_1 = index of RC Feedback Tag, index_2 = index of next RC order Tag
-			rc_order = self.soe_ctrl.loc[index]
-			date_rc, b1, b2, b3, elm, sts = rc_order.loc[['Time stamp', 'B1', 'B2', 'B3', 'Element', 'Status']]
-			index_0 = index
-			index_2 = rc_order_index[x + 1] if x<len(rc_order_index)-1 else self.highest_index
-			index_1, result = self.get_result(rc_order, rc_list, note_list)
-			bufkey = (b1, b2, b3, elm, sts)
+		def find_status(iorder:int, ifback:int, istatus:int, status_anomaly:bool=False):
+			row_order = df_bay.loc[iorder]
+			row_status = df_bay.loc[istatus]
+			t_delta = get_execution_duration(row_order, row_status)
+			t_exec = join_datetime(row_status['Time stamp'], row_status['Milliseconds'])
+			rc_elm = row_order['Element']
+			rc_sts = row_order['Status']
+			lr_st, lr_q = self.check_remote_status(t1=t_exec, b1=b1, b2=b2, b3=b3)
+			cd_st, cd_q = self.check_enable_status(t1=t_exec, b1=b1)
+			st_list = list()
+			txt_res = ''
+			idx_last = None
+			comment = self.soe_ctrl.loc[istatus, 'Comment'].split('\n')
 
-			# if result in ['FAILED', 'UNCERTAIN']: print(x, bufkey)
-			# Check RC repetition
+			if cd_q=='good': st_list.append(f'CD={cd_st}')
+
+			if rc_sts=='Close':
+				cso_st, cso_q = self.check_synchro_interlock(t1=t_exec, b1=b1, b2=b2, b3=b3)
+				prot = self.check_protection_interlock(t1=t_exec, b1=b1, b2=b2, b3=b3)
+
+				if cso_q=='good': st_list.append(f'CSO={cso_st}')
+
+				if prot: st_list.append(f'{prot}=Appeared')
+
+			txt_sts = f'({", ".join(st_list)})' if len(st_list)>0 else ''
+
+			if row_status['Status']==rc_sts or status_anomaly:
+				# Valid status or anomaly
+				if lr_st=='Remote' and t_delta<=self.t_monitor[rc_elm]:
+					txt_res = f'Potensi RC sukses {"tapi status " + rc_sts + " anomali" if status_anomaly else ""} ({t_delta}s){txt_sts}'
+				else:
+					txt_res = f'Eksekusi lokal GI {"tapi status " + rc_sts + " anomali" if status_anomaly else ""} {txt_sts}'
+			else:
+				# Inverted status occured
+				if lr_st=='Remote' and t_delta<=self.t_monitor[rc_elm]:
+					txt_res = f'RC {rc_sts} tapi status balikan {row_status["Status"]}. Perlu ditelusuri!'
+				# else:
+				# 	anomaly_status = True
+
+			if istatus>ifback: idx_last = istatus
+
+			if txt_res and txt_res not in comment:
+				comment.append(txt_res)
+				# self.soe_ctrl.loc[istatus, 'Comment'] = '\n'.join(comment)
+			
+			if (istatus, 'Comment') in soe_upd:
+				soe_upd[(istatus, 'Comment')].append(comment)
+			else:
+				soe_upd[(istatus, 'Comment')] = comment
+
+			return idx_last, txt_res
+
+		def annotate_repetition(key:tuple):
+			for m in range(len(buffer1[key])):
+				if m==len(buffer1[key])-1:
+					comment_text = f'Percobaan RC ke-{m+1} (terakhir)'
+				else:
+					comment_text = f'Percobaan RC ke-{m+1}'
+					# Give flag
+					bay_rcd[buffer2[key][m]]['Rep. Flag'] = '*'
+
+				bay_rcd[buffer2[key][m]]['Annotations'].insert(0, comment_text)
+
+				if (buffer1[key][m], 'Comment') in soe_upd:
+					soe_upd[(buffer1[key][m], 'Comment')].append(comment_text)
+				else:
+					soe_upd[(buffer1[key][m], 'Comment')] = [comment_text]
+
+		for x, idx in enumerate(iorder_list):
+			idx_order = idx
+			t_order, t_tx = get_datetime(df_bay.loc[idx])
+			t_feedback = t_tx
+			elm, sts, tag, opr = df_bay.loc[idx, ['Element', 'Status', 'Tag', 'Operator']]
+			idx_result = idx
+			txt_cd_anomaly = 'Status CD anomali'
+			txt_lr_anomaly = 'Status LR anomali'
+			txt_ts_anomaly = 'Anomali timestamp RTU'
+			soe_comment = self.soe_ctrl.loc[idx, 'Comment'].split('\n')
+			data = {
+				'Order Time': t_order,
+				'Feedback Time': t_feedback,
+				'B1': b1,
+				'B2': b2,
+				'B3': b3,
+				'Element': elm,
+				'Status': sts,
+				'Tag': tag,
+				'Operator': opr,
+				'Pre Result': '',
+				'Execution (s)': 0,
+				'Termination (s)': 0,
+				'TxRx (s)': 0,
+				'Rep. Flag': '',
+				'Marked Unused': '',
+				'Marked Success': '',
+				'Marked Failed': '',
+				'Final Result': '',
+				'Annotations': list(),
+				'Navigation': (idx_order, idx_result)
+			}
+			rc_result = 'UNCERTAIN'
+			active_prot = ''
+
+			# Check IFS before RC
+			ifs_status_0, ifs_name_0 = self.check_ifs_status(t1=t_order, b1=b1)
+			if ifs_status_0=='Down':
+				txt_ifs_before_rc = f'RC dalam kondisi IFS "{ifs_name_0}" {ifs_status_0}'
+				data['Annotations'].append(txt_ifs_before_rc)
+				soe_comment.append(txt_ifs_before_rc)
+
+			# Check LR before RC
+			lr_status_0, lr_quality_0 = self.check_remote_status(t1=t_order, b1=b1, b2=b2, b3=b3)
+			if lr_quality_0=='good' and lr_status_0=='Local':
+				txt_rc_at_local = f'Status LR {lr_status_0}'
+				data['Annotations'].append(txt_rc_at_local)
+				if txt_rc_at_local not in soe_comment: soe_comment.append(txt_rc_at_local)
+			elif lr_quality_0=='bad':
+				data['Annotations'].append(txt_lr_anomaly)
+				if txt_lr_anomaly not in soe_comment: soe_comment.append(txt_lr_anomaly)
+
+			# Check CD before RC
+			cd_status_0, cd_quality_0 = self.check_enable_status(t1=t_order, b1=b1)
+			if cd_quality_0=='good' and cd_status_0=='Disable':
+				txt_rc_at_disable = f'Status CD {cd_status_0}'
+				data['Annotations'].append(txt_rc_at_disable)
+				if txt_rc_at_disable not in soe_comment: soe_comment.append(txt_rc_at_disable)
+			elif cd_quality_0=='bad':
+				data['Annotations'].append(txt_cd_anomaly)
+				if txt_cd_anomaly not in soe_comment: soe_comment.append(txt_cd_anomaly)
+
+			# Check CSO & Protection before RC
+			if sts=='Close':
+				cso_status_0, cso_quality_0 = self.check_synchro_interlock(t1=t_order, b1=b1, b2=b2, b3=b3)
+				if cso_quality_0=='good':
+					txt_rc_at_cso = f'Status CSO {cso_status_0}'
+					data['Annotations'].append(txt_rc_at_cso)
+					if txt_rc_at_cso not in soe_comment: soe_comment.append(txt_rc_at_cso)
+				elif cso_quality_0=='bad':
+					txt_cso_anomaly = 'Status CSO anomali'
+					data['Annotations'].append(txt_cso_anomaly)
+					if txt_cso_anomaly not in soe_comment: soe_comment.append(txt_cso_anomaly)
+
+				active_prot = self.check_protection_interlock(t1=t_order, b1=b1, b2=b2, b3=b3)
+				if active_prot:
+					txt_prot_active = f'Proteksi {active_prot} sedang aktif'
+					data['Annotations'].append(txt_prot_active)
+					if txt_prot_active not in soe_comment: soe_comment.append(txt_prot_active)
+
+			# Sampling dataframe within t_search time
+			df_range = df_bay[(join_datetime(df_bay['System time stamp'], df_bay['System milliseconds'])>=t_order) & (join_datetime(df_bay['System time stamp'], df_bay['System milliseconds'])<=join_datetime(t_order, self.t_search*1000)) & (df_bay['Element']==elm)]
+
+			# Get first feedback
+			df_result = df_range[(df_range['Status']==sts) & (df_range['Tag'].isin(self.feedback_tags))][:1]
+
+			if df_result.shape[0]>0:
+				# Continue check feedback
+				row_result = df_result.iloc[0]
+				idx_result = row_result.name
+
+				if 'R' in row_result['Tag']:
+					rc_result = 'SUCCESS'
+				else:
+					rc_result = 'FAILED'
+
+				t_feedback, t_receive = get_datetime(row_result)
+				t_exec = get_execution_duration(df_bay.loc[idx], row_result)
+				t_term = get_termination_duration(df_bay.loc[idx], row_result)
+				t_txrx = t_term - t_exec
+				idx_last = idx_result
+				data['Feedback Time'] = t_feedback
+				data['Execution (s)'] = t_exec
+				data['Termination (s)'] = t_term
+				data['TxRx (s)'] = t_txrx
+				data['Navigation'] = (idx_order, idx_result)
+
+				# Check if t_feedback leading t_order
+				if t_exec<0 or t_txrx<0:
+					data['Annotations'].append(txt_ts_anomaly)
+					row_result_comment = self.soe_ctrl.loc[idx_result, 'Comment'].split('\n')
+
+					if txt_ts_anomaly not in row_result_comment: row_result_comment.append(txt_ts_anomaly)
+
+					if (idx_result, 'Comment') in soe_upd:
+						soe_upd[(idx_result, 'Comment')].append(row_result_comment)
+					else:
+						soe_upd[(idx_result, 'Comment')] = row_result_comment
+			else:
+				# Cut operation if no feedback found
+				# Return order index with status UNCERTAIN
+				idx_last = idx_order
+
+			final_result = rc_result
+
+			if rc_result=='FAILED':
+				status_anomaly = False
+				no_status_changes = False
+
+				# Check IFS after RC
+				if ifs_status_0=='Up':
+					ifs_status1, ifs_name1 = self.check_ifs_status(t1=t_feedback, b1=b1)
+					if ifs_status1=='Down':
+						txt_ifs_after_rc = f'IFS "{ifs_name1}" {ifs_status1} sesaat setelah RC'
+						data['Annotations'].append(txt_ifs_after_rc)
+						soe_comment.append(txt_ifs_after_rc)
+
+				# Only Tag [OR, O*, RC, R*, ""] would pass
+				df_failed = df_range[(join_datetime(df_range['System time stamp'], df_range['System milliseconds'])>t_order) & ((df_range['Tag'].isin(self.order_tags + ['RC', 'R*'])) | (df_range['Tag']==''))]
+
+				# Check for normal status occurences
+				if df_failed[(df_failed['Status'].isin(['Close', 'Open'])) & (df_failed['Tag']=='')].shape[0]>0:
+					df_status_normal = df_failed[df_failed['Status'].isin(['Close', 'Open'])]
+					first_change = df_status_normal.iloc[0]
+
+					if first_change['Tag']=='':
+						# Status changes after RC order
+						ind, note = find_status(idx_order, idx_result, first_change.name, status_anomaly)
+
+						if ind is not None: idx_last = ind
+
+						if note: data['Annotations'].append(note)
+					else:
+						# Another RC order tag
+						no_status_changes = True
+				else:
+					status_anomaly = True
+
+				# Check for anomaly status occurences
+				if (no_status_changes or status_anomaly) and df_failed[df_failed['Status']=='Dist.'].shape[0]>0:
+					isfeedback = True
+					first_dist_change = df_failed[df_failed['Status']=='Dist.'].iloc[0]
+					# Sampling for next order
+					df_next_order = df_failed[df_failed['Tag'].isin(self.order_tags)]
+
+					if df_next_order.shape[0]>0:
+						# Check if dist. status occured after another RC order
+						if df_next_order.iloc[0].name<first_dist_change.name: isfeedback = False
+
+					if isfeedback:
+						# Anomaly status occured
+						ind, note = find_status(idx_order, idx_result, first_dist_change.name, status_anomaly)
+
+						if ind is not None: idx_last = ind
+
+						if note: data['Annotations'].append(note)
+
+			# Copy User Comment if any
+			user_comment = df_range.loc[df_range.index<=idx_last, 'User comment'].to_list()
+			for cmt in user_comment:
+				if cmt and '**' not in cmt:
+					# Eleminate unnecessary character
+					txt = re.sub('^\W*|\s*$', '', cmt)
+					data['Annotations'].append(txt)
+
+			# Event marked by user
+			if self.unused_mark in df_range['User comment'].to_list() or 'notused' in df_range['User comment'].to_list():
+				data['Annotations'].append('User menandai RC dianulir**')
+				data['Marked Unused'] = '*'
+			elif self.success_mark in df_range['User comment'].to_list():
+				final_result = 'SUCCESS'
+				data['Annotations'].append('User menandai RC sukses**')
+				data['Marked Success'] = '*'
+			elif self.failed_mark in df_range['User comment'].to_list():
+				final_result = 'FAILED'
+				data['Annotations'].append('User menandai RC gagal**')
+				data['Marked Failed'] = '*'
+
+			soe_upd[(idx_order, 'Comment')] = soe_comment
+			soe_upd[(idx_result, 'RC Feedback')] = rc_result
+			data['Pre Result'] = rc_result
+			data['Final Result'] = final_result
+			# Append data into list
+			bay_rcd.append(data)
+
 			if self.check_repetition:
-				if (date_rc.year==date_origin.year and date_rc.month==date_origin.month and date_rc.day==date_origin.day) and x<len(rc_order_index)-1:
+				# Check repetition
+				key = (elm, sts)
+				if date_origin.year==t_tx.year and date_origin.month==t_tx.month and date_origin.day==t_tx.day:
 					# If in the same day and not last iteration
-					if bufkey in buffer1:
-						# Bufkey already in buffer, append buffer
-						buffer1[bufkey] += [index_0]
-						buffer2[bufkey] += [x]
+					if key in buffer1:
+						# Element & status already in buffer, append buffer
+						buffer1[key] += [idx]
+						buffer2[key] += [x]
 
-						if result=='SUCCESS':
+						if final_result=='SUCCESS':
 							# Comment to mark as last RC repetition
-							for m in range(len(buffer1[bufkey])):
-								if m==len(buffer1[bufkey])-1:
-									comment_text = f'Percobaan RC ke-{m+1} (terakhir)'
-								else:
-									comment_text = f'Percobaan RC ke-{m+1}'
-									# Give flag
-									rc_list[buffer2[bufkey][m]]['Rep. Flag'] = '*'
-								self.soe_ctrl.at[buffer1[bufkey][m], 'Comment'] += f'{comment_text}\n'
-								note_list[buffer2[bufkey][m]].insert(0, comment_text)
-
-							del buffer1[bufkey]
-							del buffer2[bufkey]
+							annotate_repetition(key)
+							del buffer1[key]
+							del buffer2[key]
 
 					else:
-						if result in ['FAILED', 'UNCERTAIN']:
-							buffer1[bufkey] = [index_0]
-							buffer2[bufkey] = [x]
+						if final_result in ['FAILED', 'UNCERTAIN']:
+							buffer1[key] = [idx]
+							buffer2[key] = [x]
 				else:
+					for _key, _val in buffer1.items():
+						if len(_val)>1: annotate_repetition(_key)	# Comment to mark as multiple RC event in 1 day
+
 					# If dates are different, set date_origin
-					date_origin = date_rc
-
-					for bkey, bval in buffer1.items():
-						if len(bval)>1:
-							# Comment to mark as multiple RC event in 1 day
-							for n in range(len(bval)):
-								if n==len(bval)-1:
-									comment_text = f'Percobaan RC ke-{n+1} (terakhir)'
-								else:
-									comment_text = f'Percobaan RC ke-{n+1}'
-									# Give flag
-									rc_list[buffer2[bkey][n]]['Rep. Flag'] = '*'
-								self.soe_ctrl.at[bval[n], 'Comment'] += f'{comment_text}\n'
-								note_list[buffer2[bkey][n]].insert(0, comment_text)
-
+					date_origin = t_tx
 					# Reset buffer
-					buffer1, buffer2 = {}, {}
+					buffer1.clear()
+					buffer2.clear()
 					# Insert into new buffer
-					if result in ['FAILED', 'UNCERTAIN']:
-						buffer1[bufkey] = [index_0]
-						buffer2[bufkey] = [x]
+					if final_result in ['FAILED', 'UNCERTAIN']:
+						buffer1[key] = [idx]
+						buffer2[key] = [x]
 
-			self._rc_indexes.append((index_0, index_1, result))
+				if x==len(iorder_list)-1:
+					for _key, _val in buffer1.items():
+						if len(_val)>1: annotate_repetition(_key)
 
-		rcd = pd.DataFrame(data=rc_list)
-		rcd['Annotations'] = list(map(lambda x: '\n'.join(list(map(lambda y: f'- {y}', x))), note_list))
-		self.rc_list = rc_list
+		for rcd in bay_rcd:
+			rcd['Annotations'] = '\n'.join(list(map(lambda x: f'- {x}', rcd['Annotations'])))
+
+		return bay_rcd, soe_upd
+
+	def analyze_rcd_concurrently(self, df:pd.DataFrame, bays:list):
+		"""
+		"""
+
+		with ThreadPoolExecutor(len(bays)) as tpe:
+			rcd_list = list()
+			soe_dict = dict()
+			futures = [tpe.submit(self.get_rcd_result, df, bay) for bay in bays]
+
+			for future in futures:
+				bay_rcd, soe_upd = future.result()
+				rcd_list += bay_rcd
+				soe_dict.update(soe_upd)
+
+			return rcd_list, soe_dict
+
+	def fast_analyze(self, start:datetime.datetime=None, stop:datetime.datetime=None, **kwargs):
+		"""
+		Analyzed every RC of bays concurrently.
+		"""
+
+		gc.collect()
+		# Can be filtered with date
+		if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
+			t0, t1 = self._set_range(start=start, stop=stop)
+		else:
+			t0, t1 = self._set_range(start=self.soe_all['Time stamp'].min(), stop=self.soe_all['Time stamp'].max())
+
+		bay_list = self.get_bays()
+		df = self.soe_all[(self.soe_all['Time stamp']>=t0) & (self.soe_all['Time stamp']<=t1)]
+		n = 8
+		chunksize = len(bay_list)//n + 1	# The fastest process duration proven from some tests
+		# chunksize = 1
+		data_list = list()
+
+		print(f'\nMenganalisa {self.get_order_count()} event RC...')
+		# ProcessPoolExecutor create new instance on different processes, so modifying instance in each process will not change instance in main process
+		with ProcessPoolExecutor(max_workers=n) as ppe:
+			futures = list()
+			soe_update = dict()
+
+			for i in range(0, len(bay_list), chunksize):
+				bays = bay_list[i:(i+chunksize)]
+				future = ppe.submit(self.analyze_rcd_concurrently, df, bays)
+				futures.append(future)
+
+			for x, future in enumerate(as_completed(futures)):
+				progress_bar((x+1)/len(futures))
+				result_list, soe_dict = future.result()
+				data_list.extend(result_list)
+				soe_update.update(soe_dict)
+
+		for cell in soe_update:
+			val = soe_update[cell]
+
+			if isinstance(val, (list, tuple)):
+				self.soe_ctrl.loc[cell[0], cell[1]] = '\n'.join([s for s in val if s])
+			else:
+				self.soe_ctrl.loc[cell[0], cell[1]] = val
+
+		# Create new DataFrame from list of dict data
+		df_rcd = pd.DataFrame(data=data_list).sort_values(['Order Time'], ascending=[True]).reset_index(drop=True)
+		self.rc_list = data_list
 		self.post_process = pd.concat([self.soe_ctrl, self.soe_lr, self.soe_cd, self.soe_sync, self.soe_prot, self.soe_ifs], copy=False).drop_duplicates(keep='first').sort_values(['Time stamp', 'Milliseconds'])
 		self._analyzed = True
 
-		return rcd[RCD_COLUMNS + ['Navigation']]
+		return df_rcd[RCD_COLUMNS + ['Navigation']]
 
-	def check_enable_status(self, data:dict):
+	def analyze(self, start:datetime.datetime=None, stop:datetime.datetime=None, **kwargs):
+		"""
+		Analyzed every RC of bays concurrently.
+		"""
+
+		gc.collect()
+		# Can be filtered with date
+		if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
+			t0, t1 = self._set_range(start=start, stop=stop)
+		else:
+			t0, t1 = self._set_range(start=self.soe_all['Time stamp'].min(), stop=self.soe_all['Time stamp'].max())
+
+		bay_list = self.get_bays()
+		df = self.soe_all[(self.soe_all['Time stamp']>=t0) & (self.soe_all['Time stamp']<=t1)]
+		data_list = list()
+		soe_update = dict()
+
+		print(f'\nMenganalisa {self.get_order_count()} event RC...')
+		for x, bay in enumerate(bay_list):
+			progress_bar((x+1)/len(bay_list))
+			result_list, soe_dict = self.get_rcd_result(df, bay)
+			data_list.extend(result_list)
+			soe_update.update(soe_dict)
+
+		for cell in soe_update:
+			val = soe_update[cell]
+
+			if isinstance(val, (list, tuple)):
+				self.soe_ctrl.loc[cell[0], cell[1]] = '\n'.join([s for s in val if s])
+			else:
+				self.soe_ctrl.loc[cell[0], cell[1]] = val
+
+		# Create new DataFrame from list of dict data
+		df_rcd = pd.DataFrame(data=data_list).sort_values(['Order Time'], ascending=[True]).reset_index(drop=True)
+		self.rc_list = data_list
+		self.post_process = pd.concat([self.soe_ctrl, self.soe_lr, self.soe_cd, self.soe_sync, self.soe_prot, self.soe_ifs], copy=False).drop_duplicates(keep='first').sort_values(['Time stamp', 'Milliseconds'])
+		self._analyzed = True
+
+		return df_rcd[RCD_COLUMNS + ['Navigation']]
+
+	def check_enable_status(self, **data:dict):
 		"""
 		Check CD status on an event parameterized in a dict (data), then return CD status and CD quality into one set.
 		* INPUT
@@ -264,11 +963,13 @@ class _SOEAnalyzer:
 
 		# Initialize
 		cd_status = 'Enable'
-		df_cd = self.soe_cd[(self.soe_cd['B1']==data['b1']) & (self.soe_cd['Element']=='CD') & (self.soe_cd['Tag']=='')]
+		b1 = data['b1']
+		t_ord = data['t1']
+		df_cd = self.soe_cd[(self.soe_cd['B1']==b1) & (self.soe_cd['Element']=='CD') & (self.soe_cd['Tag']=='')]
 
 		# Check CD quality in program buffer
-		if data['b1'] in self.cd_qualities:
-			cd_quality = self.cd_qualities[data['b1']]
+		if b1 in self.cd_qualities:
+			cd_quality = self.cd_qualities[b1]
 		else:
 			# Do CD value check
 			cd_values = df_cd['Status'].values
@@ -283,24 +984,24 @@ class _SOEAnalyzer:
 				cd_quality = 'uncertain'
 
 			# Save in buffer
-			self._cd_qualities[data['b1']] = cd_quality
+			self._cd_qualities[b1] = cd_quality
 
 		if cd_quality in ['good', 'bad']:
 			# If quality good, filter only valid status
 			if cd_quality=='good': df_cd = df_cd[df_cd['Status'].isin(['Enable', 'Disable'])]
 			
-			if df_cd[join_datetime(df_cd['System time stamp'], df_cd['System milliseconds'])<data['t1']].shape[0]>0:
+			if df_cd[join_datetime(df_cd['System time stamp'], df_cd['System milliseconds'])<t_ord].shape[0]>0:
 				# CD status changes occured before
-				cd_last_change = df_cd[join_datetime(df_cd['System time stamp'], df_cd['System milliseconds'])<data['t1']].iloc[-1]
+				cd_last_change = df_cd[join_datetime(df_cd['System time stamp'], df_cd['System milliseconds'])<t_ord].iloc[-1]
 				cd_status = 'Enable' if cd_last_change['Status']=='Enable' else 'Disable'
 			else:
 				# CD status changes occured after
-				cd_first_change = df_cd[join_datetime(df_cd['System time stamp'], df_cd['System milliseconds'])>=data['t1']].iloc[0]
+				cd_first_change = df_cd[join_datetime(df_cd['System time stamp'], df_cd['System milliseconds'])>=t_ord].iloc[0]
 				cd_status = 'Disable' if cd_first_change['Status']=='Enable' else 'Enable'
 				
 		return cd_status, cd_quality
 
-	def check_ifs_status(self, data:dict):
+	def check_ifs_status(self, **data:dict):
 		"""
 		Check IFS status on an event parameterized in a dict (data), then return IFS status and IFS name into one set.
 		* INPUT
@@ -316,49 +1017,54 @@ class _SOEAnalyzer:
 		ifs_status = 'Up'
 		# Change here if using ifs_name_matching
 		ifs_name = data['b1']
+		t_ord = data['t1']
 
 		if ifs_name:
 			df_ifs = self.soe_ifs[(self.soe_ifs['B1']=='IFS') & (self.soe_ifs['B2']=='RTU_P1') & (self.soe_ifs['B3']==ifs_name) & (self.soe_ifs['Tag']=='')]
 			if df_ifs.shape[0]>0:
-				if df_ifs[join_datetime(df_ifs['System time stamp'], df_ifs['System milliseconds'])<data['t1']].shape[0]>0:
+				if df_ifs[join_datetime(df_ifs['System time stamp'], df_ifs['System milliseconds'])<t_ord].shape[0]>0:
 					# IFS status changes occured before
-					ifs_last_change = df_ifs[join_datetime(df_ifs['System time stamp'], df_ifs['System milliseconds'])<data['t1']].iloc[-1]
+					ifs_last_change = df_ifs[join_datetime(df_ifs['System time stamp'], df_ifs['System milliseconds'])<t_ord].iloc[-1]
 					ifs_status = 'Down' if ifs_last_change['Status']=='Down' else 'Up'
 				else:
 					# IFS status changes occured after
-					ifs_first_change = df_ifs[join_datetime(df_ifs['System time stamp'], df_ifs['System milliseconds'])>=data['t1']].iloc[0]
-					t_delta = round((join_datetime(ifs_first_change['System time stamp'], ifs_first_change['System milliseconds'])-data['t1']).total_seconds(), 1)
+					ifs_first_change = df_ifs[join_datetime(df_ifs['System time stamp'], df_ifs['System milliseconds'])>=t_ord].iloc[0]
+					t_delta = round((join_datetime(ifs_first_change['System time stamp'], ifs_first_change['System milliseconds'])-t_ord).total_seconds(), 1)
 					if abs(t_delta)<t_hyst:
-						ifs_status = f'transisi menuju down ({t_delta}s)' if ifs_first_change['Status']=='Down' else f'transisi menuju Up ({t_delta}s)'
+						ifs_status = f'transisi menuju Down ({t_delta}s)' if ifs_first_change['Status']=='Down' else f'transisi menuju Up ({t_delta}s)'
 					else:
 						ifs_status = f'Up' if ifs_first_change['Status']=='Down' else f'Down'
 
 		return ifs_status, ifs_name
 
-	def check_protection_interlock(self, data:dict):
+	def check_protection_interlock(self, **data:dict):
 		"""
 		Check protection status on an event parameterized in a dict (data), then return active protection or "" (empty string) if none.
 		* INPUT
 		data : dict of an event, required field [System Timestamp, B1, B2, B3]
 		* OUTPUT
-		prot_isactive
+		active_prot
 		"""
 
 		# Initialize
-		prot_isactive = ''
+		active_prot = ''
 		index = -1
-		df_prot = self.soe_prot[(self.soe_prot['Tag']=='') & (self.soe_prot['B1']==data['b1']) & (self.soe_prot['B2']==data['b2']) & (self.soe_prot['B3']==data['b3']) & (self.soe_prot['Element'].isin(['CBTR', 'MTO']))]
+		t_ord = data['t1']
+		b1 = data['b1']
+		b2 = data['b2']
+		b3 = data['b3']
+		df_prot = self.soe_prot[(self.soe_prot['Tag']=='') & (self.soe_prot['B1']==b1) & (self.soe_prot['B2']==b2) & (self.soe_prot['B3']==b3) & (self.soe_prot['Element'].isin(['CBTR', 'MTO']))]
 
-		if df_prot[join_datetime(df_prot['System time stamp'], df_prot['System milliseconds'])<data['t1']].shape[0]>0:
+		if df_prot[join_datetime(df_prot['System time stamp'], df_prot['System milliseconds'])<t_ord].shape[0]>0:
 			# Latched protection Appeared before
-			prot_last_appear = df_prot[join_datetime(df_prot['System time stamp'], df_prot['System milliseconds'])<data['t1']].iloc[-1]
+			prot_last_appear = df_prot[join_datetime(df_prot['System time stamp'], df_prot['System milliseconds'])<t_ord].iloc[-1]
 			if prot_last_appear['Status']=='Appeared':
-				prot_isactive = prot_last_appear['Element']
+				active_prot = prot_last_appear['Element']
 				index = prot_last_appear.name
 
-		return prot_isactive
+		return active_prot
 
-	def check_remote_status(self, data:dict):
+	def check_remote_status(self, **data:dict):
 		"""
 		Check LR status on an event parameterized in a dict (data), then return LR status and LR quality into one set.
 		* INPUT
@@ -372,11 +1078,15 @@ class _SOEAnalyzer:
 
 		# Initialize
 		lr_status = 'Remote'
-		df_lr = self.soe_lr[(self.soe_lr['Tag']=='') & (self.soe_lr['B1']==data['b1']) & (self.soe_lr['B2']==data['b2']) & (self.soe_lr['B3']==data['b3']) & (self.soe_lr['Element']=='LR')]
+		t_ord = data['t1']
+		b1 = data['b1']
+		b2 = data['b2']
+		b3 = data['b3']
+		df_lr = self.soe_lr[(self.soe_lr['Tag']=='') & (self.soe_lr['B1']==b1) & (self.soe_lr['B2']==b2) & (self.soe_lr['B3']==b3) & (self.soe_lr['Element']=='LR')]
 
 		# Check LR quality in program buffer
-		if (data['b1'], data['b2'], data['b3']) in self.lr_qualities:
-			lr_quality = self.lr_qualities[(data['b1'], data['b2'], data['b3'])]
+		if (b1, b2, b3) in self.lr_qualities:
+			lr_quality = self.lr_qualities[(b1, b2, b3)]
 		else:
 			# Do LR value check
 			lr_values = df_lr['Status'].values
@@ -391,24 +1101,24 @@ class _SOEAnalyzer:
 				lr_quality = 'uncertain'
 
 			# Save in buffer
-			self._lr_qualities[(data['b1'], data['b2'], data['b3'])] = lr_quality
+			self._lr_qualities[(b1, b2, b3)] = lr_quality
 
 		if lr_quality in ['good', 'bad']:
 			# If quality good, filter only valid status
 			if lr_quality=='good': df_lr = df_lr[df_lr['Status'].isin(['Remote', 'Local'])]
 
-			if df_lr[join_datetime(df_lr['System time stamp'], df_lr['System milliseconds'])<data['t1']].shape[0]>0:
+			if df_lr[join_datetime(df_lr['System time stamp'], df_lr['System milliseconds'])<t_ord].shape[0]>0:
 				# LR status changes occured before
-				lr_last_change = df_lr[join_datetime(df_lr['System time stamp'], df_lr['System milliseconds'])<data['t1']].iloc[-1]
+				lr_last_change = df_lr[join_datetime(df_lr['System time stamp'], df_lr['System milliseconds'])<t_ord].iloc[-1]
 				lr_status = 'Remote' if lr_last_change['Status']=='Remote' else 'Local'
 			else:
 				# LR status changes occured after
-				lr_first_change = df_lr[join_datetime(df_lr['System time stamp'], df_lr['System milliseconds'])>=data['t1']].iloc[0]
+				lr_first_change = df_lr[join_datetime(df_lr['System time stamp'], df_lr['System milliseconds'])>=t_ord].iloc[0]
 				lr_status = 'Local' if lr_first_change['Status']=='Remote' else 'Remote'
 
 		return lr_status, lr_quality
 
-	def check_synchro_interlock(self, data:dict):
+	def check_synchro_interlock(self, **data:dict):
 		"""
 		Check CSO status on an event parameterized in a dict (data), then return CSO status and CSO quality into one set.
 		* INPUT
@@ -422,11 +1132,15 @@ class _SOEAnalyzer:
 
 		# Initialize
 		cso_status = 'Off'
-		df1 = self.soe_sync[(self.soe_sync['Tag']=='') & (self.soe_sync['B1']==data['b1']) & (self.soe_sync['B2']==data['b2']) & (self.soe_sync['B3']==data['b3']) & (self.soe_sync['Element']=='CSO')]
+		t_ord = data['t1']
+		b1 = data['b1']
+		b2 = data['b2']
+		b3 = data['b3']
+		df1 = self.soe_sync[(self.soe_sync['Tag']=='') & (self.soe_sync['B1']==b1) & (self.soe_sync['B2']==b2) & (self.soe_sync['B3']==b3) & (self.soe_sync['Element']=='CSO')]
 
-		if (data['b1'], data['b2'], data['b3']) in self.cso_qualities:
+		if (b1, b2, b3) in self.cso_qualities:
 			# Check CSO quality in program buffer
-			cso_quality = self.cso_qualities[(data['b1'], data['b2'], data['b3'])]
+			cso_quality = self.cso_qualities[(b1, b2, b3)]
 		else:
 			# Do CSO value check
 			cso_values = df1['Status'].values
@@ -441,30 +1155,50 @@ class _SOEAnalyzer:
 				cso_quality = 'uncertain'
 
 			# Save in buffer
-			self._cso_qualities[(data['b1'], data['b2'], data['b3'])] = cso_quality
+			self._cso_qualities[(b1, b2, b3)] = cso_quality
 
 		if cso_quality in ['good', 'bad']:
 			# If quality good, filter only valid status
 			if cso_quality=='good': df1 = df1[df1['Status'].isin(['On', 'Off'])]
 
-			if df1[join_datetime(df1['System time stamp'], df1['System milliseconds'])<data['t1']].shape[0]>0:
+			if df1[join_datetime(df1['System time stamp'], df1['System milliseconds'])<t_ord].shape[0]>0:
 				# CSO status changes occured before
-				cso_last_change = df1[join_datetime(df1['System time stamp'], df1['System milliseconds'])<data['t1']].iloc[-1]
+				cso_last_change = df1[join_datetime(df1['System time stamp'], df1['System milliseconds'])<t_ord].iloc[-1]
 				cso_status = 'On' if cso_last_change['Status']=='On' else 'Off'
 			else:
 				# CSO status changes occured after
-				cso_first_change = df1[join_datetime(df1['System time stamp'], df1['System milliseconds'])>=data['t1']].iloc[0]
+				cso_first_change = df1[join_datetime(df1['System time stamp'], df1['System milliseconds'])>=t_ord].iloc[0]
 				cso_status = 'Off' if cso_first_change['Status']=='On' else 'On'
 
 		return cso_status, cso_quality
 
-	def get_orders(self, start:datetime=None, stop:datetime=None):
+	def get_bays(self):
+		"""
+		"""
+
+		columns = ['B1', 'B2', 'B3']
+		df = self.soe_all
+		unique_bays = df.loc[(df['A']=='') & (df['Element'].isin(self.rc_element)) & (df['Tag'].isin(self.order_tags)) & (df['Time stamp']>=self._t0) & (df['Time stamp']<=self._t1), columns].drop_duplicates(subset=columns, keep='first')
+
+		return unique_bays.values
+
+	def get_order_count(self):
+		"""
+		"""
+
+		df = self.soe_all
+		# Get His. Messages with order tag only
+		count = df[(df['A']=='') & (df['Element'].isin(self.rc_element)) & (df['Tag'].isin(self.order_tags)) & (df['Time stamp']>=self._t0) & (df['Time stamp']<=self._t1)].shape[0]
+
+		return count
+
+	def get_orders(self, start:datetime.datetime=None, stop:datetime.datetime=None):
 		"""
 		"""
 
 		df = self.soe_all.copy()
 		# Can be filtered with date
-		if isinstance(start, datetime) and isinstance(stop, datetime):
+		if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
 			t0, t1 = self._set_range(start=start, stop=stop)
 		else:
 			t0, t1 = self._set_range(start=df['Time stamp'].min(), stop=df['Time stamp'].max())
@@ -473,264 +1207,6 @@ class _SOEAnalyzer:
 		orders = df[(df['A']=='') & (df['Element'].isin(self.rc_element)) & (df['Tag'].isin(self.order_tags)) & (df['Time stamp']>=t0) & (df['Time stamp']<=t1)]
 
 		return orders
-
-	def get_result(self, order:pd.Series, rc_list:list, note_list:list):
-		"""
-		Get result of RC Event execution ended within t_search duration.
-		* INPUT
-		index : index of RC Event with order tag
-		* OUTPUT
-		result_idx : index of RC Event with feedback tag
-		rc_result : RC Event result Success / Failed / Uncertain
-		* SET
-		analyzed_rc_rows
-		rcd
-		soe
-		note_list
-		"""
-		
-		order_idx = order.name
-		t_order, t_transmit = get_datetime(order)
-		# t_order, t_transmit = get_datetime(self.soe_ctrl.loc[index])
-		b1, b2, b3, elm, sts, tag, dis = order.loc[['B1', 'B2', 'B3', 'Element', 'Status', 'Tag', 'Operator']]
-		# b1, b2, b3, elm, sts, tag, dis = self.soe_ctrl.loc[index, ['B1', 'B2', 'B3', 'Element', 'Status', 'Tag', 'Operator']]
-		rc_result, t0, t1, t2 = 'UNCERTAIN', 0, 0, 0
-		t_feedback = t_transmit
-		prot_isactive = ''
-		annotation = []
-		mark_success, mark_failed, mark_unused = False, False, False
-
-		txt_cd_anomaly = 'Status CD anomali'
-		txt_lr_anomaly = 'Status LR anomali'
-		txt_timestamp_anomaly = 'Anomali timestamp RTU'
-
-		ifs_status_0, ifs_name_0 = self.check_ifs_status(data={'t1': t_order, 'b1': b1})
-		if ifs_status_0=='Down':
-			txt_ifs_before_rc = f'RC dalam kondisi IFS "{ifs_name_0}" {ifs_status_0}'
-			annotation.append(txt_ifs_before_rc)
-			self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_ifs_before_rc}\n'
-		
-		# TEST PROGRAMM
-		invert_status = {'Open': 'Close', 'Close': 'Open'}
-
-		# Notes for LR
-		lr_status_0, lr_quality_0 = self.check_remote_status(data={'t1': t_order, 'b1': b1, 'b2': b2, 'b3': b3})
-		if lr_quality_0=='good' and lr_status_0=='Local':
-			txt_rc_at_local = f'Status LR {lr_status_0}'
-			annotation.append(txt_rc_at_local)
-			if txt_rc_at_local not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_rc_at_local}\n'
-		elif lr_quality_0=='bad':
-			annotation.append(txt_lr_anomaly)
-			if txt_lr_anomaly not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_lr_anomaly}\n'
-
-		# Notes for CD
-		cd_status_0, cd_quality_0 = self.check_enable_status(data={'t1': t_order, 'b1': b1})
-		if cd_quality_0=='good' and cd_status_0=='Disable':
-			txt_rc_at_disable = f'Status CD {cd_status_0}'
-			annotation.append(txt_rc_at_disable)
-			if txt_rc_at_disable not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_rc_at_disable}\n'
-		elif cd_quality_0=='bad':
-			annotation.append(txt_cd_anomaly)
-			if txt_cd_anomaly not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_cd_anomaly}\n'
-			
-		# Notes for CSO and protection status
-		if sts=='Close':
-			cso_status_0, cso_quality_0 = self.check_synchro_interlock(data={'t1': t_order, 'b1': b1, 'b2': b2, 'b3': b3})
-			if cso_quality_0=='good':
-				txt_rc_at_cso = f'Status CSO {cso_status_0}'
-				annotation.append(txt_rc_at_cso)
-				if txt_rc_at_cso not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_rc_at_cso}\n'
-			elif cso_quality_0=='bad':
-				txt_cso_anomaly = 'Status CSO anomali'
-				annotation.append(txt_cso_anomaly)
-				if txt_cso_anomaly not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_cso_anomaly}\n'
-				
-			prot_isactive = self.check_protection_interlock(data={'t1': t_order, 'b1': b1, 'b2': b2, 'b3': b3})
-			if prot_isactive:
-				txt_prot_active = f'Proteksi {prot_isactive} sedang aktif'
-				annotation.append(txt_prot_active)
-				if txt_prot_active not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_prot_active}\n'
-
-		# Sampling dataframe within t_search time
-		df_range = self.soe_ctrl[(join_datetime(self.soe_ctrl['System time stamp'], self.soe_ctrl['System milliseconds'])>=t_order) & (join_datetime(self.soe_ctrl['System time stamp'], self.soe_ctrl['System milliseconds'])<=join_datetime(t_order, self.t_search*1000)) & (self.soe_ctrl['B1']==b1) & (self.soe_ctrl['B2']==b2) & (self.soe_ctrl['B3']==b3) & (self.soe_ctrl['Element']==elm)]
-
-		# Get first feedback
-		result_range = df_range[(df_range['Status']==sts) & (df_range['Tag'].isin(self.feedback_tags))][:1]
-
-		if result_range.shape[0]>0:
-			# Continue check feedback
-			result_row = result_range.iloc[0]
-			result_idx = result_row.name
-			if 'R' in result_row['Tag']:
-				rc_result = 'SUCCESS'
-			else:
-				rc_result = 'FAILED'
-
-			t_feedback, t_receive = get_datetime(result_row)
-			t0 = get_execution_duration(order, result_row)
-			t1 = get_termination_duration(order, result_row)
-			t2 = t1 - t0
-			last_idx = result_idx
-
-			# Check if t_feedback leading t_order
-			if t0<0 or t2<0:
-				annotation.append(txt_timestamp_anomaly)
-				if txt_timestamp_anomaly not in self.soe_ctrl.loc[result_idx, 'Comment']: self.soe_ctrl.at[result_idx, 'Comment'] += f'{txt_timestamp_anomaly}\n'
-		else:
-			# Cut operation if no feedback found
-			# Return order index with status UNCERTAIN
-			last_idx = order_idx
-			result_idx = order_idx
-
-		final_result = rc_result
-
-		if rc_result=='FAILED':
-			anomaly_status = False
-			no_status_changes = False
-
-			# Check for IFS
-			if ifs_status_0=='Up':
-				ifs_status1, ifs_name1 = self.check_ifs_status(data={'t1': t_feedback, 'b1': b1})
-				if ifs_status1=='Down':
-					txt_ifs_after_rc = f'IFS "{ifs_name1}" {ifs_status1} sesaat setelah RC'
-					annotation.append(txt_ifs_after_rc)
-					self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_ifs_after_rc}\n'
-
-			# Only Tag [OR, O*, RC, R*, ""] would pass
-			df_failed = df_range[(join_datetime(df_range['System time stamp'], df_range['System milliseconds'])>t_order) & ((df_range['Tag'].isin(self.order_tags + ['RC', 'R*'])) | (df_range['Tag']==''))]
-
-			# Check for normal status occurences
-			if df_failed[(df_failed['Status'].isin(['Close', 'Open'])) & (df_failed['Tag']=='')].shape[0]>0:
-				df_status_normal = df_failed[df_failed['Status'].isin(['Close', 'Open'])]
-				first_change = df_status_normal.iloc[0]
-				
-				if first_change['Tag']=='':
-					# Status changes after RC order
-					t_delta = get_execution_duration(df_range.loc[order_idx], first_change)
-
-					txt_list = []
-					t_executed = join_datetime(*first_change.loc[['Time stamp', 'Milliseconds']].to_list())
-					lr_status_1, lr_quality_1 = self.check_remote_status(data={'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-					cd_status_1, cd_quality_1 = self.check_enable_status(data={'t1': t_executed, 'b1': b1})
-					# if cd_quality_1=='good': txt_list.append(f'CD={cd_status_1}')
-					
-					if sts=='Close':
-						cso_status_1, cso_quality_1 = self.check_synchro_interlock(data={'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-						# if cso_quality_1=='good': txt_list.append(f'CSO={cso_status_1}')
-						prot_isactive = self.check_protection_interlock(data={'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-						if prot_isactive: txt_list.append(f'{prot_isactive}=Appeared')
-
-					txt_additional = f' ({", ".join(txt_list)})' if len(txt_list)>0 else ''
-					
-					txt_status_result = ''
-					if first_change['Status']==sts:
-						# Valid status exists
-						if lr_status_1=='Remote' and t_delta<=self.t_monitor[elm]:
-							txt_status_result = f'Potensi RC sukses ({t_delta}s){txt_additional}'
-						else:
-							txt_status_result = f'Eksekusi lokal GI{txt_additional}'
-					else:
-						# Inverted status occured
-						if lr_status_1=='Remote' and t_delta<=self.t_monitor[elm]:
-							txt_status_result = f'RC {sts} tapi status balikan {first_change["Status"]}. Perlu ditelusuri!'
-						else:
-							anomaly_status = True
-
-					if first_change.name>result_idx: last_idx = first_change.name
-					if txt_status_result:
-						annotation.append(txt_status_result)
-						self.soe_ctrl.at[first_change.name, 'Comment'] += f'{txt_status_result}\n'
-				else:
-					# Another RC order tag
-					no_status_changes = True
-			else:
-				anomaly_status = True
-
-			# Check for anomaly status occurences
-			if (no_status_changes or anomaly_status) and df_failed[df_failed['Status']=='Dist.'].shape[0]>0:
-				isfeedback = True
-				first_dist_change = df_failed[df_failed['Status']=='Dist.'].iloc[0]
-
-				# Sampling for next order
-				df_next_order = df_failed[df_failed['Tag'].isin(self.order_tags)]
-
-				if df_next_order.shape[0]>0:
-					# Check if dist. status occured after another RC order
-					if df_next_order.iloc[0].name<first_dist_change.name: isfeedback = False
-
-				if isfeedback:
-					# Anomaly status occured
-					t_delta = get_execution_duration(df_range.loc[order_idx], first_dist_change)
-
-					txt_list = []
-					t_executed = join_datetime(*first_dist_change.loc[['Time stamp', 'Milliseconds']].to_list())
-					lr_status_1, lr_quality_1 = self.check_remote_status(data={'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-					cd_status_1, cd_quality_1 = self.check_enable_status(data={'t1': t_executed, 'b1': b1})
-					# if cd_quality_1=='good': txt_list.append(f'CD={cd_status_1}')
-					
-					if sts=='Close':
-						cso_status_1, cso_quality_1 = self.check_synchro_interlock(data={'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-						# if cso_quality_1=='good': txt_list.append(f'CSO={cso_status_1}')
-						prot_isactive = self.check_protection_interlock(data={'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-						if prot_isactive: txt_list.append(f'{prot_isactive}=Appeared')
-
-					txt_additional = f' ({", ".join(txt_list)})' if len(txt_list)>0 else ''
-					
-					if lr_status_1=='Remote' and t_delta<=self.t_monitor[elm]:
-						txt_status_anomaly = f'Potensi RC sukses, tapi status {sts} anomali ({t_delta}s){txt_additional}'
-					else:
-						txt_status_anomaly = f'Eksekusi lokal GI, tapi status {sts} anomali{txt_additional}'
-
-					if first_dist_change.name>result_idx: last_idx = first_dist_change.name
-					annotation.append(txt_status_anomaly)
-					self.soe_ctrl.at[first_dist_change.name, 'Comment'] += f'{txt_status_anomaly}\n'
-
-		# Copy User Comment if any
-		user_comment = df_range.loc[df_range.index<=last_idx, 'User comment'].to_list()
-		for cmt in user_comment:
-			if cmt and '**' not in cmt:
-				# Eleminate unnecessary character
-				txt = re.sub('^\W*|\s*$', '', cmt)
-				annotation.append(txt)
-
-		# Event marked by user
-		if self.unused_mark in df_range['User comment'].to_list() or 'notused' in df_range['User comment'].to_list():
-			annotation.append('User menandai RC dianulir**')
-			mark_unused = True
-		elif self.success_mark in df_range['User comment'].to_list():
-			final_result = 'SUCCESS'
-			annotation.append('User menandai RC sukses**')
-			mark_success = True
-		elif self.failed_mark in df_range['User comment'].to_list():
-			final_result = 'FAILED'
-			annotation.append('User menandai RC gagal**')
-			mark_failed = True
-
-		self.soe_ctrl.loc[result_idx, 'RC Feedback'] = rc_result
-		note_list.append(annotation)
-		rc_list.append({
-			'Order Time': t_order,
-			'Feedback Time': t_feedback,
-			'B1': b1,
-			'B2': b2,
-			'B3': b3,
-			'Element': elm,
-			'Status': sts,
-			'Tag': tag,
-			'Operator': dis,
-			'Pre Result': rc_result,
-			'Execution (s)': t0,
-			'Termination (s)': t1,
-			'TxRx (s)': t2,
-			'Rep. Flag': '',
-			'Marked Unused': '*' if mark_unused else '',
-			'Marked Success': '*' if mark_success else '',
-			'Marked Failed': '*' if mark_failed else '',
-			'Final Result': final_result,
-			'Navigation': (order_idx, result_idx)
-		})
-
-		return result_idx, final_result
 
 	@property
 	def analyzed(self):
@@ -807,9 +1283,108 @@ class _RCDBaseCalculation:
 
 		if data is not None: self.rcd_all = data
 
-		if hasattr(self, 'rcd_all'): self.calculate(start=kwargs.get('start'), stop=kwargs.get('stop'))
+		# if hasattr(self, 'rcd_all'): self.calculate(start=kwargs.get('start'), stop=kwargs.get('stop'))
 
-	def _calculate(self, start:datetime, stop:datetime):
+	@calc_time
+	def _calculate(self, start:datetime.datetime, stop:datetime.datetime, force:bool=False, fast:bool=True, **kwargs):
+		"""
+		Extension of _calculate function.
+		"""
+
+		if not hasattr(self, 'rcd_all') or force:
+			# Must be analyzed first and pass to rcd_all
+			fn1 = getattr(self, 'fast_analyze', None)
+			fn2 = getattr(self, 'analyze', None)
+			if callable(fn1) and fast:
+				self.rcd_all = fn1(start=start, stop=stop, **kwargs)
+			elif callable(fn2):
+				self.rcd_all = fn2(start=start, stop=stop, **kwargs)
+			else:
+				raise AttributeError('Atttribute error.', name='fast_analyze() / analyze()', obj=self.__class__.__name__)
+
+		if isinstance(self.rcd_all, pd.DataFrame):
+			# Can be filtered with date
+			if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
+				t0, t1 = self._set_range(start=start, stop=stop)
+			else:
+				t0, t1 = self._set_range(start=self.rcd_all['Order Time'].min(), stop=self.rcd_all['Order Time'].max())
+		else:
+			raise AttributeError('Data input tidak valid.', name='rcd_all', obj=self)
+
+		print(f'\nMenghitung RC tanggal {t0.strftime("%d-%m-%Y")} s/d {t1.strftime("%d-%m-%Y")}...')
+		result = self.get_result(**kwargs)
+
+		return result
+
+	def _rcd_setup(self, df:pd.DataFrame, **kwargs):
+		"""
+		"""
+
+		prepared = df.copy()
+
+		# Filter only rows with not unused-marked
+		prepared = prepared.loc[prepared['Marked Unused']=='']
+
+		# Filter only rows without repetition-marked
+		if self.check_repetition:
+			prepared = prepared.loc[prepared['Rep. Flag']=='']
+
+		return prepared
+
+	def _set_attr(self, **kwargs):
+		"""
+		"""
+
+		for key, val in kwargs.items():
+			setattr(self, key, val)
+
+	def _set_range(self, start:datetime.datetime, stop:datetime.datetime):
+		"""
+		Set start and stop date of query data.
+		"""
+
+		dt0 = start.replace(hour=0, minute=0, second=0, microsecond=0)
+		dt1 = stop.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+		self._t0 = dt0
+		self._t1 = dt1
+
+		return dt0, dt1
+
+	def calculate(self, start:datetime.datetime=None, stop:datetime.datetime=None, force:bool=False, fast:bool=True, **kwargs):
+		"""
+		Extension of _calculate function.
+		"""
+
+		self.result, t = self._calculate(start=start, stop=stop, force=force, fast=fast, **kwargs)
+		self._process_date = datetime.datetime.now()
+		self._process_duration = round(t, 3)
+		print(f'Perhitungan selesai. (durasi={t:.2f}s, error=0)')
+
+	def generate_reference(self, soe:pd.DataFrame, rcd:pd.DataFrame):
+		"""
+		"""
+
+		navs = []
+		errors = 0
+
+		try:
+			for idx_start, idx_stop in rcd['Navigation']:
+				try:
+					hyperlink = f'=HYPERLINK("#HIS_MESSAGES!A{soe.index.get_loc(idx_start)+2}:T{soe.index.get_loc(idx_stop)+2}","CARI >>")'
+				except Exception:
+					errors += 1
+					hyperlink = f'=HYPERLINK("#ERROR!{idx_start}:{idx_stop}","ERROR!!")'
+
+				navs.append(hyperlink)
+		except Exception:
+			errors += 1
+
+		if errors>0: print(f'Terjadi {errors} error saat generate hyperlink.')
+
+		return np.array(navs)
+
+	def get_result(self, **kwargs):
 		"""
 		Get aggregate data as per Station, Bay, and Operator, then return list of Excel worksheet name and Dataframe wrapped into dictionaries.
 		* INPUT
@@ -835,16 +1410,7 @@ class _RCDBaseCalculation:
 				z = default
 			return z
 
-		if isinstance(self.rcd_all, pd.DataFrame):
-			# Can be filtered with date
-			if isinstance(start, datetime) and isinstance(stop, datetime):
-				t0, t1 = self._set_range(start=start, stop=stop)
-			else:
-				t0, t1 = self._set_range(start=self.rcd_all['Order Time'].min(), stop=self.rcd_all['Order Time'].max())
-		else:
-			raise AttributeError('Invalid data input.', name='rcd_all', obj=self)
-
-		df = self.rcd_all.loc[(self.rcd_all['Order Time']>=t0) & (self.rcd_all['Order Time']<=t1)]
+		df = self.rcd_all.loc[(self.rcd_all['Order Time']>=self.t0) & (self.rcd_all['Order Time']<=self.t1)]
 		df_pre = self._rcd_setup(df)
 
 		self.pre_process = df
@@ -903,81 +1469,6 @@ class _RCDBaseCalculation:
 				}
 			}
 		}
-
-	def _rcd_setup(self, df:pd.DataFrame, **kwargs):
-		"""
-		"""
-
-		prepared = df.copy()
-
-		# Filter only rows with not unused-marked
-		prepared = prepared.loc[prepared['Marked Unused']=='']
-
-		# Filter only rows without repetition-marked
-		if self.check_repetition:
-			prepared = prepared.loc[prepared['Rep. Flag']=='']
-
-		return prepared
-
-	def _set_attr(self, **kwargs):
-		"""
-		"""
-
-		for key, val in kwargs.items():
-			setattr(self, key, val)
-
-	def _set_range(self, start:datetime, stop:datetime):
-		"""
-		Set start and stop date of query data.
-		"""
-
-		dt0 = start.replace(hour=0, minute=0, second=0, microsecond=0)
-		dt1 = stop.replace(hour=23, minute=59, second=59, microsecond=999999)
-
-		self._t0 = dt0
-		self._t1 = dt1
-
-		return dt0, dt1
-
-	def calculate(self, start:datetime=None, stop:datetime=None):
-		"""
-		Extension of _calculate function.
-		"""
-
-		process_date = datetime.now()
-		process_begin = time.time()
-		self.result = self._calculate(start=start, stop=stop)
-		process_stop = time.time()
-		process_duration = round(process_stop - process_begin, 2)
-
-		# Set attributes
-		self._process_date = process_date
-		self._process_begin = process_begin
-		self._process_stop = process_stop
-		self._process_duration = process_duration
-
-	def generate_reference(self, soe:pd.DataFrame, rcd:pd.DataFrame):
-		"""
-		"""
-
-		navs = []
-		errors = 0
-
-		try:
-			for idx_start, idx_stop in rcd['Navigation']:
-				try:
-					hyperlink = f'=HYPERLINK("#HIS_MESSAGES!A{soe.index.get_loc(idx_start)+2}:T{soe.index.get_loc(idx_stop)+2}","CARI >>")'
-				except Exception:
-					errors += 1
-					hyperlink = f'=HYPERLINK("#ERROR!{idx_start}:{idx_stop}","ERROR!!")'
-
-				navs.append(hyperlink)
-		except Exception:
-			errors += 1
-
-		if errors>0: print(f'Terjadi {errors} error saat generate hyperlink.')
-
-		return np.array(navs)
 
 	def group(self, df:pd.DataFrame, columns:list):
 		"""
@@ -1227,11 +1718,12 @@ class _RCDBaseCalculation:
 			}
 			df_opr_result = pd.DataFrame(data=opr_result)
 
-			# Update new DataFrame
-			df_rc.update(pd.DataFrame(rc_update))
-			df_gi.update(pd.DataFrame(gi_update))
-			df_bay.update(pd.DataFrame(bay_update))
-			df_opr.update(pd.DataFrame(opr_update))
+			# Loop through columns to update Dataframe
+			# Using <df>.update(pd.Dataframe(<df_update>)) may cause unwanted warning because of incompatible dtype set
+			for rccol in rc_update: df_rc[rccol] = np.array(rc_update[rccol])
+			for gicol in gi_update: df_gi[gicol] = np.array(gi_update[gicol])
+			for baycol in bay_update: df_bay[baycol] = np.array(bay_update[baycol])
+			for oprcol in opr_update: df_opr[oprcol] = np.array(opr_update[oprcol])
 
 			# Update summary information
 			self.result['statistic']['total_repetition'] = f'=COUNTIF({rule_repetition.split(",")[0]}, "*")'
@@ -1295,20 +1787,12 @@ class _RCDBaseCalculation:
 		return self._mro
 
 	@property
-	def process_begin(self):
-		return self._process_begin
-
-	@property
 	def process_date(self):
 		return self._process_date
 
 	@property
 	def process_duration(self):
 		return self._process_duration
-
-	@property
-	def process_stop(self):
-		return self._process_stop
 
 	@property
 	def t0(self):
@@ -1329,28 +1813,6 @@ class SOEtoRCD(_Export, _SOEAnalyzer, _RCDBaseCalculation):
 
 	def __init__(self, data:pd.DataFrame=None, calculate_bi:bool=False, check_repetition:bool=True, **kwargs):
 		super().__init__(data, calculate_bi, check_repetition, **kwargs)
-
-	def calculate(self, start:datetime=None, stop:datetime=None, force:bool=False):
-		"""
-		Override calculate function.
-		"""
-
-		process_date = datetime.now()
-		process_begin = time.time()
-
-		if not hasattr(self, 'rcd_all') or force:
-			# Must be analyzed first and pass to rcd_all
-			self.rcd_all = self.analyze(start=start, stop=stop)
-
-		self.result = self._calculate(start=start, stop=stop)
-		process_stop = time.time()
-		process_duration = round(process_stop - process_begin, 2)
-
-		# Set attributes
-		self._process_date = process_date
-		self._process_begin = process_begin
-		self._process_stop = process_stop
-		self._process_duration = process_duration
 
 	def prepare_export(self, generate_formula:bool=False, **kwargs):
 		"""
@@ -1420,24 +1882,33 @@ Rangkuman RC {kwargs.get('element')} tanggal {kwargs.get('date_start')} s/d {kwa
 """
 
 def test_analyze_file(**params):
-	print(' TEST ANALYZE RCD '.center(80, '#'))
 	rc = RCDFromFile('sample/sample_rcd*.xlsx')
-	rc.calculate()
+	print()
+	print(' TEST ANALYZE RCD CONCURRENTLY '.center(CONSOLE_WIDTH, '#'))
+	# t0 = time.time()
+	rc.calculate(force=True, fast=True)
+	# print(f'Durasi = {time.time()-t0:.2f}s')
+	print(' TEST ANALYZE RCD '.center(CONSOLE_WIDTH, '#'))
+	# t1 = time.time()
+	rc.calculate(force=True, fast=False)
+	# print(f'Durasi = {time.time()-t1:.2f}s')
 	if 'y' in input('Export hasil test? [y/n]  '):
 		rc.to_excel(filename='test_analyze_rcd_spectrum')
 	return rc
 
 def test_analyze_file2(**params):
-	print(' TEST ANALYZE RCD '.center(80, '#'))
 	rc = RCDFromFile2('sample/survalent/sample_soe*.XLSX')
+	print()
+	print(' TEST ANALYZE RCD '.center(CONSOLE_WIDTH, '#'))
 	rc.calculate()
 	if 'y' in input('Export hasil test? [y/n]  '):
 		rc.to_excel(filename='test_analyze_rcd_survalent')
 	return rc
 
 def test_collective_file(**params):
-	print(' TEST COLLECTIVE RCD '.center(80, '#'))
 	rc = RCDCollective('sample/sample_rcd*.xlsx')
+	print()
+	print(' TEST COLLECTIVE RCD '.center(CONSOLE_WIDTH, '#'))
 	rc.calculate()
 	if 'y' in input('Export hasil test? [y/n]  '):
 		rc.to_excel(filename='test_collective_rcd')

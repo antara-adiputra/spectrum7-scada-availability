@@ -1,14 +1,16 @@
-import re
+import os, re
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from glob import glob
 from typing import Union
 
 import pandas as pd
 from global_parameters import RCD_COLUMNS, RTU_COLUMNS, SOE_COLUMNS, SOE_COLUMNS_DTYPE
-from lib import calc_time, immutable_dict, join_datetime, load_cpoint, load_workbook, read_xml, test_datetime_format
+from lib import CONSOLE_WIDTH, calc_time, immutable_dict, join_datetime, load_cpoint, load_workbook, read_xml, test_datetime_format, truncate
 
 
 class _FileReader:
 	__slot__ = ['switching_element']
+	_errors = 0
 	column_list = []
 	keep_duplicate = 'last'
 	sheet_name = 'Sheet1'
@@ -16,8 +18,8 @@ class _FileReader:
 
 	def __init__(self, filepaths:Union[str, list], **kwargs):
 		self._date_range = None
-		self.cached_file = {}
-		self.filepaths = []
+		self.cached_file = dict()
+		self.filepaths = list()
 
 		if isinstance(filepaths, str):
 			for f in filepaths.split(','):
@@ -41,48 +43,81 @@ class _FileReader:
 				date_stop=kwargs['date_stop'].replace(hour=23, minute=59, second=59, microsecond=999999)
 			)
 
-		df = self.load()
-		self.post_load(df)
+		if len(self.filepaths)>0:
+			self.load()
 		# Need this for cooperative multiple-inheritance
 		super().__init__(**kwargs)
 
 	@calc_time
-	def load(self, **kwargs):
+	def _load(self, **kwargs):
 		"""
 		Load every file in filepaths.
 		"""
 
-		data = []
 		errors = 0
+		count = len(self.filepaths)
 
-		if self.filepaths:
-			# If paths defined
-			for file in self.filepaths:
-				df = self.open_file(filepath=file, sheet_name=self.sheet_name, table_header=self.column_list, base_column=self.time_series_column)
-				if isinstance(df, pd.DataFrame):
-					df = self.post_open_file(df)
-					data.append(df)
-				else:
-					errors += 1
-					# print('\r\nGagal!')
-					# raise ValueError('Gagal mengimport file.')
-
-			if errors:
-				choice = input(f'Terdapat {errors} error, tetap lanjutkan? [y/n]\t')
-				if 'y' in choice:
-					# Continue
-					pass
-				else:
-					raise RuntimeError(f'Proses dihentikan oleh user. (Error={errors})')
-
-			# Combine each Dataframe in data list into one and eleminate duplicated rows
-			df_merged = pd.concat(data).drop_duplicates(keep=self.keep_duplicate)
-
-			self.sources = ',\n'.join(self.filepaths)
-			print(f'Selesai. (Error={errors})', end='', flush=True)
-			return df_merged
-		else:
+		if count==0:
 			raise SyntaxError('Input file belum ditentukan!')
+		if count==1:
+			df = self.open_file(filepath=self.filepaths[0], sheet_name=self.sheet_name, table_header=self.column_list, base_column=self.time_series_column)
+	
+			if isinstance(df, pd.DataFrame):
+				df = self.post_open_file(df)
+				df_result = df.drop_duplicates(keep=self.keep_duplicate)
+			else:
+				df_result = None
+				errors += 1
+		else:
+			# Optimize file loading with ProcessPoolExecutor
+			valid_df = list()
+			n = 8
+			chunksize = len(self.filepaths)//n + 1
+
+			with ProcessPoolExecutor(n) as ppe:
+				futures = list()
+
+				for i in range(0, len(self.filepaths), chunksize):
+					fpaths = self.filepaths[i:(i+chunksize)]
+					future = ppe.submit(self.open_files_concurrently, fpaths)
+					futures.append(future)
+
+				for future in as_completed(futures):
+					result_list, fpaths = future.result()
+
+					for result in result_list:
+						if isinstance(result, pd.DataFrame):
+							df = self.post_open_file(result)
+							valid_df.append(df)
+						else:
+							errors += 1
+
+			if len(valid_df)==0: raise RuntimeError(f'Semua data tidak valid. (Error={errors})')
+			# Combine each Dataframe in data list into one and eleminate duplicated rows
+			df_result = pd.concat(valid_df).drop_duplicates(keep=self.keep_duplicate)
+
+		self._errors = errors
+		self.sources = ',\n'.join(self.filepaths)
+
+		return df_result
+
+	def load(self, **kwargs):
+		"""
+		"""
+
+		print(f'\nTotal {len(self.filepaths)} file...')
+		df, t = self._load()
+		print(f'(durasi={t:.2f}s, error={self.errors})')
+
+		if self.errors:
+			choice = input(f'Terdapat {self.errors} error, tetap lanjutkan? [y/n]  ')
+			if 'y' in choice:
+				# Continue
+				pass
+			else:
+				raise RuntimeError(f'Proses dihentikan oleh user. (Error={self.errors})')
+
+		self.post_load(df)
 
 	def post_load(self, df:pd.DataFrame):
 		"""
@@ -91,18 +126,32 @@ class _FileReader:
 
 		if self._date_range==None: self.set_date_range(date_start=df[self.time_series_column].min(), date_stop=df[self.time_series_column].max())
 
+	def open_files_concurrently(self, filepaths:list):
+		with ThreadPoolExecutor(len(filepaths)) as tpe:
+			futures = [tpe.submit(self.open_file, filepath, sheet_name=self.sheet_name, table_header=self.column_list, base_column=self.time_series_column) for filepath in filepaths]
+			data_list = [future.result() for future in futures]
+
+			return data_list, filepaths
+
 	def open_file(self, filepath:str, sheet_name:str=None, table_header:Union[list, tuple]=None, base_column:str=None, **kwargs):
 		"""
 		Loads single excel file into pandas Dataframe.
 		"""
 
-		wb = {}
+		wb = dict()
 		df = None
 		first_sheet = False
+		txt_stat_len = 5
+		txt_info_len = CONSOLE_WIDTH - txt_stat_len
+		txt_prefix = f'Membuka file'
 
 		if sheet_name is None and table_header is None: first_sheet = True		# Sheet name & header not defined, load first sheet
 
-		print(f'Membuka file "{filepath}"...', end='', flush=True)
+		if len(txt_prefix)+len(filepath)+4>txt_info_len:
+			txt_path = f'"{truncate(text=filepath, max_length=txt_info_len-len(txt_prefix)-4, on="left")}"'
+		else:
+			txt_path = f'"{filepath}"'.ljust(txt_info_len-len(txt_prefix)-2)
+
 		try:
 			wb = load_workbook(filepath)
 
@@ -114,22 +163,22 @@ class _FileReader:
 				ws = wb[sheet_name]
 				if table_header is None:
 					df = ws
-					print('\tOK!')
+					txtstatus = 'OK!'
 				else:
 					if set(table_header).issubset(ws.columns):
 						df = ws
-						print('\tOK!')
+						txtstatus = 'OK!'
 					else:
-						print(f'\tNOK!\r\nHeader tabel tidak sesuai.')
+						txtstatus = f'NOK!\r\nHeader tabel tidak sesuai.'
 			else:
 				for ws_name, sheet in wb.items():
 					# Loop through workbook sheets & match header
 					if set(table_header).issubset(sheet.columns):
 						df = sheet
-						print('\tOK!')
+						print('OK!')
 						break
 
-				if df is None: print(f'\tNOK!\r\nData tidak ditemukan!')
+				if df is None: txtstatus = f'NOK!\r\nData tidak ditemukan!'
 
 			if isinstance(df, pd.DataFrame) and base_column is not None:
 				# Neglect null value on base column
@@ -140,11 +189,12 @@ class _FileReader:
 				# Attempting to open file with xml format
 				df = read_xml(filepath, **kwargs)
 			except (ValueError, ImportError):
-				print('\tNOK!\r\nGagal membuka file.')
+				txtstatus = 'NOK!\r\nGagal membuka file.'
 		except FileNotFoundError:
-			print('\tNOK!\r\nFile tidak ditemukan.')
+			txtstatus = 'NOK!\r\nFile tidak ditemukan.'
 
 		self.cached_file[filepath] = df
+		print(f'{txt_prefix} {txt_path} {txtstatus}')
 
 		return df
 
@@ -178,6 +228,10 @@ class _FileReader:
 	@property
 	def date_stop(self):
 		return self._date_stop
+
+	@property
+	def errors(self):
+		return self._errors
 
 
 class SpectrumFileReader(_FileReader):
@@ -411,7 +465,7 @@ class SurvalentFileReader(_FileReader):
 
 		columns = SOE_COLUMNS
 		# Copy and reorder Dataframe
-		df0 = df.copy().sort_values('Time').fillna('')
+		df0 = df.infer_objects().fillna('').sort_values('Time')
 		df0[['Point B3', 'Element']] = df0['Point'].str.split(',', expand=True)
 
 		# Filter only required element
@@ -525,7 +579,7 @@ class SurvalentFileReader(_FileReader):
 
 
 def test_random_file(**params):
-	print(' TEST OPEN RANDOM FILE '.center(80, '#'))
+	print(' TEST OPEN RANDOM FILE '.center(CONSOLE_WIDTH, '#'))
 	print('## Dummy load ##')
 	f = SpectrumFileReader('sample/sample_rcd_2024_01.xlsx')
 	file = input('\r\nMasukkan lokasi file :  ')
@@ -536,32 +590,36 @@ def test_random_file(**params):
 	return f1
 
 def test_file_not_exist(**params):
-	print(' TEST FILE NOT FOUND '.center(80, '#'))
+	print(' TEST FILE NOT FOUND '.center(CONSOLE_WIDTH, '#'))
 	f = SpectrumFileReader('sample/file_not_existed.xlsx')
 	return f
 
 def test_wrong_file(**params):
-	print(' TEST WRONG FILE '.center(80, '#'))
+	print(' TEST WRONG FILE '.center(CONSOLE_WIDTH, '#'))
 	f = SpectrumFileReader('sample/wrong_file_1.xlsx')
 	return f
 
 def test_file_spectrum(**params):
-	print(' TEST FILE SOE SPECTRUM '.center(80, '#'))
+	print(' TEST FILE SOE SPECTRUM '.center(CONSOLE_WIDTH, '#'))
 	f = SpectrumFileReader('sample/sample_rcd*.xlsx')
+	print('\r\n' + ' TEST FILE SOE SPECTRUM CONCURRENTLY '.center(CONSOLE_WIDTH, '#'))
+	# f.load_()
 	return f
 
 def test_file_survalent(**params):
-	print(' TEST FILE SOE SURVALENT '.center(80, '#'))
+	print(' TEST FILE SOE SURVALENT '.center(CONSOLE_WIDTH, '#'))
 	f = SurvalentFileReader('sample/survalent/sample_soe*.XLSX')
+	print('\r\n' + ' TEST FILE SOE SURVALENT CONCURRENTLY '.center(CONSOLE_WIDTH, '#'))
+	# f.load_()
 	return f
 
 def test_file_rcd_collective(**params):
-	print(' TEST FILE RCD COLLECTIVE '.center(80, '#'))
+	print(' TEST FILE RCD COLLECTIVE '.center(CONSOLE_WIDTH, '#'))
 	f = RCFileReader('sample/sample_rcd*.xlsx')
 	return f
 
 def test_file_rtu_collective(**params):
-	print(' TEST FILE RTU COLLECTIVE '.center(80, '#'))
+	print(' TEST FILE RTU COLLECTIVE '.center(CONSOLE_WIDTH, '#'))
 	f = AvFileReader('sample/sample_rtu*.xlsx')
 	return f
 

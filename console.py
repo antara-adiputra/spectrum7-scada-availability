@@ -69,11 +69,14 @@ class ConsoleApp:
 		if filepaths:
 			if pu.confirm_answer('y', f'\nAnda menginput {len(filepaths)} file:\n{print_list(filepaths)}\nLanjutkan?'):
 				pu.clear()
-				calc = instance(filepaths)
-				calc.calculate()
+				try:
+					calc = instance(filepaths)
+					calc.calculate()
 
-				if pu.confirm_answer('y', f'\nExport hasil?'):
-					calc.to_excel()
+					if pu.confirm_answer('y', f'\nExport hasil?'):
+						calc.to_excel()
+				except Exception as e:
+					print(f'Oops! Terjadi kesalahan. {"\n".join(e.args)}\n')
 
 		pu.enter_to_continue('\n\n>> Klik [Enter] untuk lanjut')
 		pu.clear()
@@ -111,55 +114,6 @@ def print_list(arr:list):
 	for i, s in enumerate(arr):
 		text += f'  {i+1}. {s}\n'
 	return text
-
-def input_file_his():
-	pu = PromptUtils(Screen())
-	file = pu.input('\nGunakan tanda koma (,) untuk menginput lebih dari satu file, atau tanda bintang (*) untuk file dengan nama serupa.\n\n>> Lokasi file : ')
-	file_list = []
-	for f in file.input_string.split(','):
-		if f.strip(): file_list += glob(f.strip())
-	if len(file_list)>0:
-		if pu.confirm_answer('y', f'\n\nAnda menginput {len(file_list)} file:\n{print_list(file_list)}\nApakah sudah benar?'):
-			pu.clear()
-			rc = RCDFromFile(file_list)
-			rc.calculate()
-			rc.print_result()
-			rc.to_excel()
-			pu.enter_to_continue('>> Klik [Enter] untuk lanjut')
-			pu.clear()
-		else:
-			input_file_his()
-	else:
-		input_file_his() if file.input_string else pu.clear()
-
-def input_file_rcd():
-	pu = PromptUtils(Screen())
-	pu.clear()
-
-def main():
-	os.system('title Kalkulasi RC')
-	os.system('mode 80,30')
-	desc = 'Aplikasi ini bertujuan untuk memudahkan dalam menghitung maupun menganalisa event RC SCADA berdasarkan data "Historical Message" pada Master Station UP2B Sistem Makassar.'
-	menu = ConsoleMenu(title='Menu Utama', subtitle='KALKULASI RC SCADA'.center(70, ' '), prologue_text=desc, exit_option_text='Keluar')
-	item_1 = FunctionItem('Analisa data Historical Messages', input_file_his)
-	item_2 = FunctionItem('Rangkum data RC', input_file_rcd)
-
-	# Create a second submenu, but this time use a standard ConsoleMenu instance
-	submenu1 = ConsoleMenu('Another Submenu Title', 'Submenu subtitle.')
-	item1_1 = FunctionItem('Fun item', Screen().input, ['Enter an input: '])
-	item1_2 = MenuItem('Another Item')
-	submenu1.append_item(item1_1)
-	submenu1.append_item(item1_2)
-	submenu1_item = SubmenuItem('Rangkuman RC', submenu=submenu1)
-	submenu1_item.set_menu(menu)
-
-	# Add all the items to the root menu
-	menu.append_item(item_1)
-	# menu.append_item(item_2)
-
-	# Show the menu
-	menu.start()
-	menu.join()
 
 
 if __name__ == '__main__':

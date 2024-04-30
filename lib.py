@@ -10,7 +10,9 @@ import xlsxwriter
 from xlsxwriter.utility import xl_col_to_name
 from lxml import etree as et
 
-
+_WIDTH = os.get_terminal_size()[0]
+MAX_WIDTH = 160
+CONSOLE_WIDTH = _WIDTH - 2 if _WIDTH<MAX_WIDTH else MAX_WIDTH
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 
 # decorator to calculate duration
@@ -25,9 +27,9 @@ def calc_time(func):
 		returned_value = func(*args, **kwargs)
 		# storing time after function execution
 		tick = time.time()
-		print(f' ({round(tick-tock, 2)}s)')
+		# print(f' ({round(tick-tock, 2)}s)')
 
-		return returned_value
+		return returned_value, tick-tock
  
 	return inner1
 
@@ -93,17 +95,17 @@ def load_cpoint(path:str):
 	"""
 
 	# Load point description
-	print('\nMemuat data "Point Name Description"...', end='', flush=True)
+	txt_prefix = '\nMemuat data "Point Name Description"...'.ljust(CONSOLE_WIDTH-5)
 	try:
 		# Open first sheet
 		df_cpoint = pd.read_excel(path, sheet_name=0).fillna('')
 		# Remove duplicates to prevent duplication in merge process
 		cpoint = validate_cpoint(df_cpoint)
-		print('\tOK!')
+		print(f'{txt_prefix} OK!')
 	except FileNotFoundError:
-		raise FileNotFoundError(f'\tNOK!\nFile "{path}" tidak ditemukan.')
+		raise FileNotFoundError(f'{txt_prefix} NOK!\nFile "{path}" tidak ditemukan.')
 	except Exception:
-		raise ValueError(f'\tNOK!\nGagal membuka file "{path}".')
+		raise ValueError(f'{txt_prefix} NOK!\nGagal membuka file "{path}".')
 
 	return cpoint
 
@@ -125,7 +127,7 @@ def load_workbook(filepath:str):
 
 def progress_bar(value:float, width:int=0, style:str='full-block'):
 	symbol = {'full-block': '█', 'left-half-block': '▌', 'right-half-block': '▐'}
-	if width==0: width = os.get_terminal_size()[0]-1
+	if width==0: width = CONSOLE_WIDTH
 	percentage = int(value*100)
 	char_block = symbol.get(style, style)
 	if value<1:
@@ -194,6 +196,28 @@ def timedelta_split(td:timedelta):
 
 def test():
 	pass
+
+def truncate(text:str, max_length:int, on:str='left', debug:bool=False):
+	"""
+	"""
+
+	length = len(text)
+
+	if length>max_length:
+		n = length - max_length + 3
+		if debug: print(f'length={length}, max-length={max_length}, n={n}, on={on}')
+		if on=='right':
+			res = f'{text[:length-n]}...'
+		elif on=='center':
+			mid = max_length // 2
+			mod = max_length % 2
+			res = f'{text[:mid]}...{text[max_length+n-mid-mod:]}'
+		else:
+			res = f'...{text[n:]}'
+	else:
+		res = text
+
+	return res
 
 def validate_cpoint(df:pd.DataFrame, verbose:bool=False):
 	"""
@@ -356,5 +380,8 @@ class BaseExportMixin:
 
 
 if __name__ == '__main__':
-	test()
-	# print(glob('RC_Output_CB_20230301-20230331.xlsx', root_dir='E:/project/excel/output'))
+	for var in (75, 80, 100):
+		print('\r\n' + '#'*var)
+		print(truncate('/media/shared-ntfs/1-scada-makassar/AVAILABILITY/2023/RCD/RCD_Output_2023_01-07.xlsx', var, 'left', True))
+		print(truncate('/media/shared-ntfs/1-scada-makassar/AVAILABILITY/2023/RCD/RCD_Output_2023_01-07.xlsx', var, 'right', True))
+		print(truncate('/media/shared-ntfs/1-scada-makassar/AVAILABILITY/2023/RCD/RCD_Output_2023_01-07.xlsx', var, 'center', True))
