@@ -469,7 +469,7 @@ class SurvalentFileReader(_FileReader):
 		df0[['Point B3', 'Element']] = df0['Point'].str.split(',', expand=True)
 
 		# Filter only required element
-		df0 = df0[(df0['Element'].isin(self.elements + self.switching_element)) & ~((df0['Message'].str.contains('Put in scan')) | (df0['Message'].str.contains('ALL ALARMS BLOCKED')))].reset_index(drop=True)
+		df0 = df0[(df0['Element'].isin(self.elements + self.switching_element)) & ~((df0['Message'].str.contains('Put in scan')) | (df0['Message'].str.contains('ALL ALARMS BLOCKED')) | (df0['Message'].str.contains('Blocked')))].reset_index(drop=True)
 		df0['A'] = ''
 		df0[['Time stamp', 'Milliseconds']] = df0['Time'].str.split('.', expand=True)
 		df0[['System time stamp', 'System milliseconds']] = df0[['Time stamp', 'Milliseconds']]
