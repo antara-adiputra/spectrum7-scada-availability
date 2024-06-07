@@ -1,9 +1,9 @@
-import os, platform, time, warnings
-from datetime import datetime, timedelta
+import os, datetime, platform, time, warnings
 from difflib import SequenceMatcher, get_close_matches
 from glob import glob
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any, Union
 
 import pandas as pd
 import xlsxwriter
@@ -30,21 +30,19 @@ def calc_time(func):
 		# print(f' ({round(tick-tock, 2)}s)')
 
 		return returned_value, tick-tock
- 
 	return inner1
 
-def get_datetime(series:pd.Series):
-	"""Return set of RTU Timestamp and System Timestamp"""
-
+def get_datetime(series: pd.Series) -> datetime.datetime:
+	"""Return set of RTU timestamp and system timestamp."""
 	return join_datetime(series['Time stamp'], series['Milliseconds']), join_datetime(series['System time stamp'], series['System milliseconds'])
 
-def get_execution_duration(s0:pd.Series, s1:pd.Series):
-	"""Calculate delta RTU time stamp"""
-
+def get_execution_duration(s0: pd.Series, s1: pd.Series) -> float:
+	"""Calculate timedelta between RTU & system timestamp between 2 events."""
 	delta_time = join_datetime(*s1.loc[['Time stamp', 'Milliseconds']].to_list()) - join_datetime(*s0.loc[['Time stamp', 'Milliseconds']].to_list())
 	return round(delta_time.total_seconds(), 3)
 
-def get_ifs_name(list1:list, list2:list):
+def get_ifs_name(list1: list, list2: list) -> dict:
+	"""Get IFS name pair based on name similarity in list1 & list2."""
 	cross_connect_dict = {}
 	if len(list1)>0 and len(list2)>0:
 		avg1 = sum([len(s1) for s1 in list1])/len(list1)
@@ -60,7 +58,8 @@ def get_ifs_name(list1:list, list2:list):
 				cross_connect_dict.update({key: value})
 	return cross_connect_dict
 
-def get_table(ws_element:et._Element, namespace:dict):
+def get_table(ws_element: et._Element, namespace: dict):
+	"""Extract table data and columns name from xml file."""
 	data = []
 	rows = ws_element.findall('.//Row', namespaces=namespace)
 	for irow, row in enumerate(rows):
@@ -73,27 +72,25 @@ def get_table(ws_element:et._Element, namespace:dict):
 			if len(columns)==len(cell_data): data.append(tuple(cell_data))
 	return columns, data
 
-def get_termination_duration(s0:pd.Series, s1:pd.Series):
-	"""Calculate delta Master Station time stamp"""
-
+def get_termination_duration(s0: pd.Series, s1: pd.Series):
+	"""Calculate timedelta of system timestamp between 2 events."""
 	delta_time = join_datetime(*s1.loc[['System time stamp', 'System milliseconds']].to_list()) - join_datetime(*s0.loc[['System time stamp', 'System milliseconds']].to_list())
 	return round(delta_time.total_seconds(), 3)
 
-def immutable_dict(input:dict):
+def immutable_dict(input: dict) -> MappingProxyType:
+	"""Create non-editable dict."""
 	for key, item in input.items():
 		if type(item)==dict:
 			input[key] = immutable_dict(item)
 	return MappingProxyType(input)
 
-def join_datetime(dt:pd.Series, ms:pd.Series):
-	"""Combine His. Messages style of separated datetime timestamp and milliseconds"""
-
+def join_datetime(dt: pd.Series, ms: pd.Series) -> datetime.datetime:
+	"""Combine datetime timestamp and milliseconds."""
 	return pd.to_datetime(dt) + pd.to_timedelta(ms, unit='ms')
 
-def load_cpoint(path:str):
+def load_cpoint(path: str):
 	"""
 	"""
-
 	# Load point description
 	txt_prefix = '\nMemuat data "Point Name Description"...'.ljust(CONSOLE_WIDTH-5)
 	try:
@@ -106,14 +103,17 @@ def load_cpoint(path:str):
 		raise FileNotFoundError(f'{txt_prefix} NOK!\nFile "{path}" tidak ditemukan.')
 	except Exception:
 		raise ValueError(f'{txt_prefix} NOK!\nGagal membuka file "{path}".')
-
 	return cpoint
 
-def load_workbook(filepath:str):
-	"""
-	Load whole excel file as dict of worksheets.
-	"""
+def load_workbook(filepath: str) -> dict[str, pd.DataFrame]:
+	"""Load whole excel file as dict of worksheets.
 
+	Args:
+		filepath : path of file
+
+	Result:
+		Dict of dataframe with sheetname as keys
+	"""
 	wb = {}
 
 	try:
@@ -122,10 +122,10 @@ def load_workbook(filepath:str):
 		raise FileNotFoundError
 	except Exception:
 		raise ImportError
-
 	return wb
 
 def progress_bar(value:float, width:int=0, style:str='full-block'):
+	"""Print progress bar on console."""
 	symbol = {'full-block': '█', 'left-half-block': '▌', 'right-half-block': '▐'}
 	if width==0: width = CONSOLE_WIDTH
 	percentage = int(value*100)
@@ -161,7 +161,7 @@ def read_xml(filepath:str, **kwargs):
 	else:
 		raise ValueError
 
-def similarity_ratio(str1:str, str2:str):
+def similarity_ratio(str1: str, str2: str):
 	return SequenceMatcher(None, str1, str2).ratio()
 
 def test_datetime_format(x):
@@ -182,7 +182,7 @@ def test_datetime_format(x):
 			break
 	return x
 
-def timedelta_split(td:timedelta):
+def timedelta_split(td: datetime.timedelta):
 	"""
 	"""
 
@@ -219,10 +219,9 @@ def truncate(text:str, max_length:int, on:str='left', debug:bool=False):
 
 	return res
 
-def validate_cpoint(df:pd.DataFrame, verbose:bool=False):
+def validate_cpoint(df: pd.DataFrame, verbose: bool = False):
+	"""Compare IFS's B3 name with SOE's B1 name and get the closest similarity into dict.
 	"""
-	"""
-
 	columns_base = ['B1', 'B2', 'B3']
 	columns_text = ['B1 text', 'B2 text', 'B3 text']
 
@@ -245,16 +244,29 @@ def validate_cpoint(df:pd.DataFrame, verbose:bool=False):
 
 
 class BaseExportMixin:
-	_sheet_parameter = immutable_dict({})
+	"""Base class mixin for exporting dataframe into excel file."""
+	_sheet_parameter: MappingProxyType[str, dict[str, Any]] = immutable_dict({})
+	t0: datetime.datetime
+	t1: datetime.datetime
+	name: str
+	process_date: datetime.datetime
+	process_duration: float
 	base_dir = Path(__file__).parent.resolve()
 	output_dir = base_dir / 'output'
-	output_extension = 'xlsx'
-	output_prefix = ''
+	output_extension: str = 'xlsx'
+	output_prefix: str = ''
 
-	def _worksheet_writer(self, workbook:xlsxwriter.Workbook, sheet_name:str, sheet_data:pd.DataFrame, *extra_data):
-		"""
-		"""
+	def _worksheet_writer(self, workbook: xlsxwriter.Workbook, sheet_name: str, sheet_data: pd.DataFrame, *extra_data):
+		"""Dataframe to excel sheet convertion.
 
+		Args:
+			workbook : current working workbook
+			sheet_name : sheet name
+			sheet_data : sheet content
+
+		Accepted extra_data:
+			Extra dataframe
+		"""
 		ws = workbook.add_worksheet(sheet_name)
 		# Worksheet formatting
 		format_header = {'num_format': '@', 'border': 1, 'bold': True, 'align': 'center', 'valign': 'top', 'font_color': 'black', 'bg_color': '#ededed'}
@@ -297,9 +309,7 @@ class BaseExportMixin:
 			if col1 in self._sheet_parameter['width']: ws.set_column(x1, x1, self._sheet_parameter['width'].get(col1))
 
 	def get_xls_properties(self):
-		"""
-		"""
-
+		"""Define file properties."""
 		return {
 			'title': f'Hasil kalkulasi {self.name} tanggal {self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")}',
 			'subject': f'{self.name}',
@@ -310,20 +320,16 @@ class BaseExportMixin:
 			'comments': f'File digenerate otomatis oleh program {self.name}'
 		}
 
-	def get_xls_filename(self, **kwargs):
-		"""
-		"""
-
+	def get_xls_filename(self, **kwargs) -> str:
+		"""Generate filename."""
 		filename = kwargs.get('filename')
 		if filename:
 			return filename
 		else:
 			return f'{self.output_prefix}_Output_{self.t0.strftime("%Y%m%d")}-{self.t1.strftime("%Y%m%d")}'
 
-	def get_sheet_info_data(self, **kwargs):
-		"""
-		"""
-
+	def get_sheet_info_data(self, **kwargs) -> list[tuple[str, str]]:
+		"""Generate sheet "Info" content."""
 		return [
 			('Source File', getattr(self, 'sources', '')),
 			('Output File', f'{kwargs.get("filepath", "")}'),
@@ -334,15 +340,15 @@ class BaseExportMixin:
 			('User', os.getlogin())
 		]
 
-	def prepare_export(self, **kwargs):
+	def prepare_export(self, **kwargs) -> dict[str, Any]:
+		"""Prepare result for excel export.
+		Override this function to handle process before export.
+		"""
 		return super().prepare_export(**kwargs)
 
 	def to_excel(self, **kwargs):
-		"""
-		"""
-
+		"""Export data into excel file."""
 		sheets_data = self.prepare_export(generate_formula=True, **kwargs)
-
 		# Check target directory of output file
 		if not os.path.isdir(self.output_dir): os.mkdir(self.output_dir)
 
@@ -353,7 +359,6 @@ class BaseExportMixin:
 
 		output_file_properties = self.get_xls_properties()
 		output_filepath = self.output_dir / f'{filename}.{self.output_extension}'
-
 		# Create excel file
 		with xlsxwriter.Workbook(output_filepath) as wb:
 			# Set excel workbook file properties

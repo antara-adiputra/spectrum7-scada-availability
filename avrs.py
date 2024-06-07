@@ -1,40 +1,48 @@
 import datetime, gc, re, time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from typing import Union
+from types import MappingProxyType
+from typing import Any, Union
 
 import numpy as np
 import pandas as pd
 from xlsxwriter.utility import xl_col_to_name
-from filereader import AvFileReader, SpectrumFileReader
+from filereader import AVRSFileReader, SpectrumFileReader
 from global_parameters import RTU_BOOK_PARAM
 from lib import CONSOLE_WIDTH, BaseExportMixin, calc_time, join_datetime, immutable_dict, load_cpoint, progress_bar, timedelta_split
 from ofdb import SpectrumOfdbClient
 
 
 class _Export(BaseExportMixin):
-	_sheet_parameter = immutable_dict(RTU_BOOK_PARAM)
-	output_prefix = 'AVRS'
+	_sheet_parameter: MappingProxyType[str, dict[str, Any]] = immutable_dict(RTU_BOOK_PARAM)
+	output_prefix: str = 'AVRS'
+	result: dict[str, dict[str, Any]]
 	
 	def get_sheet_info_data(self, **kwargs):
-		"""
-		"""
-
-		info_data = super().get_sheet_info_data(**kwargs)
+		"""Define extra information into sheet "Info"."""
 		extra_info = [
-			*info_data,
+			*super().get_sheet_info_data(**kwargs),
 			('', ''),
 			('SUMMARY', ''),
 			('RTU with Downtime', self.result['overall']['total_rtu_down']),
-			('Availability', self.result['overall']['availability'])
+			('RTU Availability', self.result['overall']['rtu_availability']),
+			('Link Availability', self.result['overall']['link_availability'])
 		]
-
 		return extra_info
 
 
 class _IFSAnalyzer:
+	"""Base class for analyze data from SOE.
+
+	Args:
+		data : SOE data
+
+	Accepted kwargs:
+		**
+	"""
 	_executor = ThreadPoolExecutor(8)
 	maintenance_mark = '**maintenance**'
-	commfailure_mark = '**communication**'
+	linkfailure_mark = '**link**'
+	rtufailure_mark = '**rtu**'
 	otherfailure_mark = '**other**'
 	keep_duplicate = 'last'
 	# List of downtime categorization (<category>, <value on hour>), ordered by the most significant category
@@ -45,7 +53,7 @@ class _IFSAnalyzer:
 		('Minor', 3)
 	]
 
-	def __init__(self, data:pd.DataFrame=None, **kwargs):
+	def __init__(self, data: pd.DataFrame = None, **kwargs):
 		self._analyzed = False
 
 		if data is not None: self.soe_all = data
@@ -53,10 +61,15 @@ class _IFSAnalyzer:
 		self._soe_setup()
 		super().__init__(**kwargs)
 
-	def _get_category(self, downtime:datetime.timedelta):
-		"""
-		"""
+	def _get_category(self, downtime: datetime.timedelta):
+		"""Annotate downtime duration category from defined rules.
 
+		Args:
+			downtime : downtime duration
+
+		Result:
+			Annotation text
+		"""
 		result = None
 
 		for rule in self.category:
@@ -66,29 +79,29 @@ class _IFSAnalyzer:
 		
 		return result
 
-	def _set_range(self, start:datetime.datetime, stop:datetime.datetime):
-		"""
-		Set start and stop date of query data.
-		"""
+	def _set_range(self, start: datetime.datetime, stop: datetime.datetime) -> tuple[datetime.datetime, datetime.datetime]:
+		"""Set adjusted time for start and stop datetime of query data.
 
+		Args:
+			start : oldest date limit
+			stop : newest date limit
+
+		Result:
+			Pair of datetime limit
+		"""
 		dt0 = start.replace(hour=0, minute=0, second=0, microsecond=0)
 		dt1 = stop.replace(hour=23, minute=59, second=59, microsecond=999999)
 
 		self._t0 = dt0
 		self._t1 = dt1
-
 		return dt0, dt1
 
 	def _soe_setup(self):
-		"""
-		Preparing Dataframe joins from multiple file with sorting and filtering to get clean data.
-		"""
-
+		"""Apply sorting and filtering on "soe_all" to get cleaned data."""
 		if isinstance(self.soe_all, pd.DataFrame):
 			self._is_valid = True
 			df = self.soe_all.copy()
 			df = df.sort_values(['System time stamp', 'System milliseconds'], ascending=[True, True]).reset_index(drop=True)
-		
 			# Get min index and max index of df
 			self._lowest_index, self._highest_index = df.index.min(), df.index.max()
 			# Double check His. Messages only for IFS status changes
@@ -97,10 +110,16 @@ class _IFSAnalyzer:
 			self._is_valid = False
 			raise ValueError('Dataframe tidak valid')
 
-	def get_rtu_updown(self, df:pd.DataFrame, rtu:str):
-		"""
-		"""
+	def get_rtu_updown(self, df: pd.DataFrame, rtu: str) -> list[dict]:
+		"""Analyze all downtime occured on a RTU.
 
+		Args:
+			df : dataframe source
+			rtu : remote station name
+
+		Result:
+			List of dict-like downtime information
+		"""
 		i_sys_tstamp = df.columns.get_loc('System time stamp')
 		i_sys_msec = df.columns.get_loc('System milliseconds')
 		i_status = df.columns.get_loc('Status')
@@ -121,10 +140,13 @@ class _IFSAnalyzer:
 				'RTU': rtu,
 				'Long Name': description,
 				'Duration': 0,
-				'Marked Maintenance': '',
-				'Marked Comm. Failure': '',
-				'Marked Other Failure': '',
 				'Annotations': '',
+				'Acknowledged Down Time': '',
+				'Fix Duration': 0,
+				'Marked Maintenance': '',
+				'Marked Link Failure': '',
+				'Marked RTU Failure': '',
+				'Marked Other Failure': '',
 				'Navigation': (0, 0)
 			}
 
@@ -133,9 +155,12 @@ class _IFSAnalyzer:
 				if self.maintenance_mark in comment:
 					data['Marked Maintenance'] = '*'
 					notes.append('User menandai downtime akibat pemeliharaan**')
-				elif self.commfailure_mark in comment:
-					data['Marked Comm. Failure'] = '*'
+				elif self.linkfailure_mark in comment:
+					data['Marked Link Failure'] = '*'
 					notes.append('User menandai downtime akibat gangguan telekomunikasi**')
+				elif self.rtufailure_mark in comment:
+					data['Marked RTU Failure'] = '*'
+					notes.append('User menandai downtime akibat gangguan RTU**')
 				elif self.otherfailure_mark in comment:
 					data['Marked Other Failure'] = '*'
 					notes.append('User menandai downtime akibat gangguan lainnya**')
@@ -155,6 +180,7 @@ class _IFSAnalyzer:
 					'Down Time': t0,
 					'Up Time': t1,
 					'Duration': downtime,
+					'Fix Duration': downtime,
 					'Annotations': '\n'.join(notes),
 					'Navigation': (index0, df_rtu.iloc[y].name)
 				})
@@ -174,6 +200,7 @@ class _IFSAnalyzer:
 						'Down Time': t1,
 						'Up Time': self._t1,
 						'Duration': downtime,
+						'Fix Duration': downtime,
 						'Annotations': '\n'.join(notes),
 						'Navigation': (df_rtu.iloc[y].name, self.highest_index)
 					})
@@ -186,10 +213,16 @@ class _IFSAnalyzer:
 
 		return rtu_updown
 
-	def analyze_rtu_concurrently(self, df:pd.DataFrame, rtus:list):
-		"""
-		"""
+	def analyze_rtu_concurrently(self, df: pd.DataFrame, rtus: list[str]) -> tuple[list[dict], list[str]]:
+		"""Run analyze process in Threads.
 
+		Args:
+			df : dataframe
+			rtus : list of remote station name
+
+		Result:
+			Pair of updown list and rtu name list
+		"""
 		with ThreadPoolExecutor(len(rtus)) as tpe:
 			updown_list = list()
 			futures = [tpe.submit(self.get_rtu_updown, df, rtu) for rtu in rtus]
@@ -199,11 +232,16 @@ class _IFSAnalyzer:
 
 			return updown_list, rtus
 
-	def fast_analyze(self, start:datetime.datetime=None, stop:datetime.datetime=None, **kwargs):
-		"""
-		Analyzed every Up/Down event concurrently with presume that all RTUs are Up in the date_start.
-		"""
+	def fast_analyze(self, start: datetime.datetime = None, stop: datetime.datetime = None, **kwargs) -> pd.DataFrame:
+		"""Split analyze into some processes, datetime limits may included.
 
+		Args:
+			start : oldest date limit
+			stop : newest date limit
+
+		Result:
+			Downtime data as dataframe
+		"""
 		gc.collect()
 		# Can be filtered with date
 		if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
@@ -237,14 +275,19 @@ class _IFSAnalyzer:
 		self.rtus = rtus
 		self.post_process = df
 		self._analyzed = True
-
 		return df_downtime
 
-	def analyze(self, start:datetime.datetime=None, stop:datetime.datetime=None, **kwargs):
-		"""
+	def analyze(self, start: datetime.datetime = None, stop: datetime.datetime = None, **kwargs) -> pd.DataFrame:
+		"""[DEPRECATED]
 		Analyzed every Up/Down event with presume that all RTUs are Up in the date_start.
-		"""
 
+		Args:
+			start : oldest date limit
+			stop : newest date limit
+
+		Result:
+			Downtime data as dataframe
+		"""
 		gc.collect()
 		updown_list = list()
 
@@ -280,10 +323,13 @@ class _IFSAnalyzer:
 					'RTU': rtu,
 					'Long Name': description,
 					'Duration': 0,
-					'Marked Maintenance': '',
-					'Marked Comm. Failure': '',
-					'Marked Other Failure': '',
 					'Annotations': '',
+					'Acknowledged Down Time': '',
+					'Fix Duration': 0,
+					'Marked Maintenance': '',
+					'Marked Link Failure': '',
+					'Marked RTU Failure': '',
+					'Marked Other Failure': '',
 					'Navigation': (0, 0)
 				}
 
@@ -292,9 +338,12 @@ class _IFSAnalyzer:
 					if self.maintenance_mark in comment:
 						data['Marked Maintenance'] = '*'
 						notes.append('User menandai downtime akibat pemeliharaan**')
-					elif self.commfailure_mark in comment:
-						data['Marked Comm. Failure'] = '*'
+					elif self.linkfailure_mark in comment:
+						data['Marked Link Failure'] = '*'
 						notes.append('User menandai downtime akibat gangguan telekomunikasi**')
+					elif self.rtufailure_mark in comment:
+						data['Marked RTU Failure'] = '*'
+						notes.append('User menandai downtime akibat gangguan RTU**')
 					elif self.otherfailure_mark in comment:
 						data['Marked Other Failure'] = '*'
 						notes.append('User menandai downtime akibat gangguan lainnya**')
@@ -314,6 +363,7 @@ class _IFSAnalyzer:
 						'Down Time': t0,
 						'Up Time': t1,
 						'Duration': downtime,
+						'Fix Duration': downtime,
 						'Annotations': '\n'.join(notes),
 						'Navigation': (index0, df_rtu.iloc[y].name)
 					})
@@ -333,6 +383,7 @@ class _IFSAnalyzer:
 							'Down Time': t1,
 							'Up Time': self._t1,
 							'Duration': downtime,
+							'Fix Duration': downtime,
 							'Annotations': '\n'.join(notes),
 							'Navigation': (df_rtu.iloc[y].name, self.highest_index)
 						})
@@ -348,19 +399,18 @@ class _IFSAnalyzer:
 		self.rtus = rtus
 		self.post_process = df
 		self._analyzed = True
-
 		return df_downtime
 
-	def get_rtus(self):
-		"""
-		"""
+	def get_rtus(self) -> np.ndarray:
+		"""Get list of unique remote station name with respect of datetime limits.
 
+		Result:
+			List of remote station name
+		"""
 		df = self.soe_ifs
 		# Get His. Messages with order tag only
 		rtus = df.loc[(df['Time stamp']>=self._t0) & (df['Time stamp']<=self._t1), 'B3'].unique()
-
 		return rtus
-
 
 	@property
 	def analyzed(self):
@@ -379,12 +429,20 @@ class _IFSAnalyzer:
 		return self._lowest_index
 
 
-class _AvBaseCalculation:
+class _AVRSBaseCalculation:
+	"""Base class for Remote Station Availability calculation.
+
+	Args:
+		data : analyzed data input
+
+	Accepted kwargs:
+		**
+	"""
 	name = 'Availability Remote Station'
 	keep_duplicate = 'last'
 	cpoint_file = 'cpoint.xlsx'
 
-	def __init__(self, data:pd.DataFrame=None, **kwargs):
+	def __init__(self, data: pd.DataFrame = None, **kwargs):
 		self._calculated = False
 		self.availability = None
 
@@ -400,14 +458,18 @@ class _AvBaseCalculation:
 
 		# if hasattr(self, 'rtudown_all'): self.calculate(start=kwargs.get('start'), stop=kwargs.get('stop'))
 
-	def _avrs_setup(self, df:pd.DataFrame, **kwargs):
-		"""
-		"""
+	def _avrs_setup(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+		"""Apply conditioning & filtering before calculation process.
 
+		Args:
+			df : raw data
+
+		Result:
+			Cleaned data
+		"""
 		prepared = df.copy()
 		duracol_type = prepared['Duration'].dtype
 		duracell_type = type(prepared.loc[prepared.index[0], 'Duration'])
-
 		# Must be determined, can cause error on groupby process
 		if duracol_type=='object' or duracell_type==datetime.time:
 			prepared['Duration'] = prepared['Duration'].map(lambda time: pd.Timedelta(time.hour*3600 + time.minute*60 + time.second + time.microsecond/10**6, unit='s'))
@@ -416,16 +478,22 @@ class _AvBaseCalculation:
 		else:
 			print(f'Warning: kolom "Duration" (column_type={duracol_type}, cell_type={duracell_type})')
 		# Filter only rows with not unused-marked
-		prepared = prepared.loc[(prepared['Marked Maintenance']=='') & (prepared['Marked Comm. Failure']=='') & (prepared['Marked Other Failure']=='')]
-
+		# prepared = prepared.loc[(prepared['Marked Maintenance']=='') & (prepared['Marked Link Failure']=='') & (prepared['Marked Other Failure']=='')]
 		return prepared
 
 	@calc_time
-	def _calculate(self, start:datetime.datetime, stop:datetime.datetime, force:bool=False, fast:bool=True, **kwargs):
-		"""
-		Analyze and calculate RTU downtime.
-		"""
+	def _calculate(self, start: datetime.datetime, stop: datetime.datetime, force: bool = False, fast: bool = True, **kwargs) -> dict[str, dict[str, Any]]:
+		"""Analyze and/or calculate RTU downtime.
 
+		Args:
+			start : oldest date limit
+			stop : newest date limit
+			force : force calculation
+			fast : use fast calculation method or not
+
+		Result:
+			Downtime data as dataframe
+		"""
 		if not hasattr(self, 'rtudown_all') or force:
 			# Must be analyzed first and pass to rtudown_all
 			fn1 = getattr(self, 'fast_analyze', None)
@@ -448,27 +516,31 @@ class _AvBaseCalculation:
 
 		print(f'\nMenghitung downtime RTU tanggal {t0.strftime("%d-%m-%Y")} s/d {t1.strftime("%d-%m-%Y")}...')
 		result = self.get_result(**kwargs)
-
 		return result
 
-	def _set_range(self, start:datetime.datetime, stop:datetime.datetime):
-		"""
-		Set start and stop date of query data.
-		"""
+	def _set_range(self, start:datetime.datetime, stop:datetime.datetime) -> tuple[datetime.datetime, datetime.datetime]:
+		"""Set adjusted time for start and stop datetime of query data.
 
+		Args:
+			start : oldest date limit
+			stop : newest date limit
+
+		Result:
+			Pair of datetime limit
+		"""
 		dt0 = start.replace(hour=0, minute=0, second=0, microsecond=0)
 		dt1 = stop.replace(hour=23, minute=59, second=59, microsecond=999999)
 
 		self._t0 = dt0
 		self._t1 = dt1
-
 		return dt0, dt1
 
-	def get_result(self, **kwargs):
-		"""
-		Get aggregate data of availability.
-		"""
+	def get_result(self, **kwargs) -> dict[str, dict[str, Any]]:
+		"""Get aggregate data of availability calculation.
 
+		Result:
+			Calculation result in dict
+		"""
 		df = self.rtudown_all.loc[(self.rtudown_all['Down Time']>=self.t0) & (self.rtudown_all['Down Time']<=self.t1)]
 		df_pre = self._avrs_setup(df)
 		df_av = self.group(df_pre)
@@ -481,7 +553,8 @@ class _AvBaseCalculation:
 		down_all = df.shape[0]
 		down_valid = df_pre.shape[0]
 		down_maint = df[df['Marked Maintenance']=='*'].shape[0]
-		down_telco = df[df['Marked Comm. Failure']=='*'].shape[0]
+		down_telco = df[df['Marked Link Failure']=='*'].shape[0]
+		down_rtugw = df[df['Marked RTU Failure']=='*'].shape[0]
 		down_other = df[df['Marked Other Failure']=='*'].shape[0]
 		down_marked = down_maint + down_telco + down_other
 		down_avg = df_pre['Duration'].mean()
@@ -491,20 +564,21 @@ class _AvBaseCalculation:
 		down_min = df_pre['Duration'].min()
 		down_min_dd, down_min_hh, down_min_mm, down_min_ss = timedelta_split(down_min)
 
-		av = round((df_av['Calculated Availability'].sum() / df_av['Calculated Availability'].count()) * 100, 2)
+		avrtu = round(1 - (df_av['RTU Downtime'] / df_av['Time Range']) * 100, 2)
+		avlink = round(1 - (df_av['Link Downtime'] / df_av['Time Range']) * 100, 2)
 		rtu_count_max = df_av.loc[df_av['Downtime Occurences'].idxmax()]['RTU']
 		rtu_count_min = df_av.loc[df_av[df_av['Downtime Occurences']>0]['Downtime Occurences'].idxmin()]['RTU']
 		rtu_down_max = df_av.loc[df_av[df_av['Downtime Occurences']>0]['Total Downtime'].idxmax()]['RTU']
 		rtu_down_min = df_av.loc[df_av[df_av['Downtime Occurences']>0]['Total Downtime'].idxmin()]['RTU']
 		rtu_avg_max = df_av.loc[df_av[df_av['Downtime Occurences']>0]['Average Downtime'].idxmax()]['RTU']
 		rtu_avg_min = df_av.loc[df_av[df_av['Downtime Occurences']>0]['Average Downtime'].idxmin()]['RTU']
-
 		return {
 			'overall': {
 				'total_rtu': df_av.shape[0],
 				'total_rtu_down': df_av[df_av['Downtime Occurences']>0].shape[0],
 				'downtime_count': f'{down_valid}',
-				'availability': f'{av}%'
+				'rtu_availability': f'{avrtu}%',
+				'link_availability': f'{avlink}%'
 			},
 			'statistic': {
 				'downtime_avg': f'{down_avg_dd} Hari {down_avg_hh:02}:{down_avg_mm:02}:{down_avg_ss:02}',
@@ -512,7 +586,8 @@ class _AvBaseCalculation:
 				'downtime_min': f'{down_min_dd} Hari {down_min_hh:02}:{down_min_mm:02}:{down_min_ss:02}',
 				'marked': {
 					'maintenance': down_maint,
-					'communication': down_telco,
+					'link': down_telco,
+					'rtu': down_rtugw,
 					'other': down_other,
 					'total': down_marked
 				},
@@ -527,20 +602,30 @@ class _AvBaseCalculation:
 			}
 		}
 
-	def calculate(self, start:datetime.datetime=None, stop:datetime.datetime=None, force:bool=False, fast:bool=True, **kwargs):
-		"""
-		Extension of _calculate function.
-		"""
+	def calculate(self, start: datetime.datetime = None, stop: datetime.datetime = None, force: bool = False, fast: bool = True, **kwargs):
+		"""Calculate RTU downtime.
 
+		Args:
+			start : oldest date limit
+			stop : newest date limit
+			force : force calculation
+			fast : use fast calculation method or not
+		"""
 		self.result, t = self._calculate(start=start, stop=stop, force=force, fast=fast, **kwargs)
 		self._process_date = datetime.datetime.now()
 		self._process_duration = round(t, 3)
 		print(f'Perhitungan selesai. (durasi={t:.2f}s, error=0)')
 
-	def generate_reference(self, soe:pd.DataFrame, down:pd.DataFrame):
-		"""
-		"""
+	def generate_reference(self, soe: pd.DataFrame, down: pd.DataFrame) -> np.ndarray:
+		"""Create excel hyperlink of each RTU up/down in sheet "DOWNTIME" to cell range in sheet "HIS_MESSAGES".
 
+		Args:
+			soe : dataframe of SOE
+			down : dataframe of DOWNTIME
+
+		Result:
+			List of excel hyperlink
+		"""
 		navs = []
 		errors = 0
 
@@ -557,14 +642,17 @@ class _AvBaseCalculation:
 			errors += 1
 
 		if errors>0: print(f'Terjadi {errors} error saat generate hyperlink.')
-
 		return np.array(navs)
 
-	def group(self, df:pd.DataFrame):
-		"""
-		Return DataFrameGroupBy Class of aggregation values which used in all grouped Dataframe with groupby_columns as columns parameter.
-		"""
+	def group(self, df: pd.DataFrame) -> pd.DataFrame:
+		"""Perform aggregation and downtime grouping to get statistical result.
 
+		Args:
+			df : calculated downtime data
+
+		Result:
+			Aggregated availability data
+		"""
 		columns = ['RTU', 'Long Name']
 		groupby_columns = columns + ['Duration']
 		output_columns = [
@@ -577,10 +665,13 @@ class _AvBaseCalculation:
 			'Longest Downtime',
 			'Longest Downtime Date',
 			'Uptime',
-			'Non-RTU Downtime',
-			'Calculated Availability',
+			'Unclassified Downtime',
+			'RTU Downtime',
+			'Link Downtime',
+			'Other Downtime',
 			'Quality',
-			'Availability'
+			'RTU Availability',
+			'Link Availability'
 		]
 
 		df_pre = df.copy()
@@ -591,29 +682,41 @@ class _AvBaseCalculation:
 		down_agg.columns = ['RTU', 'Long Name', 'Total Downtime', 'Average Downtime', 'Longest Downtime']
 		filter_max_downtime = df_pre.groupby(columns, as_index=False)['Duration'].transform('max')==df_pre['Duration']
 		down_max_t = df_pre.loc[filter_max_downtime, columns + ['Down Time']].rename(columns={'Down Time': 'Longest Downtime Date'})
-		filter_nonrtu_down = (df['Marked Maintenance']=='*') | (df['Marked Comm. Failure']=='*') | (df['Marked Other Failure']=='*')
-		down_nonrtu = df.loc[filter_nonrtu_down, groupby_columns].groupby(columns, as_index=False).sum().rename(columns={'Duration': 'Non-RTU Downtime'})
+		filter_unc_down =  (df['Marked Maintenance']=='*') & (df['Marked RTU Failure']=='*') & (df['Marked Link Failure']=='*') & (df['Marked Other Failure']=='*')
+		filter_other_down = (df['Marked Maintenance']=='*') | (df['Marked Other Failure']=='*')
+		filter_rtu_down = (df['Marked RTU Failure']=='*')
+		filter_link_down = (df['Marked Link Failure']=='*')
+		down_uncls = df.loc[filter_unc_down, groupby_columns].groupby(columns, as_index=False).sum().rename(columns={'Duration': 'Unclassified Downtime'})
+		down_rtu = df.loc[filter_rtu_down, groupby_columns].groupby(columns, as_index=False).sum().rename(columns={'Duration': 'RTU Downtime'})
+		down_link = df.loc[filter_link_down, groupby_columns].groupby(columns, as_index=False).sum().rename(columns={'Duration': 'Link Downtime'})
+		down_other = df.loc[filter_other_down, groupby_columns].groupby(columns, as_index=False).sum().rename(columns={'Duration': 'Other Downtime'})
 
 		# Merge table and fill NaN Downtime Occurences to 0
 		df_groupby = rtu_table.merge(right=down_count, how='outer', on=columns).fillna(0)
 		# Merge existing table with aggregated table and fill NaT with timedelta(0 second)
-		df_groupby = df_groupby.merge(right=down_agg, how='left', on=columns).fillna(datetime.timedelta(seconds=0))
-		df_groupby = df_groupby.merge(right=down_nonrtu, how='left', on=columns).fillna(datetime.timedelta(seconds=0))
-		df_groupby = df_groupby.merge(right=down_max_t, how='left', on=columns).fillna(self.t1)
+		for dfgroup in [down_agg, down_uncls, down_rtu, down_link, down_other]:
+			df_groupby = df_groupby.merge(right=dfgroup, how='left', on=columns).fillna(datetime.timedelta(seconds=0))
 
+		df_groupby = df_groupby.merge(right=down_max_t, how='left', on=columns).fillna(self.t1)
 		df_groupby['Time Range'] = self.t1 - self.t0 + datetime.timedelta(microseconds=1)
 		df_groupby['Uptime'] = df_groupby['Time Range'] - df_groupby['Total Downtime']
-		df_groupby['Calculated Availability'] = round((df_groupby['Uptime'] + df_groupby['Non-RTU Downtime']) / df_groupby['Time Range'], 4)
 		df_groupby['Quality'] = 1
-		df_groupby['Availability'] = df_groupby['Calculated Availability']
-
+		df_groupby['RTU Availability'] = round(1 - (df_groupby['RTU Downtime'] / df_groupby['Time Range']), 4)
+		df_groupby['Link Availability'] = round(1 - (df_groupby['Link Downtime'] / df_groupby['Time Range']), 4)
 		return df_groupby[output_columns]
 
-	def prepare_export(self, generate_formula:bool=False, **kwargs):
-		"""
-		Applying excel formulas to output file
-		"""
+	def prepare_export(self, generate_formula: bool = False, **kwargs) -> dict[str, Union[pd.DataFrame, tuple[pd.DataFrame]]]:
+		"""Applying excel formulas to output file.
 
+		Args:
+			generate_formula : either formula will be generated or not
+
+		Accepted kwargs:
+			soe : dataframe of SOE
+
+		Result:
+			Dict of sheet name & data
+		"""
 		if not self.calculated: raise SyntaxError('Jalankan calculate() terlebih dahulu!')
 
 		df_dt = self.pre_process.copy()
@@ -648,21 +751,26 @@ class _AvBaseCalculation:
 			xa = {col: xl_col_to_name(av_columns.index(col)) for col in av_columns}
 
 			dt_update = {
-				'Duration': []
+				'Duration': [],
+				'Fix Duration': []
 			}
 			av_update = {
 				'Downtime Occurences': [],
 				'Total Downtime': [],
 				'Average Downtime': [],
 				'Uptime': [],
-				'Non-RTU Downtime': [],
-				'Calculated Availability': [],
-				'Availability': []
+				'Unclassified Downtime': [],
+				'RTU Downtime': [],
+				'Link Downtime': [],
+				'Other Downtime': [],
+				'RTU Availability': [],
+				'Link Availability': []
 			}
 			
 			# Define excel formula rule
 			rule_maint = rule_lookup('Marked Maintenance', '""')
-			rule_telco = rule_lookup('Marked Comm. Failure', '""')
+			rule_dtrtu = rule_lookup('Marked RTU Failure', '""')
+			rule_telco = rule_lookup('Marked Link Failure', '""')
 			rule_other = rule_lookup('Marked Other Failure', '""')
 
 			# Apply excel formula as string
@@ -674,27 +782,34 @@ class _AvBaseCalculation:
 			for rowd in range(dlen):
 				h = rowd + 2
 				dt_update['Duration'].append(f'=${xd["Up Time"]}{h}-${xd["Down Time"]}{h}')
+				dt_update['Fix Duration'].append(f'=${xd["Duration"]}{h} - IF(ISNUMBER(${xd["Acknowledged Down Time"]}{h}), ${xd["Acknowledged Down Time"]}{h} - ${xd["Down Time"]}{h}, 0)')
+
 			# Sheet AVAILABILITY
 			for rowa in range(alen):
 				i = rowa + 2
 				rule_rtu = rule_lookup('RTU', f'${xa["RTU"]}{i}')
-				rules = [rule_rtu, rule_maint, rule_telco, rule_other]
-				sum_maint = sumifs(rule_lookup('Duration'), rule_rtu, rule_lookup('Marked Maintenance', '"*"'))
-				sum_telco = sumifs(rule_lookup('Duration'), rule_rtu, rule_lookup('Marked Comm. Failure', '"*"'))
-				sum_other = sumifs(rule_lookup('Duration'), rule_rtu, rule_lookup('Marked Other Failure', '"*"'))
-				av_update['Downtime Occurences'].append('=' + countifs(*rules))
-				av_update['Total Downtime'].append('=' + sumifs(rule_lookup('Duration'), *rules))
-				av_update['Average Downtime'].append('=' + averageifs(rule_lookup('Duration'), *rules))
-				av_update['Uptime'].append(f'=${xa["Time Range"]}{i}-${xa["Total Downtime"]}{i}-${xa["Non-RTU Downtime"]}{i}')
-				av_update['Non-RTU Downtime'].append(f'={sum_maint}+{sum_telco}+{sum_other}')
-				av_update['Calculated Availability'].append(f'=ROUND((${xa["Uptime"]}{i}+${xa["Non-RTU Downtime"]}{i})/${xa["Time Range"]}{i}, 4)')
-				av_update['Availability'].append(f'=ROUND(${xa["Calculated Availability"]}{i}*${xa["Quality"]}{i}, 4)')
+				rules = [rule_rtu, rule_maint, rule_dtrtu, rule_telco, rule_other]
+				sum_uncls = sumifs(rule_lookup('Fix Duration'), *rules)
+				sum_maint = sumifs(rule_lookup('Fix Duration'), rule_rtu, rule_lookup('Marked Maintenance', '"*"'))
+				sum_dtrtu = sumifs(rule_lookup('Fix Duration'), rule_rtu, rule_lookup('Marked RTU Failure', '"*"'))
+				sum_telco = sumifs(rule_lookup('Fix Duration'), rule_rtu, rule_lookup('Marked Link Failure', '"*"'))
+				sum_other = sumifs(rule_lookup('Fix Duration'), rule_rtu, rule_lookup('Marked Other Failure', '"*"'))
+				av_update['Downtime Occurences'].append('=' + countifs(rule_rtu))
+				av_update['Total Downtime'].append('=' + sumifs(rule_lookup('Fix Duration'), rule_rtu))
+				av_update['Average Downtime'].append('=' + averageifs(rule_lookup('Fix Duration'), rule_rtu))
+				av_update['Uptime'].append(f'=${xa["Time Range"]}{i}-${xa["Total Downtime"]}{i}')
+				av_update['Unclassified Downtime'].append(f'={sum_uncls}')
+				av_update['RTU Downtime'].append(f'={sum_dtrtu}')
+				av_update['Link Downtime'].append(f'={sum_telco}')
+				av_update['Other Downtime'].append(f'={sum_maint}+{sum_other}')
+				av_update['RTU Availability'].append(f'=ROUND((1-(${xa["RTU Downtime"]}{i}/${xa["Time Range"]}{i}))*${xa["Quality"]}{i}, 4)')
+				av_update['Link Availability'].append(f'=ROUND((1-((${xa["Link Downtime"]}{i}+${xa["Unclassified Downtime"]}{i})/${xa["Time Range"]}{i}))*${xa["Quality"]}{i}, 4)')
 
 			av_result = {
 				'Downtime Occurences': [f'=SUM(${xa["Downtime Occurences"]}$2:${xa["Downtime Occurences"]}${alen+1})'],
-				'Calculated Availability': [f'=IFERROR(AVERAGE(${xa["Calculated Availability"]}$2:${xa["Calculated Availability"]}${alen+1}), 0)'],
 				'Quality': [f'=SUM(${xa["Quality"]}$2:${xa["Quality"]}${alen+1})'],
-				'Availability': [f'=SUM(${xa["Availability"]}$2:${xa["Availability"]}${alen+1})/${xa["Quality"]}{alen+2}']
+				'RTU Availability': [f'=SUM(${xa["RTU Availability"]}$2:${xa["RTU Availability"]}${alen+1})/${xa["Quality"]}{alen+2}'],
+				'Link Availability': [f'=SUM(${xa["Link Availability"]}$2:${xa["Link Availability"]}${alen+1})/${xa["Quality"]}{alen+2}']
 			}
 			df_av_result = pd.DataFrame(data=av_result)
 
@@ -704,20 +819,22 @@ class _AvBaseCalculation:
 
 			# Update summary information
 			count_maint = 'COUNTIF(' + rule_lookup('Marked Maintenance', '"*"') + ')'
-			count_telco = 'COUNTIF(' + rule_lookup('Marked Comm. Failure', '"*"') + ')'
+			count_dtrtu = 'COUNTIF(' + rule_lookup('Marked Link Failure', '"*"') + ')'
+			count_telco = 'COUNTIF(' + rule_lookup('Marked Link Failure', '"*"') + ')'
 			count_other = 'COUNTIF(' + rule_lookup('Marked Other Failure', '"*"') + ')'
 			self.result['overall']['total_rtu_down'] = f'=COUNTIF(AVAILABILITY!${xa["Downtime Occurences"]}$2:${xa["Downtime Occurences"]}${alen+1}, ">0")'
-			self.result['overall']['availability'] = f'=ROUND(AVAILABILITY!${xa["Availability"]}${alen+2}*100, 2) & "%"'
+			self.result['overall']['rtu_availability'] = f'=ROUND(AVAILABILITY!${xa["RTU Availability"]}${alen+2}*100, 2) & "%"'
+			self.result['overall']['link_availability'] = f'=ROUND(AVAILABILITY!${xa["Link Availability"]}${alen+2}*100, 2) & "%"'
 			self.result['statistic']['marked']['maintenance'] = '=' + count_maint
-			self.result['statistic']['marked']['communication'] = '=' + count_telco
+			self.result['statistic']['marked']['rtu'] = '=' + count_dtrtu
+			self.result['statistic']['marked']['link'] = '=' + count_telco
 			self.result['statistic']['marked']['other'] = '=' + count_other
-			self.result['statistic']['marked']['total'] = f'={count_maint}+{count_telco}+{count_other}'
+			self.result['statistic']['marked']['total'] = f'={count_maint}+{count_dtrtu}+{count_telco}+{count_other}'
 
 		return {
 			'DOWNTIME': df_dt,
 			'AVAILABILITY': (df_av, df_av_result)
 		}
-
 
 	@property
 	def calculated(self):
@@ -740,22 +857,26 @@ class _AvBaseCalculation:
 		return self._t1
 
 
-class AVRS(_Export, _AvBaseCalculation):
+class AVRS(_Export, _AVRSBaseCalculation):
 
-	def __init__(self, data:pd.DataFrame=None, **kwargs):
+	def __init__(self, data: pd.DataFrame = None, **kwargs):
 		super().__init__(data, **kwargs)
 
 
-class SOEtoAVRS(_Export, _IFSAnalyzer, _AvBaseCalculation):
+class SOEtoAVRS(_Export, _IFSAnalyzer, _AVRSBaseCalculation):
 
-	def __init__(self, data:pd.DataFrame=None, **kwargs):
+	def __init__(self, data: pd.DataFrame = None, **kwargs):
 		super().__init__(data, **kwargs)
 
-	def prepare_export(self, generate_formula:bool=False, **kwargs):
-		"""
-		Applying excel formulas to output file
-		"""
+	def prepare_export(self, generate_formula: bool = False, **kwargs):
+		"""Applying excel formulas to output file.
 
+		Args:
+			generate_formula : either formula will be generated or not
+
+		Result:
+			Dict of sheet name & data
+		"""
 		if not self.analyzed: raise SyntaxError('Jalankan calculate() terlebih dahulu!')
 
 		# Define soe as reference on generating hyperlink in prepare_export()
@@ -767,21 +888,21 @@ class SOEtoAVRS(_Export, _IFSAnalyzer, _AvBaseCalculation):
 		}
 
 
-class AVRSCollective(AvFileReader, AVRS):
+class AVRSCollective(AVRSFileReader, AVRS):
 
-	def __init__(self, filepaths:Union[str, list], **kwargs):
+	def __init__(self, filepaths: Union[str, list], **kwargs):
 		super().__init__(filepaths, **kwargs)
 
 
 class AVRSFromOFDB(SpectrumOfdbClient, SOEtoAVRS):
 
-	def __init__(self, date_start:datetime.datetime, date_stop:datetime.datetime=None, **kwargs):
+	def __init__(self, date_start: datetime.datetime, date_stop: datetime.datetime = None, **kwargs):
 		super().__init__(date_start, date_stop, **kwargs)
 
 
 class AVRSFromFile(SpectrumFileReader, SOEtoAVRS):
 
-	def __init__(self, filepaths:Union[str, list], **kwargs):
+	def __init__(self, filepaths: Union[str, list], **kwargs):
 		super().__init__(filepaths, **kwargs)
 
 
