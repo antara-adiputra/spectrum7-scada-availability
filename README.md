@@ -4,6 +4,7 @@ Aplikasi yang digunakan untuk penghitungan availability SCADA pada bagian Fasili
 >Python3.9+, 
 >pandas, 
 >Xlsxwriter
+>nicegui
 
 
 ## Feature
@@ -35,10 +36,15 @@ Pengembangan support untuk perhitungan RC dari file historical Master Survalent.
 #### Update 30-04-2024
 Peningkatan performa dalam durasi membuka file maupun proses perhitungan hingga **4x** lebih cepat dari versi sebelumnya.
 
-#### Update 31-05-2024 (Terbaru)
+#### Update 31-05-2024
 - Pengembangan struktur perhitungan availability RTU
 - Penambahan perhitungan availability link komunikasi
-- Peningkatan dokumentasi aplikasi 
+- Peningkatan dokumentasi aplikasi
+
+#### Update 15-07-2024 (Terbaru)
+- Web GUI interface (baru)
+- Optimalisasi performa perhitungan
+- Fitur "Test" untuk memudahkan troubleshooting (baru)
 
 
 ## Contributor

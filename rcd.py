@@ -1,24 +1,41 @@
-import datetime, gc, os, re, time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from typing import Union
+import asyncio, datetime, os, re, time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from io import BytesIO
+from types import MappingProxyType
+from typing import Any, Dict, List, Callable, Iterable, Optional, Tuple, TypeAlias, Union
 
 import numpy as np
 import pandas as pd
 from xlsxwriter.utility import xl_col_to_name
+from core import BaseAvailability, XLSExportMixin
 from filereader import RCFileReader, SpectrumFileReader, SurvalentFileReader
 from global_parameters import RCD_BOOK_PARAM, RCD_COLUMNS
-from lib import CONSOLE_WIDTH, BaseExportMixin, calc_time, get_datetime, get_execution_duration, get_termination_duration, join_datetime, immutable_dict, progress_bar
+from lib import ProcessError, calc_time, get_datetime, get_execution_duration, get_termination_duration, immutable_dict, join_datetime, nested_dict, progress_bar
 from ofdb import SpectrumOfdbClient
+from test import *
+from worker import run_cpu_bound
 
 
-class _Export(BaseExportMixin):
-	_sheet_parameter = immutable_dict(RCD_BOOK_PARAM)
-	output_prefix = 'RCD'
+FilePaths: TypeAlias = List[str]
+FileDict: TypeAlias = Dict[str, BytesIO]
+CalcResult : TypeAlias = Dict[str, Dict[str, Any]]
+Cell: TypeAlias = Tuple[int, str]
+CellUpdate: TypeAlias = Dict[Cell, Any]
+KeyPair: TypeAlias = Tuple[str, str]
+ListLikeDataFrame: TypeAlias = List[Dict[str, Any]]
+SOEBay: TypeAlias = Union[Iterable[str], Tuple[str, str, str]]
+
+
+class _Export(XLSExportMixin):
+	_sheet_parameter: MappingProxyType[str, dict[str, Any]] = immutable_dict(RCD_BOOK_PARAM)
+	rc_element: List[str]
+	check_repetition: bool
+	result: Dict[str, Dict[str, Any]]
+	threshold_variable: int
+	output_prefix: str = 'RCD'
 
 	def get_sheet_info_data(self, **kwargs):
-		"""
-		"""
-
+		"""Define extra information into sheet "Info"."""
 		info_data = super().get_sheet_info_data(**kwargs)
 		extra_info = [
 			*info_data,
@@ -30,502 +47,127 @@ class _Export(BaseExportMixin):
 			('', ''),
 			('SUMMARY', ''),
 			('Success Percentage', self.result['overall']['percentage']),
-			('Success Percentage (Close)', self.result['statistic']['operation']['close_success_percentage']),
-			('Success Percentage (Open)', self.result['statistic']['operation']['open_success_percentage']),
+			('Success Percentage (Close)', nested_dict(self.result, ['statistic', 'operation', 'close_success_percentage'])),
+			('Success Percentage (Open)', nested_dict(self.result, ['statistic', 'operation', 'open_success_percentage'])),
 			('', ''),
 			('STATISTICS', ''),
-			('Marked', self.result['statistic']['marked']['total']),
-			('Unused-marked', self.result['statistic']['marked']['unused']),
-			('Success-marked', self.result['statistic']['marked']['success']),
-			('Failed-marked', self.result['statistic']['marked']['failed'])
+			('Marked', nested_dict(self.result, ['statistic', 'marked', 'total'])),
+			('Unused-marked', nested_dict(self.result, ['statistic', 'marked', 'unused'])),
+			('Success-marked', nested_dict(self.result, ['statistic', 'marked', 'success'])),
+			('Failed-marked', nested_dict(self.result, ['statistic', 'marked', 'failed']))
 		]
 
 		return extra_info
 
 
-class _SOEAnalyzer:
-	_feedback_tags = ['RC', 'NE', 'R*', 'N*']
-	_order_tags = ['OR', 'O*']
-	t_monitor = {'CB': 15, 'BI1': 30, 'BI2': 30}
-	t_transition = {'CB': 1, 'BI1': 16, 'BI2': 16}
-	t_search = 3*60*60
-	success_mark = '**success**'
-	failed_mark = '**failed**'
-	unused_mark = '**unused**'
-	keep_duplicate = 'last'
+class _SOEAnalyzer(BaseAvailability):
+	"""Base class for analyze IFS from SOE.
 
-	def __init__(self, data:pd.DataFrame=None, calculate_bi:bool=False, check_repetition:bool=True, **kwargs):
-		self.rc_element = ['CB']
-		self.check_repetition = check_repetition
+	Args:
+		data : SOE data
 
+	Accepted kwargs:
+		**
+	"""
+	_highest_index: int
+	_lowest_index: int
+	_feedback_tags: Tuple[str] = ('RC', 'NE', 'R*', 'N*')
+	_order_tags: Tuple[str] = ('OR', 'O*')
+	t_monitor: Dict[str, int] = {'CB': 15, 'BI1': 30, 'BI2': 30}
+	t_transition: Dict[str, int] = {'CB': 1, 'BI1': 16, 'BI2': 16}
+	t_search: int = 3*60*60
+	success_mark: str = '**success**'
+	failed_mark: str = '**failed**'
+	unused_mark: str = '**unused**'
+	soe_all: pd.DataFrame
+
+	def __init__(self, data: Optional[pd.DataFrame] = None, calculate_bi: bool = False, check_repetition: bool = True, **kwargs):
+		self._analyzed: bool = False
+		self._is_valid: bool = False
+		self.rc_element: List[str] = ['CB']
+		self.check_repetition: bool = check_repetition
+		self.soe_all = data
 		if calculate_bi: self.rc_element += ['BI1', 'BI2']
+		super().__init__(**kwargs)
 
-		if data is not None: self.soe_all = data
+	def initialize(self) -> None:
+		"""Set class attributes into intial value"""
+		self.init_analyze()
+		super().initialize()
 
-		self._initialize()
-		self._soe_setup()
-		super().__init__(calculate_bi=calculate_bi, check_repetition=check_repetition, **kwargs)
-
-	def _analyze(self, start:datetime.datetime=None, stop:datetime.datetime=None):
-		"""
-		Loop through RC event to analyze set of probability and infromation about how every RC event occured (Failed or Success). In case of loop optimization, we split the main Dataframe (df) into parts of categories.
-		* INPUT
-		analyzed_rc_rows : list of tuple of analyzed RC event to create new Dataframe
-		note_list : list of annotation of each analyzed RC event
-		rc_order_index : list of index of RC order
-		multiple_rc_at_same_time : crossing of multiple RC Event
-		date_origin : date refference as comparator
-		buffer1 : buffer for storing index of df_rc, to get RC repetition in one day
-		buffer1 : buffer for storing index of df_result, to get RC repetition in one day
-		* OUTPUT
-		rcd
-		* SET
-		analyzed_rc_rows
-		soe
-		note_list
-		"""
-
-		rc_list = []
-		note_list = []
-		buffer1, buffer2 = {}, {}
-
-		orders = self.get_orders(start=start, stop=stop)
-		rc_order_index = orders.index.to_list()
-		date_origin = self.soe_ctrl.loc[rc_order_index[0], 'Time stamp']
-
-		print(f'\nMenganalisa {len(rc_order_index)} kejadian RC...')
-		for x, index in enumerate(rc_order_index):
-			progress_bar((x+1)/len(rc_order_index))
-
-			# index_0 = index of RC order Tag, index_1 = index of RC Feedback Tag, index_2 = index of next RC order Tag
-			rc_order = self.soe_ctrl.loc[index]
-			date_rc, b1, b2, b3, elm, sts = rc_order.loc[['Time stamp', 'B1', 'B2', 'B3', 'Element', 'Status']]
-			index_0 = index
-			index_2 = rc_order_index[x + 1] if x<len(rc_order_index)-1 else self.highest_index
-			index_1, result = self._check_events(rc_order, rc_list, note_list)
-			bufkey = (b1, b2, b3, elm, sts)
-
-			# if result in ['FAILED', 'UNCERTAIN']: print(x, bufkey)
-			# Check RC repetition
-			if self.check_repetition:
-				if (date_rc.year==date_origin.year and date_rc.month==date_origin.month and date_rc.day==date_origin.day) and x<len(rc_order_index)-1:
-					# If in the same day and not last iteration
-					if bufkey in buffer1:
-						# Bufkey already in buffer, append buffer
-						buffer1[bufkey] += [index_0]
-						buffer2[bufkey] += [x]
-
-						if result=='SUCCESS':
-							# Comment to mark as last RC repetition
-							for m in range(len(buffer1[bufkey])):
-								if m==len(buffer1[bufkey])-1:
-									comment_text = f'Percobaan RC ke-{m+1} (terakhir)'
-								else:
-									comment_text = f'Percobaan RC ke-{m+1}'
-									# Give flag
-									rc_list[buffer2[bufkey][m]]['Rep. Flag'] = '*'
-								self.soe_ctrl.at[buffer1[bufkey][m], 'Comment'] += f'{comment_text}\n'
-								note_list[buffer2[bufkey][m]].insert(0, comment_text)
-
-							del buffer1[bufkey]
-							del buffer2[bufkey]
-
-					else:
-						if result in ['FAILED', 'UNCERTAIN']:
-							buffer1[bufkey] = [index_0]
-							buffer2[bufkey] = [x]
-				else:
-					# If dates are different, set date_origin
-					date_origin = date_rc
-
-					for bkey, bval in buffer1.items():
-						if len(bval)>1:
-							# Comment to mark as multiple RC event in 1 day
-							for n in range(len(bval)):
-								if n==len(bval)-1:
-									comment_text = f'Percobaan RC ke-{n+1} (terakhir)'
-								else:
-									comment_text = f'Percobaan RC ke-{n+1}'
-									# Give flag
-									rc_list[buffer2[bkey][n]]['Rep. Flag'] = '*'
-								self.soe_ctrl.at[bval[n], 'Comment'] += f'{comment_text}\n'
-								note_list[buffer2[bkey][n]].insert(0, comment_text)
-
-					# Reset buffer
-					buffer1, buffer2 = {}, {}
-					# Insert into new buffer
-					if result in ['FAILED', 'UNCERTAIN']:
-						buffer1[bufkey] = [index_0]
-						buffer2[bufkey] = [x]
-
-			self._rc_indexes.append((index_0, index_1, result))
-
-		rcd = pd.DataFrame(data=rc_list)
-		rcd['Annotations'] = list(map(lambda x: '\n'.join(list(map(lambda y: f'- {y}', x))), note_list))
-		self.rc_list = rc_list
-		self.post_process = pd.concat([self.soe_ctrl, self.soe_lr, self.soe_cd, self.soe_sync, self.soe_prot, self.soe_ifs], copy=False).drop_duplicates(keep='first').sort_values(['Time stamp', 'Milliseconds'])
-		self._analyzed = True
-
-		return rcd[RCD_COLUMNS + ['Navigation']]
-
-	def _check_events(self, order:pd.Series, rc_list:list, note_list:list):
-		"""
-		Get result of RC Event execution ended within t_search duration.
-		* INPUT
-		index : index of RC Event with order tag
-		* OUTPUT
-		result_idx : index of RC Event with feedback tag
-		rc_result : RC Event result Success / Failed / Uncertain
-		* SET
-		analyzed_rc_rows
-		rcd
-		soe
-		note_list
-		"""
-		
-		order_idx = order.name
-		t_order, t_transmit = get_datetime(order)
-		# t_order, t_transmit = get_datetime(self.soe_ctrl.loc[index])
-		b1, b2, b3, elm, sts, tag, dis = order.loc[['B1', 'B2', 'B3', 'Element', 'Status', 'Tag', 'Operator']]
-		# b1, b2, b3, elm, sts, tag, dis = self.soe_ctrl.loc[index, ['B1', 'B2', 'B3', 'Element', 'Status', 'Tag', 'Operator']]
-		rc_result, t0, t1, t2 = 'UNCERTAIN', 0, 0, 0
-		t_feedback = t_transmit
-		prot_isactive = ''
-		annotation = []
-		mark_success, mark_failed, mark_unused = False, False, False
-
-		txt_cd_anomaly = 'Status CD anomali'
-		txt_lr_anomaly = 'Status LR anomali'
-		txt_timestamp_anomaly = 'Anomali timestamp RTU'
-
-		ifs_status_0, ifs_name_0 = self.check_ifs_status(**{'t1': t_order, 'b1': b1})
-		if ifs_status_0=='Down':
-			txt_ifs_before_rc = f'RC dalam kondisi IFS "{ifs_name_0}" {ifs_status_0}'
-			annotation.append(txt_ifs_before_rc)
-			self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_ifs_before_rc}\n'
-		
-		# TEST PROGRAMM
-		invert_status = {'Open': 'Close', 'Close': 'Open'}
-
-		# Notes for LR
-		lr_status_0, lr_quality_0 = self.check_remote_status(**{'t1': t_order, 'b1': b1, 'b2': b2, 'b3': b3})
-		if lr_quality_0=='good' and lr_status_0=='Local':
-			txt_rc_at_local = f'Status LR {lr_status_0}'
-			annotation.append(txt_rc_at_local)
-			if txt_rc_at_local not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_rc_at_local}\n'
-		elif lr_quality_0=='bad':
-			annotation.append(txt_lr_anomaly)
-			if txt_lr_anomaly not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_lr_anomaly}\n'
-
-		# Notes for CD
-		cd_status_0, cd_quality_0 = self.check_enable_status(**{'t1': t_order, 'b1': b1})
-		if cd_quality_0=='good' and cd_status_0=='Disable':
-			txt_rc_at_disable = f'Status CD {cd_status_0}'
-			annotation.append(txt_rc_at_disable)
-			if txt_rc_at_disable not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_rc_at_disable}\n'
-		elif cd_quality_0=='bad':
-			annotation.append(txt_cd_anomaly)
-			if txt_cd_anomaly not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_cd_anomaly}\n'
-			
-		# Notes for CSO and protection status
-		if sts=='Close':
-			cso_status_0, cso_quality_0 = self.check_synchro_interlock(**{'t1': t_order, 'b1': b1, 'b2': b2, 'b3': b3})
-			if cso_quality_0=='good':
-				txt_rc_at_cso = f'Status CSO {cso_status_0}'
-				annotation.append(txt_rc_at_cso)
-				if txt_rc_at_cso not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_rc_at_cso}\n'
-			elif cso_quality_0=='bad':
-				txt_cso_anomaly = 'Status CSO anomali'
-				annotation.append(txt_cso_anomaly)
-				if txt_cso_anomaly not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_cso_anomaly}\n'
-				
-			prot_isactive = self.check_protection_interlock(**{'t1': t_order, 'b1': b1, 'b2': b2, 'b3': b3})
-			if prot_isactive:
-				txt_prot_active = f'Proteksi {prot_isactive} sedang aktif'
-				annotation.append(txt_prot_active)
-				if txt_prot_active not in self.soe_ctrl.loc[order_idx, 'Comment']: self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_prot_active}\n'
-
-		# Sampling dataframe within t_search time
-		df_range = self.soe_ctrl[(join_datetime(self.soe_ctrl['System time stamp'], self.soe_ctrl['System milliseconds'])>=t_order) & (join_datetime(self.soe_ctrl['System time stamp'], self.soe_ctrl['System milliseconds'])<=join_datetime(t_order, self.t_search*1000)) & (self.soe_ctrl['B1']==b1) & (self.soe_ctrl['B2']==b2) & (self.soe_ctrl['B3']==b3) & (self.soe_ctrl['Element']==elm)]
-
-		# Get first feedback
-		result_range = df_range[(df_range['Status']==sts) & (df_range['Tag'].isin(self.feedback_tags))][:1]
-
-		if result_range.shape[0]>0:
-			# Continue check feedback
-			result_row = result_range.iloc[0]
-			result_idx = result_row.name
-			if 'R' in result_row['Tag']:
-				rc_result = 'SUCCESS'
-			else:
-				rc_result = 'FAILED'
-
-			t_feedback, t_receive = get_datetime(result_row)
-			t0 = get_execution_duration(order, result_row)
-			t1 = get_termination_duration(order, result_row)
-			t2 = t1 - t0
-			last_idx = result_idx
-
-			# Check if t_feedback leading t_order
-			if t0<0 or t2<0:
-				annotation.append(txt_timestamp_anomaly)
-				if txt_timestamp_anomaly not in self.soe_ctrl.loc[result_idx, 'Comment']: self.soe_ctrl.at[result_idx, 'Comment'] += f'{txt_timestamp_anomaly}\n'
-		else:
-			# Cut operation if no feedback found
-			# Return order index with status UNCERTAIN
-			last_idx = order_idx
-			result_idx = order_idx
-
-		final_result = rc_result
-
-		if rc_result=='FAILED':
-			anomaly_status = False
-			no_status_changes = False
-
-			# Check for IFS
-			if ifs_status_0=='Up':
-				ifs_status1, ifs_name1 = self.check_ifs_status(**{'t1': t_feedback, 'b1': b1})
-				if ifs_status1=='Down':
-					txt_ifs_after_rc = f'IFS "{ifs_name1}" {ifs_status1} sesaat setelah RC'
-					annotation.append(txt_ifs_after_rc)
-					self.soe_ctrl.at[order_idx, 'Comment'] += f'{txt_ifs_after_rc}\n'
-
-			# Only Tag [OR, O*, RC, R*, ""] would pass
-			df_failed = df_range[(join_datetime(df_range['System time stamp'], df_range['System milliseconds'])>t_order) & ((df_range['Tag'].isin(self.order_tags + ['RC', 'R*'])) | (df_range['Tag']==''))]
-
-			# Check for normal status occurences
-			if df_failed[(df_failed['Status'].isin(['Close', 'Open'])) & (df_failed['Tag']=='')].shape[0]>0:
-				df_status_normal = df_failed[df_failed['Status'].isin(['Close', 'Open'])]
-				first_change = df_status_normal.iloc[0]
-				
-				if first_change['Tag']=='':
-					# Status changes after RC order
-					t_delta = get_execution_duration(df_range.loc[order_idx], first_change)
-
-					txt_list = []
-					t_executed = join_datetime(*first_change.loc[['Time stamp', 'Milliseconds']].to_list())
-					lr_status_1, lr_quality_1 = self.check_remote_status(**{'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-					cd_status_1, cd_quality_1 = self.check_enable_status(**{'t1': t_executed, 'b1': b1})
-					# if cd_quality_1=='good': txt_list.append(f'CD={cd_status_1}')
-					
-					if sts=='Close':
-						cso_status_1, cso_quality_1 = self.check_synchro_interlock(**{'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-						# if cso_quality_1=='good': txt_list.append(f'CSO={cso_status_1}')
-						prot_isactive = self.check_protection_interlock(**{'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-						if prot_isactive: txt_list.append(f'{prot_isactive}=Appeared')
-
-					txt_additional = f' ({", ".join(txt_list)})' if len(txt_list)>0 else ''
-					
-					txt_status_result = ''
-					if first_change['Status']==sts:
-						# Valid status exists
-						if lr_status_1=='Remote' and t_delta<=self.t_monitor[elm]:
-							txt_status_result = f'Potensi RC sukses ({t_delta}s){txt_additional}'
-						else:
-							txt_status_result = f'Eksekusi lokal GI{txt_additional}'
-					else:
-						# Inverted status occured
-						if lr_status_1=='Remote' and t_delta<=self.t_monitor[elm]:
-							txt_status_result = f'RC {sts} tapi status balikan {first_change["Status"]}. Perlu ditelusuri!'
-						else:
-							anomaly_status = True
-
-					if first_change.name>result_idx: last_idx = first_change.name
-					if txt_status_result:
-						annotation.append(txt_status_result)
-						self.soe_ctrl.at[first_change.name, 'Comment'] += f'{txt_status_result}\n'
-				else:
-					# Another RC order tag
-					no_status_changes = True
-			else:
-				anomaly_status = True
-
-			# Check for anomaly status occurences
-			if (no_status_changes or anomaly_status) and df_failed[df_failed['Status']=='Dist.'].shape[0]>0:
-				isfeedback = True
-				first_dist_change = df_failed[df_failed['Status']=='Dist.'].iloc[0]
-
-				# Sampling for next order
-				df_next_order = df_failed[df_failed['Tag'].isin(self.order_tags)]
-
-				if df_next_order.shape[0]>0:
-					# Check if dist. status occured after another RC order
-					if df_next_order.iloc[0].name<first_dist_change.name: isfeedback = False
-
-				if isfeedback:
-					# Anomaly status occured
-					t_delta = get_execution_duration(df_range.loc[order_idx], first_dist_change)
-
-					txt_list = []
-					t_executed = join_datetime(*first_dist_change.loc[['Time stamp', 'Milliseconds']].to_list())
-					lr_status_1, lr_quality_1 = self.check_remote_status(**{'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-					cd_status_1, cd_quality_1 = self.check_enable_status(**{'t1': t_executed, 'b1': b1})
-					# if cd_quality_1=='good': txt_list.append(f'CD={cd_status_1}')
-					
-					if sts=='Close':
-						cso_status_1, cso_quality_1 = self.check_synchro_interlock(**{'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-						# if cso_quality_1=='good': txt_list.append(f'CSO={cso_status_1}')
-						prot_isactive = self.check_protection_interlock(**{'t1': t_executed, 'b1': b1, 'b2': b2, 'b3': b3})
-						if prot_isactive: txt_list.append(f'{prot_isactive}=Appeared')
-
-					txt_additional = f' ({", ".join(txt_list)})' if len(txt_list)>0 else ''
-					
-					if lr_status_1=='Remote' and t_delta<=self.t_monitor[elm]:
-						txt_status_anomaly = f'Potensi RC sukses, tapi status {sts} anomali ({t_delta}s){txt_additional}'
-					else:
-						txt_status_anomaly = f'Eksekusi lokal GI, tapi status {sts} anomali{txt_additional}'
-
-					if first_dist_change.name>result_idx: last_idx = first_dist_change.name
-					annotation.append(txt_status_anomaly)
-					self.soe_ctrl.at[first_dist_change.name, 'Comment'] += f'{txt_status_anomaly}\n'
-
-		# Copy User Comment if any
-		user_comment = df_range.loc[df_range.index<=last_idx, 'User comment'].to_list()
-		for cmt in user_comment:
-			if cmt and '**' not in cmt:
-				# Eleminate unnecessary character
-				txt = re.sub('^\W*|\s*$', '', cmt)
-				annotation.append(txt)
-
-		# Event marked by user
-		if self.unused_mark in df_range['User comment'].to_list() or 'notused' in df_range['User comment'].to_list():
-			annotation.append('User menandai RC dianulir**')
-			mark_unused = True
-		elif self.success_mark in df_range['User comment'].to_list():
-			final_result = 'SUCCESS'
-			annotation.append('User menandai RC sukses**')
-			mark_success = True
-		elif self.failed_mark in df_range['User comment'].to_list():
-			final_result = 'FAILED'
-			annotation.append('User menandai RC gagal**')
-			mark_failed = True
-
-		self.soe_ctrl.loc[result_idx, 'RC Feedback'] = rc_result
-		note_list.append(annotation)
-		rc_list.append({
-			'Order Time': t_order,
-			'Feedback Time': t_feedback,
-			'B1': b1,
-			'B2': b2,
-			'B3': b3,
-			'Element': elm,
-			'Status': sts,
-			'Tag': tag,
-			'Operator': dis,
-			'Pre Result': rc_result,
-			'Execution (s)': t0,
-			'Termination (s)': t1,
-			'TxRx (s)': t2,
-			'Rep. Flag': '',
-			'Marked Unused': '*' if mark_unused else '',
-			'Marked Success': '*' if mark_success else '',
-			'Marked Failed': '*' if mark_failed else '',
-			'Final Result': final_result,
-			'Navigation': (order_idx, result_idx)
-		})
-
-		return result_idx, final_result
-
-	def _initialize(self):
-		"""
-		"""
-
+	def init_analyze(self) -> None:
+		"""Set class attributes into intial value"""
 		self._analyzed = False
-		self._cd_qualities = {}
-		self._cso_qualities = {}
-		self._lr_qualities = {}
-		self._rc_indexes = []
+		self._is_valid = False
+		self.cd_qualities = dict()
+		self.cso_qualities = dict()
+		self.lr_qualities = dict()
 
-	def _set_range(self, start:datetime.datetime, stop:datetime.datetime):
-		"""
-		Set start and stop date of query data.
-		"""
-
-		dt0 = start.replace(hour=0, minute=0, second=0, microsecond=0)
-		dt1 = stop.replace(hour=23, minute=59, second=59, microsecond=999999)
-
-		self._t0 = dt0
-		self._t1 = dt1
-
-		return dt0, dt1
-
-	def _soe_setup(self):
-		"""
-		Preparing Dataframe joins from multiple file with sorting and filtering to get clean data.
-		* INPUT
-		input :
-		* OUTPUT
-		df :
-		* SET
-		date_start :
-		date_stop :
-		highest_index :
-		lowest_index :
-		order_messages : Dataframe filter for His. Messages with "Order" tag only
-		b*_list : list of unique value of field B1, B2, B3
-		soe_ifs : Dataframe filter for His. Messages of IFS Status only
-		ifs_list :
-		ifs_name_matching :
-		soe_ctrl : Dataframe of RC element status changes only
-		soe_cd : Dataframe of CD status only
-		soe_lr : Dataframe of LR status only
-		soe_sync : Dataframe of CSO status only
-		soe_prot : Dataframe of protection alarm only
-		"""
+	def soe_setup(self, **kwargs) -> Union[pd.DataFrame, Exception]:
+		"""Apply sorting and filtering on "soe_all" to get cleaned data."""
+		start = kwargs.get('start')
+		stop = kwargs.get('stop')
 
 		if isinstance(self.soe_all, pd.DataFrame):
 			self._is_valid = True
-			df = self.soe_all.copy()
-			df = df.sort_values(['System time stamp', 'System milliseconds', 'Time stamp', 'Milliseconds'], ascending=[True, True, True, True]).reset_index(drop=True)
-			orders = self.get_orders()
+			# Can be filtered with date
+			if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
+				t0, t1 = self.set_range(start=start, stop=stop)
+			else:
+				# Parameter start or stop is not valid datetime or None
+				t0, t1 = self.set_range(start=self.soe_all['Time stamp'].min(), stop=self.soe_all['Time stamp'].max())
 
+			df = self.soe_all.copy()
+			df = df[(df['Time stamp']>=t0) & (df['Time stamp']<=t1)].sort_values(['System time stamp', 'System milliseconds', 'Time stamp', 'Milliseconds'], ascending=[True, True, True, True]).reset_index(drop=True)
+			orders = self.get_orders()
 			# Get min index and max index of df
 			self._lowest_index, self._highest_index = df.index.min(), df.index.max()
-
 			soe_ifs = df[(df['A']=='') & (df['B1']=='IFS') & (df['B2']=='RTU_P1') & (df['Tag']=='')]
 			# Get IFS name matching
-			self._ifs_list = soe_ifs['B3'].unique()
-			self._b1_list, self._b2_list, self._b3_list = orders['B1'].unique(), orders['B2'].unique(), orders['B3'].unique()
+			self.ifs_list = soe_ifs['B3'].unique()
+			self.b1_list, self.b2_list, self.b3_list = orders['B1'].unique(), orders['B2'].unique(), orders['B3'].unique()
 			# Filter IFS messages only if related to RC Event
 			self.soe_ifs = soe_ifs[soe_ifs['B3'].isin(self.b1_list)]
-
 			# Filter His. Messages only if related to RC Event's B1, B2 and B3
-			df = df[(df['A']=='') & (df['B1'].isin(self.b1_list)) & (df['B2'].isin(self.b2_list)) & (df['B3'].isin(self.b3_list))]
-
+			# df = df[(df['A']=='') & (df['B1'].isin(self.b1_list)) & (df['B2'].isin(self.b2_list)) & (df['B3'].isin(self.b3_list))]
+			soe_by_bay = df[(df['A']=='') & (df['B1'].isin(self.b1_list)) & (df['B2'].isin(self.b2_list)) & (df['B3'].isin(self.b3_list))]
 			# Reset comment column and search for order tag for RC element
-			soe_ctrl = df[(df['Element'].isin(self.rc_element)) & (df['Status'].isin(['Open', 'Close', 'Dist.']))].copy()
+			soe_ctrl = soe_by_bay[(soe_by_bay['Element'].isin(self.rc_element)) & (soe_by_bay['Status'].isin(['Open', 'Close', 'Dist.']))].copy()
 			soe_ctrl['RC Order'] = np.where((soe_ctrl['Element'].isin(self.rc_element)) & (soe_ctrl['Tag'].isin(self.order_tags)), 'REMOTE', '')
 			soe_ctrl['RC Feedback'] = ''
 			soe_ctrl['Comment'] = ''
-
 			# Split into DataFrames for each purposes, not reset index
 			self.soe_ctrl = soe_ctrl
-			self.soe_cd = df[df['Element']=='CD'].copy()
-			self.soe_lr = df[df['Element']=='LR'].copy()
-			self.soe_sync = df[df['Element']=='CSO'].copy()
-			self.soe_prot = df[df['Element'].isin(['CBTR', 'MTO'])].copy()
+			self.soe_cd = soe_by_bay[soe_by_bay['Element']=='CD'].copy()
+			self.soe_lr = soe_by_bay[soe_by_bay['Element']=='LR'].copy()
+			self.soe_sync = soe_by_bay[soe_by_bay['Element']=='CSO'].copy()
+			self.soe_prot = soe_by_bay[soe_by_bay['Element'].isin(['CBTR', 'MTO'])].copy()
+			return df
 		else:
-			self._is_valid = False
-			raise ValueError('Dataframe tidak valid')
+			raise ProcessError('SOEAnalyzeError', 'Input data tidak valid.', f'soe_all={type(self.soe_all)}')
 
-	def get_rcd_result(self, df:pd.DataFrame, bay:Union[list, tuple]):
-		"""
-		"""
+	def get_rcd_result(self, df: pd.DataFrame, bay: SOEBay) -> Tuple[ListLikeDataFrame, CellUpdate]:
+		"""Analyze all RCD events.
 
+		Args:
+			df : dataframe source
+			bay : couple of bay name
+
+		Result:
+			List of dict-like RC information and dict of values tobe updated in SOE
+		"""
 		b1, b2, b3 = bay
-		df_bay = df[(df['B1']==b1) & (df['B2']==b2) & (df['B3']==b3)]
-		iorder_list = df_bay.loc[df_bay['Tag'].isin(self.order_tags)].index.values
-
+		df_bay: pd.DataFrame = df[(df['B1']==b1) & (df['B2']==b2) & (df['B3']==b3)]
+		iorder_list: np.ndarray = df_bay.loc[df_bay['Tag'].isin(self.order_tags)].index.values
+		bay_rcd: ListLikeDataFrame = list()
+		soe_upd: CellUpdate = dict()
+		buffer1: Dict[KeyPair, List[int]] = dict()
+		buffer2: Dict[KeyPair, List[int]] = dict()
 		# No RCD for this bay, skip check
 		if len(iorder_list)==0: return bay_rcd
-
 		date_origin = df_bay.loc[iorder_list[0], 'Time stamp']
-		bay_rcd = list()
-		soe_upd = dict()
-		buffer1 = dict()
-		buffer2 = dict()
 
-		def find_status(iorder:int, ifback:int, istatus:int, status_anomaly:bool=False):
+		def find_status(iorder: int, ifback: int, istatus: int, status_anomaly: bool = False):
 			row_order = df_bay.loc[iorder]
 			row_status = df_bay.loc[istatus]
 			t_delta = get_execution_duration(row_order, row_status)
@@ -554,9 +196,9 @@ class _SOEAnalyzer:
 			if row_status['Status']==rc_sts or status_anomaly:
 				# Valid status or anomaly
 				if lr_st=='Remote' and t_delta<=self.t_monitor[rc_elm]:
-					txt_res = f'Potensi RC sukses {"tapi status " + rc_sts + " anomali" if status_anomaly else ""} ({t_delta}s){txt_sts}'
+					txt_res = f'Potensi RC sukses{" tapi status " + rc_sts + " anomali" if status_anomaly else ""} ({t_delta}s){" " + txt_sts if txt_sts else ""}'
 				else:
-					txt_res = f'Eksekusi lokal GI {"tapi status " + rc_sts + " anomali" if status_anomaly else ""} {txt_sts}'
+					txt_res = f'Eksekusi lokal GI{" tapi status " + rc_sts + " anomali" if status_anomaly else ""}{" " + txt_sts if txt_sts else ""}'
 			else:
 				# Inverted status occured
 				if lr_st=='Remote' and t_delta<=self.t_monitor[rc_elm]:
@@ -577,7 +219,7 @@ class _SOEAnalyzer:
 
 			return idx_last, txt_res
 
-		def annotate_repetition(key:tuple):
+		def annotate_repetition(key: Tuple):
 			for m in range(len(buffer1[key])):
 				if m==len(buffer1[key])-1:
 					comment_text = f'Percobaan RC ke-{m+1} (terakhir)'
@@ -731,7 +373,7 @@ class _SOEAnalyzer:
 						soe_comment.append(txt_ifs_after_rc)
 
 				# Only Tag [OR, O*, RC, R*, ""] would pass
-				df_failed = df_range[(join_datetime(df_range['System time stamp'], df_range['System milliseconds'])>t_order) & ((df_range['Tag'].isin(self.order_tags + ['RC', 'R*'])) | (df_range['Tag']==''))]
+				df_failed = df_range[(join_datetime(df_range['System time stamp'], df_range['System milliseconds'])>t_order) & ((df_range['Tag'].isin(list(self.order_tags) + ['RC', 'R*'])) | (df_range['Tag']==''))]
 
 				# Check for normal status occurences
 				if df_failed[(df_failed['Status'].isin(['Close', 'Open'])) & (df_failed['Tag']=='')].shape[0]>0:
@@ -841,97 +483,108 @@ class _SOEAnalyzer:
 
 		return bay_rcd, soe_upd
 
-	def analyze_rcd_concurrently(self, df:pd.DataFrame, bays:list):
+	def analyze_rcd_bays(self, df: pd.DataFrame, bays: List[SOEBay], *args, **kwargs) -> Tuple[ListLikeDataFrame, CellUpdate]:
+		"""Run analyze RCD of bays.
+
+		Args:
+			df : dataframe
+			bays : list of bay name
+
+		Result:
+			Pair of RC list and dict of SOE update
 		"""
+		rcd_list: ListLikeDataFrame = list()
+		soe_dict: CellUpdate = dict()
+		## Using simple synchronous program, execution improvement upto 3.3x
+		## In this case, Simple synchronous program will minimize overhead compared with ThreadPoolExecutor
+		for bay in bays:
+			bay_rcd, soe_upd = self.get_rcd_result(df, bay)
+			rcd_list += bay_rcd
+			soe_dict.update(soe_upd)
+
+		return rcd_list, soe_dict
+
+	def analyze_rcd_multiprocess(self, df: pd.DataFrame, bays: List[SOEBay], callback: Optional[Callable] = None, *args, **kwargs) -> Tuple[ListLikeDataFrame, CellUpdate]:
+		"""Run analyze with multiple Processes.
+
+		Args:
+			df : dataframe
+			bays : list of bay name
+
+		Result:
+			Pair of RC list and dict of SOE update
 		"""
-
-		with ThreadPoolExecutor(len(bays)) as tpe:
-			rcd_list = list()
-			soe_dict = dict()
-			futures = [tpe.submit(self.get_rcd_result, df, bay) for bay in bays]
-
-			for future in futures:
-				bay_rcd, soe_upd = future.result()
-				rcd_list += bay_rcd
-				soe_dict.update(soe_upd)
-
-			return rcd_list, soe_dict
-
-	def fast_analyze(self, start:datetime.datetime=None, stop:datetime.datetime=None, **kwargs):
-		"""
-		Analyzed every RC of bays concurrently.
-		"""
-
-		gc.collect()
-		# Can be filtered with date
-		if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
-			t0, t1 = self._set_range(start=start, stop=stop)
+		data_list: ListLikeDataFrame = list()
+		soe_update: CellUpdate = dict()
+		n = kwargs.get('nprocess', os.cpu_count())
+		chunksize = kwargs.get('chunksize', len(bays)//n + 1)	# The fastest process duration proven from some tests
+		if callable(callback):
+			cb = callback
 		else:
-			t0, t1 = self._set_range(start=self.soe_all['Time stamp'].min(), stop=self.soe_all['Time stamp'].max())
-
-		bay_list = self.get_bays()
-		df = self.soe_all[(self.soe_all['Time stamp']>=t0) & (self.soe_all['Time stamp']<=t1)]
-		n = 8
-		chunksize = len(bay_list)//n + 1	# The fastest process duration proven from some tests
-		# chunksize = 1
-		data_list = list()
-
-		print(f'\nMenganalisa {self.get_order_count()} event RC...')
-		# ProcessPoolExecutor create new instance on different processes, so modifying instance in each process will not change instance in main process
-		with ProcessPoolExecutor(max_workers=n) as ppe:
+			cb = progress_bar
+		# ProcessPoolExecutor create new instance on different processes, so modifying instance in each process will not change instance in main process. Value returned must be "serializable".
+		with ProcessPoolExecutor(n) as ppe:
 			futures = list()
-			soe_update = dict()
 
-			for i in range(0, len(bay_list), chunksize):
-				bays = bay_list[i:(i+chunksize)]
-				future = ppe.submit(self.analyze_rcd_concurrently, df, bays)
+			for i in range(0, len(bays), chunksize):
+				bay_segment = bays[i:(i+chunksize)]
+				future = ppe.submit(self.analyze_rcd_bays, df, bay_segment)
 				futures.append(future)
 
 			for x, future in enumerate(as_completed(futures)):
-				progress_bar((x+1)/len(futures))
 				result_list, soe_dict = future.result()
 				data_list.extend(result_list)
 				soe_update.update(soe_dict)
+				self.progress.update(len(result_list)/self.get_order_count())
+				# Call callback function
+				cb(value=(x+1)/len(futures), name='analyze')
 
-		for cell in soe_update:
-			val = soe_update[cell]
+		return data_list, soe_update
 
-			if isinstance(val, (list, tuple)):
-				self.soe_ctrl.loc[cell[0], cell[1]] = '\n'.join([s for s in val if s])
-			else:
-				self.soe_ctrl.loc[cell[0], cell[1]] = val
+	def analyze_rcd_synchronous(self, df: pd.DataFrame, bays: List[SOEBay], callback: Optional[Callable] = None, *args, **kwargs) -> Tuple[ListLikeDataFrame, CellUpdate]:
+		"""Run analyze synchronously.
 
-		# Create new DataFrame from list of dict data
-		df_rcd = pd.DataFrame(data=data_list).sort_values(['Order Time'], ascending=[True]).reset_index(drop=True)
-		self.rc_list = data_list
-		self.post_process = pd.concat([self.soe_ctrl, self.soe_lr, self.soe_cd, self.soe_sync, self.soe_prot, self.soe_ifs], copy=False).drop_duplicates(keep='first').sort_values(['Time stamp', 'Milliseconds'])
-		self._analyzed = True
+		Args:
+			df : dataframe
+			bays : list of bay name
 
-		return df_rcd[RCD_COLUMNS + ['Navigation']]
-
-	def analyze(self, start:datetime.datetime=None, stop:datetime.datetime=None, **kwargs):
+		Result:
+			Pair of RC list and dict of SOE update
 		"""
-		Analyzed every RC of bays concurrently.
-		"""
-
-		gc.collect()
-		# Can be filtered with date
-		if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
-			t0, t1 = self._set_range(start=start, stop=stop)
+		data_list: ListLikeDataFrame = list()
+		soe_update: CellUpdate = dict()
+		if callable(callback):
+			cb = callback
 		else:
-			t0, t1 = self._set_range(start=self.soe_all['Time stamp'].min(), stop=self.soe_all['Time stamp'].max())
+			cb = progress_bar
 
-		bay_list = self.get_bays()
-		df = self.soe_all[(self.soe_all['Time stamp']>=t0) & (self.soe_all['Time stamp']<=t1)]
-		data_list = list()
-		soe_update = dict()
-
-		print(f'\nMenganalisa {self.get_order_count()} event RC...')
-		for x, bay in enumerate(bay_list):
-			progress_bar((x+1)/len(bay_list))
+		for x, bay in enumerate(bays):
 			result_list, soe_dict = self.get_rcd_result(df, bay)
 			data_list.extend(result_list)
 			soe_update.update(soe_dict)
+			# Call callback function
+			cb(value=(x+1)/len(bays), name='analyze')
+
+		return data_list, soe_update
+
+	def run_analyze_with_function(self, fn: Callable, *args, **kwargs) -> pd.DataFrame:
+		"""Run RC analyze with given function.
+
+		Args:
+			fn : function which will be used to run analyze
+
+		Result:
+			Dataframe of RC events
+		"""
+		# Pre-analyze initialization
+		self.init_analyze()
+		df = self.soe_setup(**kwargs)
+		bay_list = self.get_bays()
+		self.progress.init('Analisa RC', raw_max_value=self.get_order_count())
+		# Result variable
+		print(f'\nMenganalisa {self.get_order_count()} event RC...')
+		# Execute given function
+		data_list, soe_update = fn(df=df, bays=bay_list, *args, **kwargs)
 
 		for cell in soe_update:
 			val = soe_update[cell]
@@ -946,27 +599,97 @@ class _SOEAnalyzer:
 		self.rc_list = data_list
 		self.post_process = pd.concat([self.soe_ctrl, self.soe_lr, self.soe_cd, self.soe_sync, self.soe_prot, self.soe_ifs], copy=False).drop_duplicates(keep='first').sort_values(['Time stamp', 'Milliseconds'])
 		self._analyzed = True
-
 		return df_rcd[RCD_COLUMNS + ['Navigation']]
 
-	def check_enable_status(self, **data:dict):
-		"""
-		Check CD status on an event parameterized in a dict (data), then return CD status and CD quality into one set.
-		* INPUT
-		data : dict of an event, required field [System Timestamp, B1]
-		* OUTPUT
-		cd_status :
-		cd_quality :
-		* SET
-		cd_qualities :
-		"""
+	def fast_analyze(self, start: Optional[datetime.datetime] = None, stop: Optional[datetime.datetime] = None, *args, **kwargs) -> pd.DataFrame:
+		"""Optimized RC analyze function using multiple Process.
 
+		Args:
+			start : oldest date limit
+			stop : newest date limit
+
+		Result:
+			Dataframe of RC events
+		"""
+		return self.run_analyze_with_function(self.analyze_rcd_multiprocess, *args, start=start, stop=stop, **kwargs)
+
+	def analyze(self, start: Optional[datetime.datetime] = None, stop: Optional[datetime.datetime] = None, *args, **kwargs) -> pd.DataFrame:
+		"""Basic RC analyze function.
+
+		Args:
+			start : oldest date limit
+			stop : newest date limit
+
+		Result:
+			Dataframe of RC events
+		"""
+		return self.run_analyze_with_function(self.analyze_rcd_synchronous, *args, start=start, stop=stop, **kwargs)
+
+	async def async_analyze(self, start: Optional[datetime.datetime] = None, stop: Optional[datetime.datetime] = None, *args, **kwargs) -> pd.DataFrame:
+		"""Asynchronous RC analyzer function using multiple Process to work concurrently.
+
+		Args:
+			start : oldest date limit
+			stop : newest date limit
+
+		Result:
+			Dataframe of RC events
+		"""
+		# Result variable
+		data_list: ListLikeDataFrame = list()
+		soe_update: CellUpdate = dict()
+
+		def done(_f: asyncio.Future):
+			result_list, soe_dict = _f.result()
+			data_list.extend(result_list)
+			soe_update.update(soe_dict)
+			self.progress.update(len(data_list)/self.get_order_count())
+
+		# Pre-analyze initialization
+		self.init_analyze()
+		df = self.soe_setup(start=start, stop=stop, **kwargs)
+		bay_list = self.get_bays()
+		n = kwargs.get('nprocess', os.cpu_count())
+		chunksize = kwargs.get('chunksize', len(bay_list)//n + 1)	# The fastest process duration proven from some tests
+		self.progress.init('Menganalisa RC', raw_max_value=self.get_order_count())
+
+		async with asyncio.TaskGroup() as tg:
+			for i in range(0, len(bay_list), chunksize):
+				bay_segment = bay_list[i:(i+chunksize)]
+				task = tg.create_task(run_cpu_bound(self.analyze_rcd_bays, df, bay_segment))
+				task.add_done_callback(done)
+
+		for cell in soe_update:
+			val = soe_update[cell]
+
+			if isinstance(val, (list, tuple)):
+				self.soe_ctrl.loc[cell[0], cell[1]] = '\n'.join([s for s in val if s])
+			else:
+				self.soe_ctrl.loc[cell[0], cell[1]] = val
+
+		# Create new DataFrame from list of dict data
+		df_rcd = pd.DataFrame(data=data_list).sort_values(['Order Time'], ascending=[True]).reset_index(drop=True)
+		self.rc_list = data_list
+		self.post_process = pd.concat([self.soe_ctrl, self.soe_lr, self.soe_cd, self.soe_sync, self.soe_prot, self.soe_ifs], copy=False)\
+			.drop_duplicates(keep='first')\
+			.sort_values(['Time stamp', 'Milliseconds'])
+		self._analyzed = True
+		return df_rcd[RCD_COLUMNS + ['Navigation']]
+
+	def check_enable_status(self, **data) -> Tuple[str, str]:
+		"""Check CD (Control Disable) status on an event parameterized in a dict (data).
+
+		Args:
+			data : must contains t1 & b1
+
+		Result:
+			CD status and CD quality
+		"""
 		# Initialize
 		cd_status = 'Enable'
 		b1 = data['b1']
 		t_ord = data['t1']
 		df_cd = self.soe_cd[(self.soe_cd['B1']==b1) & (self.soe_cd['Element']=='CD') & (self.soe_cd['Tag']=='')]
-
 		# Check CD quality in program buffer
 		if b1 in self.cd_qualities:
 			cd_quality = self.cd_qualities[b1]
@@ -984,12 +707,12 @@ class _SOEAnalyzer:
 				cd_quality = 'uncertain'
 
 			# Save in buffer
-			self._cd_qualities[b1] = cd_quality
+			self.cd_qualities[b1] = cd_quality
 
 		if cd_quality in ['good', 'bad']:
 			# If quality good, filter only valid status
 			if cd_quality=='good': df_cd = df_cd[df_cd['Status'].isin(['Enable', 'Disable'])]
-			
+
 			if df_cd[join_datetime(df_cd['System time stamp'], df_cd['System milliseconds'])<t_ord].shape[0]>0:
 				# CD status changes occured before
 				cd_last_change = df_cd[join_datetime(df_cd['System time stamp'], df_cd['System milliseconds'])<t_ord].iloc[-1]
@@ -998,20 +721,18 @@ class _SOEAnalyzer:
 				# CD status changes occured after
 				cd_first_change = df_cd[join_datetime(df_cd['System time stamp'], df_cd['System milliseconds'])>=t_ord].iloc[0]
 				cd_status = 'Disable' if cd_first_change['Status']=='Enable' else 'Enable'
-				
+
 		return cd_status, cd_quality
 
-	def check_ifs_status(self, **data:dict):
-		"""
-		Check IFS status on an event parameterized in a dict (data), then return IFS status and IFS name into one set.
-		* INPUT
-		data : dict of an event, required field [System Timestamp, B1]
-		name_dict : dict of name matching between name in SOE event messages field B1 and name in IFS event messages field B3
-		* OUTPUT
-		ifs_status :
-		ifs_name :
-		"""
+	def check_ifs_status(self, **data) -> Tuple[str, str]:
+		"""Check IFS status on an event parameterized in a dict (data).
 
+		Args:
+			data : must contains t1 & b1
+
+		Result:
+			IFS status and IFS name
+		"""
 		# Initialize
 		t_hyst = 2*60
 		ifs_status = 'Up'
@@ -1037,15 +758,15 @@ class _SOEAnalyzer:
 
 		return ifs_status, ifs_name
 
-	def check_protection_interlock(self, **data:dict):
-		"""
-		Check protection status on an event parameterized in a dict (data), then return active protection or "" (empty string) if none.
-		* INPUT
-		data : dict of an event, required field [System Timestamp, B1, B2, B3]
-		* OUTPUT
-		active_prot
-		"""
+	def check_protection_interlock(self, **data) -> str:
+		"""Check protection signal on an event parameterized in a dict (data).
 
+		Args:
+			data : must contains t1, b1, b2, b3
+
+		Result:
+			Active protection signal
+		"""
 		# Initialize
 		active_prot = ''
 		index = -1
@@ -1064,18 +785,15 @@ class _SOEAnalyzer:
 
 		return active_prot
 
-	def check_remote_status(self, **data:dict):
-		"""
-		Check LR status on an event parameterized in a dict (data), then return LR status and LR quality into one set.
-		* INPUT
-		data : dict of an event, required field [System Timestamp, B1, B2, B3]
-		* OUTPUT
-		lr_status :
-		lr_quality :
-		* SET
-		lr_qualities : dict that store checked LR quality
-		"""
+	def check_remote_status(self, **data) -> Tuple[str, str]:
+		"""Check LR (Local/Remote) status on an event parameterized in a dict (data).
 
+		Args:
+			data : must contains t1, b1, b2, b3
+
+		Result:
+			LR status and LR quality
+		"""
 		# Initialize
 		lr_status = 'Remote'
 		t_ord = data['t1']
@@ -1083,7 +801,6 @@ class _SOEAnalyzer:
 		b2 = data['b2']
 		b3 = data['b3']
 		df_lr = self.soe_lr[(self.soe_lr['Tag']=='') & (self.soe_lr['B1']==b1) & (self.soe_lr['B2']==b2) & (self.soe_lr['B3']==b3) & (self.soe_lr['Element']=='LR')]
-
 		# Check LR quality in program buffer
 		if (b1, b2, b3) in self.lr_qualities:
 			lr_quality = self.lr_qualities[(b1, b2, b3)]
@@ -1099,9 +816,8 @@ class _SOEAnalyzer:
 			else:
 				# LR quality unknown, no status changes occured
 				lr_quality = 'uncertain'
-
 			# Save in buffer
-			self._lr_qualities[(b1, b2, b3)] = lr_quality
+			self.lr_qualities[(b1, b2, b3)] = lr_quality
 
 		if lr_quality in ['good', 'bad']:
 			# If quality good, filter only valid status
@@ -1118,18 +834,15 @@ class _SOEAnalyzer:
 
 		return lr_status, lr_quality
 
-	def check_synchro_interlock(self, **data:dict):
-		"""
-		Check CSO status on an event parameterized in a dict (data), then return CSO status and CSO quality into one set.
-		* INPUT
-		data : dict of an event, required field [System Timestamp, B1, B2, B3]
-		* OUTPUT
-		cso_status :
-		cso_quality :
-		* SET
-		cso_qualities :
-		"""
+	def check_synchro_interlock(self, **data) -> Tuple[str, str]:
+		"""Check CSO (Check Synchro Override) status on an event parameterized in a dict (data).
 
+		Args:
+			data : must contains t1, b1, b2, b3
+
+		Result:
+			CSO status and CSO quality
+		"""
 		# Initialize
 		cso_status = 'Off'
 		t_ord = data['t1']
@@ -1153,9 +866,8 @@ class _SOEAnalyzer:
 			else:
 				# CSO quality unknown, no status changes occured
 				cso_quality = 'uncertain'
-
 			# Save in buffer
-			self._cso_qualities[(b1, b2, b3)] = cso_quality
+			self.cso_qualities[(b1, b2, b3)] = cso_quality
 
 		if cso_quality in ['good', 'bad']:
 			# If quality good, filter only valid status
@@ -1172,65 +884,30 @@ class _SOEAnalyzer:
 
 		return cso_status, cso_quality
 
-	def get_bays(self):
-		"""
-		"""
-
+	def get_bays(self) -> np.ndarray:
+		"""Get unique bay name as list."""
 		columns = ['B1', 'B2', 'B3']
 		df = self.soe_all
-		unique_bays = df.loc[(df['A']=='') & (df['Element'].isin(self.rc_element)) & (df['Tag'].isin(self.order_tags)) & (df['Time stamp']>=self._t0) & (df['Time stamp']<=self._t1), columns].drop_duplicates(subset=columns, keep='first')
-
+		t0, t1 = self.get_range()
+		unique_bays = df.loc[(df['A']=='') & (df['Element'].isin(self.rc_element)) & (df['Tag'].isin(self.order_tags)) & (df['Time stamp']>=t0) & (df['Time stamp']<=t1), columns].drop_duplicates(subset=columns, keep='first')
 		return unique_bays.values
 
-	def get_order_count(self):
-		"""
-		"""
+	def get_order_count(self) -> int:
+		"""Get total RC order."""
+		return self.get_orders().shape[0]
 
-		df = self.soe_all
-		# Get His. Messages with order tag only
-		count = df[(df['A']=='') & (df['Element'].isin(self.rc_element)) & (df['Tag'].isin(self.order_tags)) & (df['Time stamp']>=self._t0) & (df['Time stamp']<=self._t1)].shape[0]
-
-		return count
-
-	def get_orders(self, start:datetime.datetime=None, stop:datetime.datetime=None):
-		"""
-		"""
-
+	def get_orders(self) -> pd.DataFrame:
+		"""Get RC order-tagged only from source."""
 		df = self.soe_all.copy()
-		# Can be filtered with date
-		if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
-			t0, t1 = self._set_range(start=start, stop=stop)
-		else:
-			t0, t1 = self._set_range(start=df['Time stamp'].min(), stop=df['Time stamp'].max())
-
+		t0, t1 = self.get_range()
 		# Get His. Messages with order tag only
 		orders = df[(df['A']=='') & (df['Element'].isin(self.rc_element)) & (df['Tag'].isin(self.order_tags)) & (df['Time stamp']>=t0) & (df['Time stamp']<=t1)]
-
 		return orders
+
 
 	@property
 	def analyzed(self):
 		return self._analyzed
-
-	@property
-	def b1_list(self):
-		return self._b1_list
-
-	@property
-	def b2_list(self):
-		return self._b2_list
-
-	@property
-	def b3_list(self):
-		return self._b3_list
-
-	@property
-	def cd_qualities(self):
-		return self._cd_qualities
-
-	@property
-	def cso_qualities(self):
-		return self._cso_qualities
 
 	@property
 	def feedback_tags(self):
@@ -1238,11 +915,7 @@ class _SOEAnalyzer:
 
 	@property
 	def highest_index(self):
-		return self._highest_index
-
-	@property
-	def ifs_list(self):
-		return self._ifs_list
+		return getattr(self, '_highest_index', None)
 
 	@property
 	def is_valid(self):
@@ -1250,122 +923,111 @@ class _SOEAnalyzer:
 
 	@property
 	def lowest_index(self):
-		return self._lowest_index
-
-	@property
-	def lr_qualities(self):
-		return self._lr_qualities
+		return getattr(self, '_lowest_index', None)
 
 	@property
 	def order_tags(self):
 		return self._order_tags
 
-	@property
-	def rc_indexes(self):
-		return self._rc_indexes
 
+class _RCDBaseCalculation(BaseAvailability):
+	"""Base class for Success Remote Control (RCD) SCADA calculation.
 
-class _RCDBaseCalculation:
-	name = 'Remote Control SCADA'
-	keep_duplicate = 'last'
-	threshold_variable = 1
+	Args:
+		data : analyzed data input
 
-	def __init__(self, data:pd.DataFrame=None, calculate_bi:bool=False, check_repetition:bool=True, **kwargs):
-		self._mro = self.__class__.__mro__
+	Accepted kwargs:
+		**
+	"""
+	name: str = 'Remote Control SCADA'
+	threshold_variable: int = 1
+	rcd_all: pd.DataFrame
+	station: pd.DataFrame
+	bay: pd.DataFrame
+	operator: pd.DataFrame
+
+	def __init__(self, data: Optional[pd.DataFrame] = None, calculate_bi: bool = False, check_repetition: bool = True, **kwargs):
+		self._calculated: bool = False
+		self.check_repetition: bool = check_repetition
+		self.rc_element: List[str] = ['CB']
+		self.rcd_all = data
+		if calculate_bi: self.rc_element += ['BI1', 'BI2']
+		super().__init__(**kwargs)
+
+	def initialize(self) -> None:
+		"""Re-initiate parameter"""
+		self.init_calculate()
+		super().initialize()
+
+	def init_calculate(self) -> None:
+		"""Re-initiate parameter"""
 		self._calculated = False
-		self.check_repetition = check_repetition
 		self.station = None
 		self.bay = None
 		self.operator = None
-		self.rc_element = ['CB']
-
-		if calculate_bi: self.rc_element += ['BI1', 'BI2']
-
-		if data is not None: self.rcd_all = data
-
-		# if hasattr(self, 'rcd_all'): self.calculate(start=kwargs.get('start'), stop=kwargs.get('stop'))
 
 	@calc_time
-	def _calculate(self, start:datetime.datetime, stop:datetime.datetime, force:bool=False, fast:bool=True, **kwargs):
-		"""
-		Extension of _calculate function.
-		"""
+	def _calculate(self, **kwargs) -> CalcResult:
+		"""Base of calculation process.
 
-		if not hasattr(self, 'rcd_all') or force:
-			# Must be analyzed first and pass to rcd_all
-			fn1 = getattr(self, 'fast_analyze', None)
-			fn2 = getattr(self, 'analyze', None)
-			if callable(fn1) and fast:
-				self.rcd_all = fn1(start=start, stop=stop, **kwargs)
-			elif callable(fn2):
-				self.rcd_all = fn2(start=start, stop=stop, **kwargs)
-			else:
-				raise AttributeError('Atttribute error.', name='fast_analyze() / analyze()', obj=self.__class__.__name__)
+		Result:
+			Calculation summary as dict
+		"""
+		start = kwargs.get('start')
+		stop = kwargs.get('stop')
 
 		if isinstance(self.rcd_all, pd.DataFrame):
 			# Can be filtered with date
 			if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
-				t0, t1 = self._set_range(start=start, stop=stop)
+				t0, t1 = self.set_range(start=start, stop=stop)
 			else:
-				t0, t1 = self._set_range(start=self.rcd_all['Order Time'].min(), stop=self.rcd_all['Order Time'].max())
+				# Parameter start or stop is not valid datetime or None
+				t0, t1 = self.set_range(start=self.rcd_all['Order Time'].min(), stop=self.rcd_all['Order Time'].max())
 		else:
 			raise AttributeError('Data input tidak valid.', name='rcd_all', obj=self)
 
-		print(f'\nMenghitung RC tanggal {t0.strftime("%d-%m-%Y")} s/d {t1.strftime("%d-%m-%Y")}...')
 		result = self.get_result(**kwargs)
-
 		return result
 
-	def _rcd_setup(self, df:pd.DataFrame, **kwargs):
-		"""
-		"""
+	def calculate(self, start: Optional[datetime.datetime] = None, stop: Optional[datetime.datetime] = None, *args, **kwargs) -> CalcResult:
+		"""Calculate RCD availability.
 
-		prepared = df.copy()
+		Args:
+			start : oldest date limit
+			stop : newest date limit
 
+		Result:
+			Calculation result as dict and process duration time
+		"""
+		self.init_calculate()
+		result, t = self._calculate(start=start, stop=stop, **kwargs)
+		self.result = result
+		self._process_date = datetime.datetime.now()
+		self._process_duration = round(t, 3)
+		return result
+
+	def rcd_setup(self, **kwargs) -> pd.DataFrame:
+		"""Apply sorting and filtering on "rcd_all" to get cleaned data."""
+		t0, t1 = self.get_range()
+		prepared = self.rcd_all[(self.rcd_all['Order Time']>=t0) & (self.rcd_all['Order Time']<=t1)].copy()
 		# Filter only rows with not unused-marked
 		prepared = prepared.loc[prepared['Marked Unused']=='']
-
 		# Filter only rows without repetition-marked
 		if self.check_repetition:
 			prepared = prepared.loc[prepared['Rep. Flag']=='']
-
 		return prepared
 
-	def _set_attr(self, **kwargs):
+	def generate_reference(self, soe: pd.DataFrame, rcd: pd.DataFrame) -> np.ndarray:
+		"""Create excel hyperlink of each RC event in sheet "RC_ONLY" to cell range in sheet "HIS_MESSAGES".
+
+		Args:
+			soe : dataframe of SOE
+			rcd : dataframe of RCD
+
+		Result:
+			List of excel hyperlink
 		"""
-		"""
-
-		for key, val in kwargs.items():
-			setattr(self, key, val)
-
-	def _set_range(self, start:datetime.datetime, stop:datetime.datetime):
-		"""
-		Set start and stop date of query data.
-		"""
-
-		dt0 = start.replace(hour=0, minute=0, second=0, microsecond=0)
-		dt1 = stop.replace(hour=23, minute=59, second=59, microsecond=999999)
-
-		self._t0 = dt0
-		self._t1 = dt1
-
-		return dt0, dt1
-
-	def calculate(self, start:datetime.datetime=None, stop:datetime.datetime=None, force:bool=False, fast:bool=True, **kwargs):
-		"""
-		Extension of _calculate function.
-		"""
-
-		self.result, t = self._calculate(start=start, stop=stop, force=force, fast=fast, **kwargs)
-		self._process_date = datetime.datetime.now()
-		self._process_duration = round(t, 3)
-		print(f'Perhitungan selesai. (durasi={t:.2f}s, error=0)')
-
-	def generate_reference(self, soe:pd.DataFrame, rcd:pd.DataFrame):
-		"""
-		"""
-
-		navs = []
+		navs = list()
 		errors = 0
 
 		try:
@@ -1381,26 +1043,12 @@ class _RCDBaseCalculation:
 			errors += 1
 
 		if errors>0: print(f'Terjadi {errors} error saat generate hyperlink.')
-
 		return np.array(navs)
 
-	def get_result(self, **kwargs):
-		"""
-		Get aggregate data as per Station, Bay, and Operator, then return list of Excel worksheet name and Dataframe wrapped into dictionaries.
-		* INPUT
-		df : Dataframe of the analyzed RC result
-		* OUTPUT
-		summary : Immutable dictionary
-		* SET
-		station : Dataframe of grouped by Station (B1)
-		bay : Dataframe of grouped by Bay (B1, B2, B3)
-		operator : Dataframe of grouped by Dispatcher (Operator)
-		"""
-
-		def div(x, y, default:int=0):
-			"""
-			Formula : <x>/<y>, if error return <default> value
-			"""
+	def get_result(self, **kwargs) -> CalcResult:
+		"""Get aggregate data as per Station, Bay, and Operator, then return list of Excel worksheet name and Dataframe wrapped into dictionaries."""
+		def div(x, y, default: int = 0):
+			"""Formula : <x>/<y>, if error return <default> value."""
 			try:
 				if y==0:
 					z = default
@@ -1410,25 +1058,26 @@ class _RCDBaseCalculation:
 				z = default
 			return z
 
-		df = self.rcd_all.loc[(self.rcd_all['Order Time']>=self.t0) & (self.rcd_all['Order Time']<=self.t1)]
-		df_pre = self._rcd_setup(df)
+		t0, t1 = self.get_range()
+		df_range = self.rcd_all.loc[(self.rcd_all['Order Time']>=t0) & (self.rcd_all['Order Time']<=t1)]
+		df_used = self.rcd_setup()
 
-		self.pre_process = df
-		self.station = self.group_station(df_pre)
-		self.bay = self.group_bay(df_pre)
-		self.operator = self.group(df_pre, ['Operator'])
+		self.pre_process = df_range
+		self.station = self.group_station(df_used)
+		self.bay = self.group_bay(df_used)
+		self.operator = self.group(df_used, ['Operator'])
 		self._calculated = True
 
 		# Calculate overall success rate
-		rc_all = df.shape[0]
-		rc_unused = df[df['Marked Unused']=='*'].shape[0]
-		rc_valid = df_pre.shape[0]
-		rc_repetition = df[df['Rep. Flag']=='*'].shape[0]
-		rc_close = df_pre[df_pre['Status']=='Close'].shape[0]
-		rc_open = df_pre[df_pre['Status']=='Open'].shape[0]
-		rc_marked = df[(df['Marked Unused']=='*') | (df['Marked Success']=='*') | (df['Marked Failed']=='*')].shape[0]
-		rc_marked_failed = df[df['Marked Failed']=='*'].shape[0]
-		rc_marked_success = df[df['Marked Success']=='*'].shape[0]
+		rc_all = df_range.shape[0]
+		rc_unused = df_range[df_range['Marked Unused']=='*'].shape[0]
+		rc_valid = df_used.shape[0]
+		rc_repetition = df_range[df_range['Rep. Flag']=='*'].shape[0]
+		rc_close = df_used[df_used['Status']=='Close'].shape[0]
+		rc_open = df_used[df_used['Status']=='Open'].shape[0]
+		rc_marked = df_range[(df_range['Marked Unused']=='*') | (df_range['Marked Success']=='*') | (df_range['Marked Failed']=='*')].shape[0]
+		rc_marked_failed = df_range[df_range['Marked Failed']=='*'].shape[0]
+		rc_marked_success = df_range[df_range['Marked Success']=='*'].shape[0]
 		rc_failed = self.bay['RC Failed'].sum()
 		rc_failed_close = self.bay['Close Failed'].sum()
 		rc_failed_open = self.bay['Open Failed'].sum()
@@ -1438,7 +1087,6 @@ class _RCDBaseCalculation:
 		rc_percentage = round(div(rc_success, rc_valid)*100, 2)
 		rc_percentage_close = round(div(rc_success_close, rc_close)*100, 2)
 		rc_percentage_open = round(div(rc_success_open, rc_open)*100, 2)
-
 		return {
 			'overall': {
 				'total': rc_valid,
@@ -1470,44 +1118,52 @@ class _RCDBaseCalculation:
 			}
 		}
 
-	def group(self, df:pd.DataFrame, columns:list):
-		"""
-		Return DataFrame of aggregation values which used in all grouped Dataframe with groupby_columns as Columns parameter.
-		"""
+	def group(self, df: pd.DataFrame, columns: List) -> pd.DataFrame:
+		"""Base function to get aggregation values based on defined "columns".
 
+		Args:
+			df : data input
+			columns : list of columns as reference
+
+		Result:
+			Grouped data
+		"""
 		groupby_columns = columns + ['Final Result']
 		rc_count = df[groupby_columns].groupby(columns, as_index=False).count().rename(columns={'Final Result': 'RC Occurences'})
 		rc_success = df.loc[(df['Final Result']=='SUCCESS'), groupby_columns].groupby(columns, as_index=False).count().rename(columns={'Final Result': 'RC Success'})
 		rc_failed = df.loc[(df['Final Result']=='FAILED'), groupby_columns].groupby(columns, as_index=False).count().rename(columns={'Final Result': 'RC Failed'})
-
 		df_groupby = rc_count.merge(right=rc_success, how='left', on=columns).merge(right=rc_failed, how='left', on=columns).fillna(0)
 		df_groupby['Success Rate'] = np.round(df_groupby['RC Success']/df_groupby['RC Occurences'], 4)
-
 		return df_groupby
 
-	def group_station(self, df:pd.DataFrame):
-		"""
-		Return DataFrame for Station (columns = B1)
-		"""
+	def group_station(self, df:pd.DataFrame) -> pd.DataFrame:
+		"""Get aggregation values based on columns Station (B1).
 
+		Args:
+			df : data input
+
+		Result:
+			Grouped data
+		"""
 		columns = ['B1']
 		groupby_columns = columns + ['Execution (s)', 'Termination (s)', 'TxRx (s)']
 		df_groupby = self.group(df, columns)
-
 		df_tmp = df.loc[df['Final Result']=='SUCCESS', groupby_columns].groupby(columns, as_index=False).mean().round(3).rename(columns={'Execution (s)': 'Execution Avg.', 'Termination (s)': 'Termination Avg.', 'TxRx (s)': 'TxRx Avg.'})
 		df_groupby = df_groupby.merge(right=df_tmp, how='left', on=columns).fillna(0)
-
 		return df_groupby
 
-	def group_bay(self, df:pd.DataFrame):
-		"""
-		Return DataFrame for Bay (columns = B1, B2, B3)
-		"""
+	def group_bay(self, df:pd.DataFrame) -> pd.DataFrame:
+		"""Get aggregation values based on Bay columns reference (B1, B2, B3).
 
+		Args:
+			df : data input
+
+		Result:
+			Grouped data
+		"""
 		columns = ['B1', 'B2', 'B3']
 		groupby_columns = columns + ['Final Result']
 		df_groupby = None
-
 		# Assign column 'Open Success', 'Open Failed', 'Close Success', 'Close Failed'
 		for status in ['Open', 'Close']:
 			for result in ['Success', 'Failed']:
@@ -1519,14 +1175,10 @@ class _RCDBaseCalculation:
 		df_groupby['Contribution'] = df_groupby['RC Occurences'].map(lambda x: x/total_rc)
 		df_groupby['Reduction'] = df_groupby['RC Failed'].map(lambda y: y/total_rc)
 		df_groupby['Tagging'] = ''
-
 		return df_groupby
 
-	def prepare_export(self, generate_formula:bool=False, **kwargs):
-		"""
-		Applying excel formulas to output file
-		"""
-
+	def prepare_export(self, generate_formula: bool = False, **kwargs):
+		"""Apply excel formulas to output file."""
 		if not self.calculated: raise SyntaxError('Jalankan calculate() terlebih dahulu!')
 
 		forsurvalent = SurvalentFileReader in self.mro
@@ -1743,13 +1395,9 @@ class _RCDBaseCalculation:
 			'DISPATCHER': (df_opr, df_opr_result)
 		}
 
-	def print_result(self):
-		"""
-		Print summary in terminal
-		"""
-
+	def print_result(self) -> None:
+		"""Print summary in terminal."""
 		width, height = os.get_terminal_size()
-		
 		# Check if RC Event has been analyzed
 		if self.calculated==False:
 			return print('Tidak dapat menampilkan hasil Kalkulasi RC. Jalankan fungsi "calculate()" terlebih dahulu.')
@@ -1760,7 +1408,6 @@ class _RCDBaseCalculation:
 		df_bay['Success Rate'] = df_bay['Success Rate'].map(lambda x: round(x*100, 2))
 		df_dispa = self.operator.copy()
 		df_dispa['Success Rate'] = df_dispa['Success Rate'].map(lambda x: round(x*100, 2))
-
 		context = {
 			'date_end': self.t1.strftime("%d-%m-%Y"),
 			'date_start': self.t0.strftime("%d-%m-%Y"),
@@ -1777,82 +1424,167 @@ class _RCDBaseCalculation:
 		}
 		print(summary_template(**context))
 
-
 	@property
 	def calculated(self):
 		return self._calculated
 
 	@property
-	def mro(self):
-		return self._mro
-
-	@property
 	def process_date(self):
-		return self._process_date
+		return getattr(self, '_process_date', None)
 
 	@property
 	def process_duration(self):
-		return self._process_duration
-
-	@property
-	def t0(self):
-		return self._t0
-
-	@property
-	def t1(self):
-		return self._t1
+		return getattr(self, '_process_duration', None)
 
 
-class RCD(_Export, _RCDBaseCalculation):
+class RCD(_RCDBaseCalculation, _Export):
 
-	def __init__(self, data:pd.DataFrame=None, calculate_bi:bool=False, check_repetition:bool=True, **kwargs):
-		super().__init__(data, calculate_bi, check_repetition, **kwargs)
+	def __init__(self, data: Optional[pd.DataFrame] = None, calculate_bi: bool = False, check_repetition: bool = True, **kwargs):
+		kwargs.update(data=data, calculate_bi=calculate_bi, check_repetition=check_repetition)
+		super().__init__(**kwargs)
+
+	def calculate(self, start: Optional[datetime.datetime] = None, stop: Optional[datetime.datetime] = None, *args, **kwargs) -> CalcResult:
+		result = super().calculate(start, stop, *args, **kwargs)
+		print(f'Perhitungan RC {self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")} selesai. (durasi={self.process_duration:.2f}s, error={len(self.errors)})')
+		return result
+
+	async def async_calculate(self, start: Optional[datetime.datetime] = None, stop: Optional[datetime.datetime] = None, *args, **kwargs) -> CalcResult:
+		await asyncio.sleep(0)
+		self.progress.init('Menghitung RC')
+		result = super().calculate(start, stop, *args, **kwargs)
+		self.progress.update(1.0)
+		print(f'Perhitungan RC {self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")} selesai. (durasi={self.process_duration:.2f}s, error={len(self.errors)})')
+		return result
 
 
-class SOEtoRCD(_Export, _SOEAnalyzer, _RCDBaseCalculation):
+class SOEtoRCD(_RCDBaseCalculation, _SOEAnalyzer, _Export):
 
-	def __init__(self, data:pd.DataFrame=None, calculate_bi:bool=False, check_repetition:bool=True, **kwargs):
-		super().__init__(data, calculate_bi, check_repetition, **kwargs)
+	def __init__(self, data: Optional[pd.DataFrame] = None, calculate_bi: bool = False, check_repetition: bool = True, **kwargs):
+		kwargs.update(data=data, calculate_bi=calculate_bi, check_repetition=check_repetition)
+		super().__init__(**kwargs)
 
-	def prepare_export(self, generate_formula:bool=False, **kwargs):
+	def calculate(
+			self,
+			start: Optional[datetime.datetime] = None,
+			stop: Optional[datetime.datetime] = None,
+			force: bool = False,
+			fast: bool = True,
+			*args,
+			**kwargs
+		) -> CalcResult:
+
+		time_start = time.time()
+		fast_analyze = getattr(self, 'fast_analyze', None)
+		analyze = getattr(self, 'analyze', None)
+
+		if callable(fast_analyze) and fast:
+			self.rcd_all = fast_analyze(*args, force=force, **kwargs)
+		elif callable(analyze):
+			self.rcd_all = analyze(*args, force=force, **kwargs)
+		else:
+			raise AttributeError('Atttribute error.', name='fast_analyze() / analyze()', obj=self.__class__.__name__)
+
+		result = super().calculate(start, stop, *args, **kwargs)
+		delta_time = time.time() - time_start
+		self._process_duration = round(delta_time, 3)
+		print(f'Perhitungan RC {self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")} selesai. (durasi={delta_time:.2f}s, error={len(self.errors)})')
+		return result
+
+	async def async_calculate(
+			self,
+			start: Optional[datetime.datetime] = None,
+			stop: Optional[datetime.datetime] = None,
+			force: bool = False,
+			*args,
+			**kwargs
+		) -> CalcResult:
+		"""Coroutine of calculation function which used to work together with async_analyze.
+
+		Args:
+			start : oldest date limit
+			stop : newest date limit
+
+		Result:
+			Calculation result as dict and process duration time
 		"""
-		Applying excel formulas to output file
-		"""
+		time_start = time.time()
+		self.rcd_all = await self.async_analyze(*args, force=force, **kwargs)
+		self.progress.init('Menghitung RC')
+		result = super().calculate(start, stop, *args, **kwargs)
+		self.progress.update(1.0)
+		delta_time = time.time() - time_start
+		self._process_duration = round(delta_time, 3)
+		print(f'Perhitungan RC {self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")} selesai. (durasi={delta_time:.2f}s, error={len(self.errors)})')
+		return result
 
+	def prepare_export(self, generate_formula: bool = False, **kwargs):
+		"""Applying excel formulas to output file.
+
+		Args:
+			generate_formula : either formula will be generated or not
+
+		Result:
+			Dict of sheet name & data
+		"""
 		if not self.analyzed: raise SyntaxError('Jalankan calculate() terlebih dahulu!')
-
-		soe = self.post_process.loc[(self.post_process['Time stamp']>=self.t0) & (self.post_process['Time stamp']<=self.t1)]
-		# Define soe as reference on generating hyperlink in prepare_export()
-		kwargs.update(soe=soe, generate_formula=generate_formula)
-
 		return {
-			'HIS_MESSAGES': soe,
-			**super().prepare_export(**kwargs)
+			'HIS_MESSAGES': self.post_process,
+			**super().prepare_export(soe=self.post_process, generate_formula=generate_formula, **kwargs)
 		}
 
 
 class RCDCollective(RCFileReader, RCD):
 
-	def __init__(self, filepaths:Union[str, list], **kwargs):
-		super().__init__(filepaths, **kwargs)
+	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
+		super().__init__(files, **kwargs)
 
-
-class RCDFromOFDB(SpectrumOfdbClient, SOEtoRCD):
-
-	def __init__(self, date_start:datetime, date_stop:datetime=None, **kwargs):
-		super().__init__(date_start, date_stop, **kwargs)
+	def load(self, **kwargs):
+		rcd_all = super().load(**kwargs)
+		self.rcd_all = rcd_all
+		return rcd_all
+	
+	async def async_load(self, **kwargs):
+		rcd_all = await super().async_load(**kwargs)
+		self.rcd_all = rcd_all
+		return rcd_all
 
 
 class RCDFromFile(SpectrumFileReader, SOEtoRCD):
 
-	def __init__(self, filepaths:Union[str, list], **kwargs):
-		super().__init__(filepaths, **kwargs)
+	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
+		super().__init__(files, **kwargs)
+
+	def load(self, **kwargs):
+		soe_all = super().load(**kwargs)
+		self.soe_all = soe_all
+		return soe_all
+
+	async def async_load(self, **kwargs):
+		soe_all = await super().async_load(**kwargs)
+		self.soe_all = soe_all
+		return soe_all
 
 
 class RCDFromFile2(SurvalentFileReader, SOEtoRCD):
 
-	def __init__(self, filepaths:Union[str, list], **kwargs):
-		super().__init__(filepaths, **kwargs)
+	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
+		super().__init__(files, **kwargs)
+
+	def load(self, **kwargs):
+		soe_all = super().load(**kwargs)
+		self.soe_all = soe_all
+		return soe_all
+
+	async def async_load(self, **kwargs):
+		soe_all = await super().async_load(**kwargs)
+		self.soe_all = soe_all
+		return soe_all
+
+
+class RCDFromOFDB(SpectrumOfdbClient, SOEtoRCD):
+
+	def __init__(self, date_start: datetime, date_stop: Optional[datetime.datetime] = None, **kwargs):
+		super().__init__(date_start, date_stop, **kwargs)
 
 
 def summary_template(**kwargs):
@@ -1880,46 +1612,33 @@ Rangkuman RC {kwargs.get('element')} tanggal {kwargs.get('date_start')} s/d {kwa
 {kwargs.get('df_dispa')}
 
 """
+	
 
-def test_analyze_file(**params):
-	rc = RCDFromFile('sample/sample_rcd*.xlsx')
-	print()
-	print(' TEST ANALYZE RCD CONCURRENTLY '.center(CONSOLE_WIDTH, '#'))
-	# t0 = time.time()
-	rc.calculate(force=True, fast=True)
-	# print(f'Durasi = {time.time()-t0:.2f}s')
-	print(' TEST ANALYZE RCD '.center(CONSOLE_WIDTH, '#'))
-	# t1 = time.time()
-	rc.calculate(force=True, fast=False)
-	# print(f'Durasi = {time.time()-t1:.2f}s')
-	if 'y' in input('Export hasil test? [y/n]  '):
-		rc.to_excel(filename='test_analyze_rcd_spectrum')
-	return rc
+def rc_analyze_file(**params):
+	handler = RCDFromFile
+	filepaths = 'sample/sample_rcd*.xlsx'
+	title = 'RCD'
+	return test_analyze(handler, title=title, filepaths=filepaths)
 
-def test_analyze_file2(**params):
-	rc = RCDFromFile2('sample/survalent/sample_soe*.XLSX')
-	print()
-	print(' TEST ANALYZE RCD '.center(CONSOLE_WIDTH, '#'))
-	rc.calculate()
-	if 'y' in input('Export hasil test? [y/n]  '):
-		rc.to_excel(filename='test_analyze_rcd_survalent')
-	return rc
+def rc_analyze_file2(**params):
+	handler = RCDFromFile2
+	filepaths = 'sample/survalent/sample_soe*.XLSX'
+	title = 'RCD'
+	master = 'Survalent'
+	return test_analyze(handler, title=title, filepaths=filepaths, master=master)
 
-def test_collective_file(**params):
-	rc = RCDCollective('sample/sample_rcd*.xlsx')
-	print()
-	print(' TEST COLLECTIVE RCD '.center(CONSOLE_WIDTH, '#'))
-	rc.calculate()
-	if 'y' in input('Export hasil test? [y/n]  '):
-		rc.to_excel(filename='test_collective_rcd')
-	return rc
+def rc_collective(**params):
+	handler = RCDCollective
+	filepaths = 'sample/sample_rcd*.xlsx'
+	title = 'RCD'
+	return test_collective(handler, title=title, filepaths=filepaths)
 
 
 if __name__=='__main__':
 	test_list = [
-		('Test analisa file SOE Spectrum', test_analyze_file),
-		('Test analisa file SOE Survalent', test_analyze_file2),
-		('Test menggabungkan file', test_collective_file)
+		('Test analisa file SOE Spectrum', rc_analyze_file),
+		('Test analisa file SOE Survalent', rc_analyze_file2),
+		('Test menggabungkan file', rc_collective)
 	]
 	ans = input('Confirm troubleshooting? [y/n]  ')
 	if ans=='y':

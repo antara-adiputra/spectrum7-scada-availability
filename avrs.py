@@ -1,21 +1,32 @@
-import datetime, gc, re, time
+import asyncio, datetime, gc, os, re, time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from functools import partial
+from io import BytesIO
 from types import MappingProxyType
-from typing import Any, Union
+from typing import Any, Dict, List, Callable, Literal, Optional, Tuple, TypeAlias, Union
 
 import numpy as np
 import pandas as pd
 from xlsxwriter.utility import xl_col_to_name
+from core import BaseAvailability, XLSExportMixin
 from filereader import AVRSFileReader, SpectrumFileReader
 from global_parameters import RTU_BOOK_PARAM
-from lib import CONSOLE_WIDTH, BaseExportMixin, calc_time, join_datetime, immutable_dict, load_cpoint, progress_bar, timedelta_split
+from lib import ProcessError, calc_time, immutable_dict, join_datetime, load_cpoint, nested_dict, progress_bar, timedelta_split
 from ofdb import SpectrumOfdbClient
+from test import *
+from worker import run_cpu_bound
 
 
-class _Export(BaseExportMixin):
-	_sheet_parameter: MappingProxyType[str, dict[str, Any]] = immutable_dict(RTU_BOOK_PARAM)
+CalcResult : TypeAlias = Dict[str, Dict[str, Any]]
+FilePaths: TypeAlias = List[str]
+FileDict: TypeAlias = Dict[str, BytesIO]
+ListLikeDataFrame: TypeAlias = List[Dict[str, Any]]
+
+
+class _Export(XLSExportMixin):
+	_sheet_parameter: MappingProxyType[str, Dict[str, Any]] = immutable_dict(RTU_BOOK_PARAM)
 	output_prefix: str = 'AVRS'
-	result: dict[str, dict[str, Any]]
+	result: Dict[str, Dict[str, Any]]
 	
 	def get_sheet_info_data(self, **kwargs):
 		"""Define extra information into sheet "Info"."""
@@ -23,14 +34,14 @@ class _Export(BaseExportMixin):
 			*super().get_sheet_info_data(**kwargs),
 			('', ''),
 			('SUMMARY', ''),
-			('RTU with Downtime', self.result['overall']['total_rtu_down']),
-			('RTU Availability', self.result['overall']['rtu_availability']),
-			('Link Availability', self.result['overall']['link_availability'])
+			('RTU with Downtime', nested_dict(self.result, ['overall', 'total_rtu_down'])),
+			('RTU Availability', nested_dict(self.result, ['overall', 'rtu_availability'])),
+			('Link Availability', nested_dict(self.result, ['overall', 'link_availability']))
 		]
 		return extra_info
 
 
-class _IFSAnalyzer:
+class _IFSAnalyzer(BaseAvailability):
 	"""Base class for analyze data from SOE.
 
 	Args:
@@ -39,26 +50,23 @@ class _IFSAnalyzer:
 	Accepted kwargs:
 		**
 	"""
-	_executor = ThreadPoolExecutor(8)
-	maintenance_mark = '**maintenance**'
-	linkfailure_mark = '**link**'
-	rtufailure_mark = '**rtu**'
-	otherfailure_mark = '**other**'
-	keep_duplicate = 'last'
+	maintenance_mark: str = '**maintenance**'
+	linkfailure_mark: str = '**link**'
+	rtufailure_mark: str = '**rtu**'
+	otherfailure_mark: str = '**other**'
 	# List of downtime categorization (<category>, <value on hour>), ordered by the most significant category
-	category = [
+	category: List[Tuple[str, int]] = [
 		('Critical', 72),
 		('Major', 24),
 		('Intermediate', 8),
 		('Minor', 3)
 	]
+	soe_all: pd.DataFrame
 
-	def __init__(self, data: pd.DataFrame = None, **kwargs):
-		self._analyzed = False
-
-		if data is not None: self.soe_all = data
-
-		self._soe_setup()
+	def __init__(self, data: Optional[pd.DataFrame] = None, **kwargs):
+		self._analyzed: bool = False
+		self._is_valid = False
+		self.soe_all = data
 		super().__init__(**kwargs)
 
 	def _get_category(self, downtime: datetime.timedelta):
@@ -76,41 +84,45 @@ class _IFSAnalyzer:
 			if downtime>datetime.timedelta(hours=rule[1]):
 				result = f'Downtime > {rule[1]} jam ({rule[0]})'
 				break
-		
+
 		return result
 
-	def _set_range(self, start: datetime.datetime, stop: datetime.datetime) -> tuple[datetime.datetime, datetime.datetime]:
-		"""Set adjusted time for start and stop datetime of query data.
+	def initialize(self) -> None:
+		"""Set class attributes into intial value"""
+		self.init_analyze()
+		super().initialize()
 
-		Args:
-			start : oldest date limit
-			stop : newest date limit
+	def init_analyze(self) -> None:
+		"""Set class attributes into intial value"""
+		self._analyzed = False
+		self._is_valid = False
 
-		Result:
-			Pair of datetime limit
-		"""
-		dt0 = start.replace(hour=0, minute=0, second=0, microsecond=0)
-		dt1 = stop.replace(hour=23, minute=59, second=59, microsecond=999999)
-
-		self._t0 = dt0
-		self._t1 = dt1
-		return dt0, dt1
-
-	def _soe_setup(self):
+	def soe_setup(self, **kwargs) -> Union[pd.DataFrame, Exception]:
 		"""Apply sorting and filtering on "soe_all" to get cleaned data."""
+		start = kwargs.get('start')
+		stop = kwargs.get('stop')
+
 		if isinstance(self.soe_all, pd.DataFrame):
 			self._is_valid = True
+			# Can be filtered with date
+			if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
+				t0, t1 = self.set_range(start=start, stop=stop)
+			else:
+				# Parameter start or stop is not valid datetime or None
+				t0, t1 = self.set_range(start=self.soe_all['Time stamp'].min(), stop=self.soe_all['Time stamp'].max())
+
 			df = self.soe_all.copy()
-			df = df.sort_values(['System time stamp', 'System milliseconds'], ascending=[True, True]).reset_index(drop=True)
+			df = df[(df['Time stamp']>=t0) & (df['Time stamp']<=t1)].sort_values(['System time stamp', 'System milliseconds'], ascending=[True, True]).reset_index(drop=True)
 			# Get min index and max index of df
 			self._lowest_index, self._highest_index = df.index.min(), df.index.max()
 			# Double check His. Messages only for IFS status changes
-			self.soe_ifs = df[(df['A']=='') & (df['B1']=='IFS') & (df['B2']=='RTU_P1') & (df['Tag']=='')]
+			soe_ifs = df[(df['A']=='') & (df['B1']=='IFS') & (df['B2']=='RTU_P1') & (df['Tag']=='')]
+			self.soe_ifs = soe_ifs
+			return soe_ifs
 		else:
-			self._is_valid = False
-			raise ValueError('Dataframe tidak valid')
+			raise ProcessError('SOEAnalyzeError', 'Input data tidak valid.', f'soe_all={type(self.soe_all)}')
 
-	def get_rtu_updown(self, df: pd.DataFrame, rtu: str) -> list[dict]:
+	def get_rtu_updown(self, df: pd.DataFrame, rtu: str) -> List[dict]:
 		"""Analyze all downtime occured on a RTU.
 
 		Args:
@@ -213,8 +225,8 @@ class _IFSAnalyzer:
 
 		return rtu_updown
 
-	def analyze_rtu_concurrently(self, df: pd.DataFrame, rtus: list[str]) -> tuple[list[dict], list[str]]:
-		"""Run analyze process in Threads.
+	def analyze_rtus(self, df: pd.DataFrame, rtus: List[str], callback: Optional[Callable] = None, *args, **kwargs) -> Tuple[ListLikeDataFrame, List[str]]:
+		"""Run analyze RTUs.
 
 		Args:
 			df : dataframe
@@ -223,16 +235,57 @@ class _IFSAnalyzer:
 		Result:
 			Pair of updown list and rtu name list
 		"""
-		with ThreadPoolExecutor(len(rtus)) as tpe:
-			updown_list = list()
-			futures = [tpe.submit(self.get_rtu_updown, df, rtu) for rtu in rtus]
+		updown_list: ListLikeDataFrame = list()
+		rtu_list: List[str] = rtus
+		# if callable(callback):
+		# 	cb = callback
+		# else:
+		# 	cb = progress_bar
 
-			for future in futures:
-				updown_list += future.result()
+		for rtu in rtus:
+			updown = self.get_rtu_updown(df, rtu)
+			updown_list += updown
 
-			return updown_list, rtus
+		return updown_list, rtu_list
+		
+	def analyze_rtu_multiprocess(self, df: pd.DataFrame, rtus: List[str], callback: Optional[Callable] = None, *args, **kwargs) -> Tuple[ListLikeDataFrame, List[str]]:
+		"""Run analyze with multiple Processes.
 
-	def fast_analyze(self, start: datetime.datetime = None, stop: datetime.datetime = None, **kwargs) -> pd.DataFrame:
+		Args:
+			df : dataframe
+			rtus : list of remote station name
+
+		Result:
+			Pair of updown list and rtu name list
+		"""
+		updown_list: ListLikeDataFrame = list()
+		rtu_list: List[str] = list()
+		n = kwargs.get('nprocess', os.cpu_count())
+		# chunksize = len(rtus)//n + 1
+		chunksize = 1	# The fastest process duration proven from some tests
+		if callable(callback):
+			cb = callback
+		else:
+			cb = progress_bar
+		# ProcessPoolExecutor create new instance on different processes, so modifying instance in each process will not change instance in main process. Value returned must be "serializable".
+		with ProcessPoolExecutor(n) as ppe:
+			futures = list()
+
+			for i in range(0, len(rtus), chunksize):
+				rtu_segment = rtus[i:(i+chunksize)]
+				future = ppe.submit(self.analyze_rtus, df, rtu_segment, callback=cb)
+				futures.append(future)
+
+			for x, future in enumerate(as_completed(futures)):
+				result_list, ifnames = future.result()
+				updown_list.extend(result_list)
+				rtu_list.extend(ifnames)
+				# Call callback function
+				cb(value=(x+1)/len(futures), name='analyze')
+
+		return updown_list, rtu_list
+
+	def fast_analyze(self, start: Optional[datetime.datetime] = None, stop: Optional[datetime.datetime] = None, *args, **kwargs) -> pd.DataFrame:
 		"""Split analyze into some processes, datetime limits may included.
 
 		Args:
@@ -242,42 +295,20 @@ class _IFSAnalyzer:
 		Result:
 			Downtime data as dataframe
 		"""
-		gc.collect()
-		# Can be filtered with date
-		if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
-			t0, t1 = self._set_range(start=start, stop=stop)
-		else:
-			t0, t1 = self._set_range(start=self.soe_ifs['Time stamp'].min(), stop=self.soe_ifs['Time stamp'].max())
-
+		# Pre-analyze initialization
+		self.init_analyze()
+		df = self.soe_setup(start=start, stop=stop, **kwargs)
 		rtu_list = self.get_rtus()
-		df = self.soe_ifs[(self.soe_ifs['Time stamp']>=t0) & (self.soe_ifs['Time stamp']<=t1)]
-		n = 8
-		# chunksize = len(rtu_list)//n + 1
-		chunksize = 1	# The fastest process duration proven from some tests
-		data_list = list()
-
-		print(f'\nMenganalisa downtime {len(rtu_list)} RTU...')
-		with ProcessPoolExecutor(n) as ppe:
-			futures = list()
-
-			for i in range(0, len(rtu_list), chunksize):
-				rtus = rtu_list[i:(i+chunksize)]
-				future = ppe.submit(self.analyze_rtu_concurrently, df, rtus)
-				futures.append(future)
-
-			for x, future in enumerate(as_completed(futures)):
-				progress_bar((x+1)/len(futures))
-				result_list, rtus = future.result()
-				data_list.extend(result_list)
-
+		print(f'\nMenganalisa downtime dari {self.get_rtu_count()} RTU...')
+		data_list, _ = self.analyze_rtu_multiprocess(df, rtu_list, *args, **kwargs)
 		# Create new DataFrame from list of dict data
 		df_downtime = pd.DataFrame(data=data_list).sort_values(['Down Time', 'Up Time'], ascending=[True, True]).reset_index(drop=True)
-		self.rtus = rtus
+		self.rtus = rtu_list
 		self.post_process = df
 		self._analyzed = True
 		return df_downtime
 
-	def analyze(self, start: datetime.datetime = None, stop: datetime.datetime = None, **kwargs) -> pd.DataFrame:
+	def analyze(self, start: Optional[datetime.datetime] = None, stop: Optional[datetime.datetime] = None, *args, **kwargs) -> pd.DataFrame:
 		"""[DEPRECATED]
 		Analyzed every Up/Down event with presume that all RTUs are Up in the date_start.
 
@@ -289,25 +320,20 @@ class _IFSAnalyzer:
 			Downtime data as dataframe
 		"""
 		gc.collect()
-		updown_list = list()
-
-		# Can be filtered with date
-		if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
-			t0, t1 = self._set_range(start=start, stop=stop)
-		else:
-			t0, t1 = self._set_range(start=self.soe_ifs['Time stamp'].min(), stop=self.soe_ifs['Time stamp'].max())
-
-		rtus = self.get_rtus()
-		df = self.soe_ifs[(self.soe_ifs['Time stamp']>=self._t0) & (self.soe_ifs['Time stamp']<=self._t1)]
+		# Pre-analyze initialization
+		self.init_analyze()
+		df = self.soe_setup(start=start, stop=stop, **kwargs)
+		rtu_list = self.get_rtus()
 		i_sys_tstamp = df.columns.get_loc('System time stamp')
 		i_sys_msec = df.columns.get_loc('System milliseconds')
 		i_status = df.columns.get_loc('Status')
 		i_user_comment = df.columns.get_loc('User comment')
 		i_b3_text = df.columns.get_loc('B3 text')
 
-		print(f'\nMenganalisa downtime dari {len(rtus)} Remote Station...')
-		for x, rtu in enumerate(rtus):
-			progress_bar((x+1)/len(rtus))
+		print(f'\nMenganalisa downtime dari {len(rtu_list)} RTU...')
+		updown_list = list()
+		for x, rtu in enumerate(rtu_list):
+			progress_bar((x+1)/len(rtu_list))
 
 			notes = list()
 			index0 = self.lowest_index
@@ -396,7 +422,54 @@ class _IFSAnalyzer:
 
 		# Create new DataFrame from list of dict data
 		df_downtime = pd.DataFrame(data=updown_list).sort_values(['Down Time', 'Up Time'], ascending=[True, True]).reset_index(drop=True)
-		self.rtus = rtus
+		self.rtus = rtu_list
+		self.post_process = df
+		self._analyzed = True
+		return df_downtime
+
+	async def async_analyze(self, start: Optional[datetime.datetime] = None, stop: Optional[datetime.datetime] = None, *args, **kwargs) -> pd.DataFrame:
+		"""Asynchronous downtime analyzer function using multiple Process to work concurrently.
+
+		Args:
+			start : oldest date limit
+			stop : newest date limit
+
+		Result:
+			Dataframe of downtime events
+		"""
+		# Result variable
+		data_list: ListLikeDataFrame = list()
+		ifsname_list: List[str] = list()
+
+		async def run_background(proc: ProcessPoolExecutor, fn: Callable, *fnargs, **fnkwargs):
+			loop = asyncio.get_running_loop() or asyncio.get_event_loop()
+			return await loop.run_in_executor(proc, partial(fn, *fnargs, **fnkwargs))
+
+		def done(_f: asyncio.Future):
+			result_list, ifnames = _f.result()
+			data_list.extend(result_list)
+			ifsname_list.extend(ifnames)
+			self.progress.update(len(ifsname_list)/self.get_rtu_count())
+
+		# Pre-analyze initialization
+		self.init_analyze()
+		df = self.soe_setup(start=start, stop=stop, **kwargs)
+		rtu_list = self.get_rtus()
+		n = kwargs.get('nprocess', os.cpu_count())
+		# chunksize = len(rtu_list)//n + 1
+		chunksize = 1	# The fastest process duration proven from some tests
+		self.progress.init('Menganalisa updown RTU', raw_max_value=self.get_rtu_count())
+
+		with ProcessPoolExecutor(n) as ppe:
+			async with asyncio.TaskGroup() as tg:
+				for i in range(0, len(rtu_list), chunksize):
+					rtu_segment = rtu_list[i:(i+chunksize)]
+					task = tg.create_task(run_background(ppe, self.analyze_rtus, df, rtu_segment))
+					task.add_done_callback(done)
+
+		# Create new DataFrame from list of dict data
+		df_downtime = pd.DataFrame(data=data_list).sort_values(['Down Time', 'Up Time'], ascending=[True, True]).reset_index(drop=True)
+		self.rtus = rtu_list
 		self.post_process = df
 		self._analyzed = True
 		return df_downtime
@@ -408,9 +481,13 @@ class _IFSAnalyzer:
 			List of remote station name
 		"""
 		df = self.soe_ifs
+		t0, t1 = self.get_range()
 		# Get His. Messages with order tag only
-		rtus = df.loc[(df['Time stamp']>=self._t0) & (df['Time stamp']<=self._t1), 'B3'].unique()
+		rtus = df.loc[(df['Time stamp']>=t0) & (df['Time stamp']<=t1), 'B3'].unique()
 		return rtus
+	
+	def get_rtu_count(self) -> int:
+		return len(self.get_rtus())
 
 	@property
 	def analyzed(self):
@@ -418,7 +495,7 @@ class _IFSAnalyzer:
 
 	@property
 	def highest_index(self):
-		return self._highest_index
+		return getattr(self, '_highest_index', None)
 
 	@property
 	def is_valid(self):
@@ -426,10 +503,10 @@ class _IFSAnalyzer:
 
 	@property
 	def lowest_index(self):
-		return self._lowest_index
+		return getattr(self, '_lowest_index', None)
 
 
-class _AVRSBaseCalculation:
+class _AVRSBaseCalculation(BaseAvailability):
 	"""Base class for Remote Station Availability calculation.
 
 	Args:
@@ -438,17 +515,28 @@ class _AVRSBaseCalculation:
 	Accepted kwargs:
 		**
 	"""
-	name = 'Availability Remote Station'
-	keep_duplicate = 'last'
-	cpoint_file = 'cpoint.xlsx'
+	name: str = 'Availability Remote Station'
+	cpoint_file: str = 'cpoint*.xlsx'
+	rtudown_all: pd.DataFrame
+	cpoint_ifs: pd.DataFrame
+	availability: pd.DataFrame
 
-	def __init__(self, data: pd.DataFrame = None, **kwargs):
+	def __init__(self, data: Optional[pd.DataFrame] = None, **kwargs):
+		self._calculated = False
+		self.rtudown_all = data
+		super().__init__(**kwargs)
+
+	def initialize(self) -> None:
+		"""Re-initiate parameter"""
+		self.init_calculate()
+		super().initialize()
+
+	def init_calculate(self):
+		"""Re-initiate parameter"""
 		self._calculated = False
 		self.availability = None
+		cpoint = getattr(self, 'point_description', None)
 
-		if data is not None: self.rtudown_all = data
-
-		cpoint = getattr(self, 'cpoint_description', None)
 		if isinstance(cpoint, pd.DataFrame):
 			self.cpoint_ifs = cpoint[(cpoint['B1']=='IFS') & (cpoint['B2']=='RTU_P1')]
 		else:
@@ -456,9 +544,47 @@ class _AVRSBaseCalculation:
 			# Remove duplicates to prevent duplication in merge process
 			self.cpoint_ifs = cpoint[(cpoint['B1']=='IFS') & (cpoint['B2']=='RTU_P1')].drop_duplicates(subset=['B1 text', 'B2 text', 'B3 text'], keep='first')
 
-		# if hasattr(self, 'rtudown_all'): self.calculate(start=kwargs.get('start'), stop=kwargs.get('stop'))
+	@calc_time
+	def _calculate(self, **kwargs) -> CalcResult:
+		"""Base of calculation process.
 
-	def _avrs_setup(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+		Result:
+			Downtime summary as dict
+		"""
+		start = kwargs.get('start')
+		stop = kwargs.get('stop')
+
+		if isinstance(self.rtudown_all, pd.DataFrame):
+			# Can be filtered with date
+			if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
+				t0, t1 = self.set_range(start=start, stop=stop)
+			else:
+				# Parameter start or stop is not valid datetime or None
+				t0, t1 = self.set_range(start=self.rtudown_all['Down Time'].min(), stop=self.rtudown_all['Down Time'].max())
+		else:
+			raise AttributeError('Data input tidak valid.', name='rtudown_all', obj=self)
+
+		result = self.get_result(**kwargs)
+		return result
+
+	def calculate(self, start: Optional[datetime.datetime] = None, stop: Optional[datetime.datetime] = None, *args, **kwargs) -> CalcResult:
+		"""Calculate RTU downtime.
+
+		Args:
+			start : oldest date limit
+			stop : newest date limit
+
+		Result:
+			Calculation result as dict and process duration time
+		"""
+		self.init_calculate()
+		result, t = self._calculate(start=start, stop=stop, **kwargs)
+		self.result = result
+		self._process_date = datetime.datetime.now()
+		self._process_duration = round(t, 3)
+		return result
+
+	def avrs_setup(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
 		"""Apply conditioning & filtering before calculation process.
 
 		Args:
@@ -481,68 +607,15 @@ class _AVRSBaseCalculation:
 		# prepared = prepared.loc[(prepared['Marked Maintenance']=='') & (prepared['Marked Link Failure']=='') & (prepared['Marked Other Failure']=='')]
 		return prepared
 
-	@calc_time
-	def _calculate(self, start: datetime.datetime, stop: datetime.datetime, force: bool = False, fast: bool = True, **kwargs) -> dict[str, dict[str, Any]]:
-		"""Analyze and/or calculate RTU downtime.
-
-		Args:
-			start : oldest date limit
-			stop : newest date limit
-			force : force calculation
-			fast : use fast calculation method or not
-
-		Result:
-			Downtime data as dataframe
-		"""
-		if not hasattr(self, 'rtudown_all') or force:
-			# Must be analyzed first and pass to rtudown_all
-			fn1 = getattr(self, 'fast_analyze', None)
-			fn2 = getattr(self, 'analyze', None)
-			if callable(fn1) and fast:
-				self.rtudown_all = fn1(start=start, stop=stop, **kwargs)
-			elif callable(fn2):
-				self.rtudown_all = fn2(start=start, stop=stop, **kwargs)
-			else:
-				raise AttributeError('Atttribute error.', name='fast_analyze() / analyze()', obj=self.__class__.__name__)
-
-		if isinstance(self.rtudown_all, pd.DataFrame):
-			# Can be filtered with date
-			if isinstance(start, datetime.datetime) and isinstance(stop, datetime.datetime):
-				t0, t1 = self._set_range(start=start, stop=stop)
-			else:
-				t0, t1 = self._set_range(start=self.rtudown_all['Down Time'].min(), stop=self.rtudown_all['Down Time'].max())
-		else:
-			raise AttributeError('Data input tidak valid.', name='rtudown_all', obj=self)
-
-		print(f'\nMenghitung downtime RTU tanggal {t0.strftime("%d-%m-%Y")} s/d {t1.strftime("%d-%m-%Y")}...')
-		result = self.get_result(**kwargs)
-		return result
-
-	def _set_range(self, start:datetime.datetime, stop:datetime.datetime) -> tuple[datetime.datetime, datetime.datetime]:
-		"""Set adjusted time for start and stop datetime of query data.
-
-		Args:
-			start : oldest date limit
-			stop : newest date limit
-
-		Result:
-			Pair of datetime limit
-		"""
-		dt0 = start.replace(hour=0, minute=0, second=0, microsecond=0)
-		dt1 = stop.replace(hour=23, minute=59, second=59, microsecond=999999)
-
-		self._t0 = dt0
-		self._t1 = dt1
-		return dt0, dt1
-
-	def get_result(self, **kwargs) -> dict[str, dict[str, Any]]:
+	def get_result(self, **kwargs) -> CalcResult:
 		"""Get aggregate data of availability calculation.
 
 		Result:
 			Calculation result in dict
 		"""
-		df = self.rtudown_all.loc[(self.rtudown_all['Down Time']>=self.t0) & (self.rtudown_all['Down Time']<=self.t1)]
-		df_pre = self._avrs_setup(df)
+		t0, t1 = self.get_range()
+		df = self.rtudown_all.loc[(self.rtudown_all['Down Time']>=t0) & (self.rtudown_all['Down Time']<=t1)]
+		df_pre = self.avrs_setup(df)
 		df_av = self.group(df_pre)
 
 		self.pre_process = df
@@ -564,8 +637,8 @@ class _AVRSBaseCalculation:
 		down_min = df_pre['Duration'].min()
 		down_min_dd, down_min_hh, down_min_mm, down_min_ss = timedelta_split(down_min)
 
-		avrtu = round(1 - (df_av['RTU Downtime'] / df_av['Time Range']) * 100, 2)
-		avlink = round(1 - (df_av['Link Downtime'] / df_av['Time Range']) * 100, 2)
+		avrtu = 1 - (df_av['RTU Downtime'].mean() / (self.t1 - self.t0 + datetime.timedelta(microseconds=1)))
+		avlink = 1 - (df_av['Link Downtime'].mean() / (self.t1 - self.t0 + datetime.timedelta(microseconds=1)))
 		rtu_count_max = df_av.loc[df_av['Downtime Occurences'].idxmax()]['RTU']
 		rtu_count_min = df_av.loc[df_av[df_av['Downtime Occurences']>0]['Downtime Occurences'].idxmin()]['RTU']
 		rtu_down_max = df_av.loc[df_av[df_av['Downtime Occurences']>0]['Total Downtime'].idxmax()]['RTU']
@@ -577,8 +650,8 @@ class _AVRSBaseCalculation:
 				'total_rtu': df_av.shape[0],
 				'total_rtu_down': df_av[df_av['Downtime Occurences']>0].shape[0],
 				'downtime_count': f'{down_valid}',
-				'rtu_availability': f'{avrtu}%',
-				'link_availability': f'{avlink}%'
+				'rtu_availability': f'{avrtu*100:.2f}%',
+				'link_availability': f'{avlink*100:.2f}%'
 			},
 			'statistic': {
 				'downtime_avg': f'{down_avg_dd} Hari {down_avg_hh:02}:{down_avg_mm:02}:{down_avg_ss:02}',
@@ -602,20 +675,6 @@ class _AVRSBaseCalculation:
 			}
 		}
 
-	def calculate(self, start: datetime.datetime = None, stop: datetime.datetime = None, force: bool = False, fast: bool = True, **kwargs):
-		"""Calculate RTU downtime.
-
-		Args:
-			start : oldest date limit
-			stop : newest date limit
-			force : force calculation
-			fast : use fast calculation method or not
-		"""
-		self.result, t = self._calculate(start=start, stop=stop, force=force, fast=fast, **kwargs)
-		self._process_date = datetime.datetime.now()
-		self._process_duration = round(t, 3)
-		print(f'Perhitungan selesai. (durasi={t:.2f}s, error=0)')
-
 	def generate_reference(self, soe: pd.DataFrame, down: pd.DataFrame) -> np.ndarray:
 		"""Create excel hyperlink of each RTU up/down in sheet "DOWNTIME" to cell range in sheet "HIS_MESSAGES".
 
@@ -626,7 +685,7 @@ class _AVRSBaseCalculation:
 		Result:
 			List of excel hyperlink
 		"""
-		navs = []
+		navs = list()
 		errors = 0
 
 		try:
@@ -705,7 +764,7 @@ class _AVRSBaseCalculation:
 		df_groupby['Link Availability'] = round(1 - (df_groupby['Link Downtime'] / df_groupby['Time Range']), 4)
 		return df_groupby[output_columns]
 
-	def prepare_export(self, generate_formula: bool = False, **kwargs) -> dict[str, Union[pd.DataFrame, tuple[pd.DataFrame]]]:
+	def prepare_export(self, generate_formula: bool = False, **kwargs) -> Dict[str, Union[pd.DataFrame, Tuple[pd.DataFrame]]]:
 		"""Applying excel formulas to output file.
 
 		Args:
@@ -832,7 +891,7 @@ class _AVRSBaseCalculation:
 			self.result['statistic']['marked']['total'] = f'={count_maint}+{count_dtrtu}+{count_telco}+{count_other}'
 
 		return {
-			'DOWNTIME': df_dt,
+			'DOWNTIME': (df_dt, ),
 			'AVAILABILITY': (df_av, df_av_result)
 		}
 
@@ -842,31 +901,90 @@ class _AVRSBaseCalculation:
 
 	@property
 	def process_date(self):
-		return self._process_date
+		return getattr(self, '_process_date', None)
 
 	@property
 	def process_duration(self):
-		return self._process_duration
-
-	@property
-	def t0(self):
-		return self._t0
-
-	@property
-	def t1(self):
-		return self._t1
+		return getattr(self, '_process_duration', None)
 
 
-class AVRS(_Export, _AVRSBaseCalculation):
+class AVRS(_AVRSBaseCalculation, _Export):
 
-	def __init__(self, data: pd.DataFrame = None, **kwargs):
+	def __init__(self, data: Optional[pd.DataFrame] = None, **kwargs):
 		super().__init__(data, **kwargs)
 
+	def calculate(self, start: Optional[datetime.datetime] = None, stop: Optional[datetime.datetime] = None, *args, **kwargs) -> CalcResult:
+		result = super().calculate(start, stop, *args, **kwargs)
+		print(f'Perhitungan downtime RTU {self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")} selesai. (durasi={self.process_duration:.2f}s, error={len(self.errors)})')
+		return result
 
-class SOEtoAVRS(_Export, _IFSAnalyzer, _AVRSBaseCalculation):
+	async def async_calculate(self, start: Optional[datetime.datetime] = None, stop: Optional[datetime.datetime] = None, *args, **kwargs) -> CalcResult:
+		await asyncio.sleep(0)
+		self.progress.init('Menghitung availability')
+		result = super().calculate(start, stop, *args, **kwargs)
+		self.progress.update(1.0)
+		print(f'Perhitungan downtime RTU {self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")} selesai. (durasi={self.process_duration:.2f}s, error={len(self.errors)})')
+		return result
 
-	def __init__(self, data: pd.DataFrame = None, **kwargs):
+
+class SOEtoAVRS(_AVRSBaseCalculation, _IFSAnalyzer, _Export):
+
+	def __init__(self, data: Optional[pd.DataFrame] = None, **kwargs):
 		super().__init__(data, **kwargs)
+
+	def calculate(
+			self,
+			start: Optional[datetime.datetime] = None,
+			stop: Optional[datetime.datetime] = None,
+			force: bool = False,
+			fast: bool = True,
+			*args,
+			**kwargs
+		) -> CalcResult:
+
+		time_start = time.time()
+		fast_analyze = getattr(self, 'fast_analyze', None)
+		analyze = getattr(self, 'analyze', None)
+
+		if callable(fast_analyze) and fast:
+			self.rtudown_all = fast_analyze(*args, force=force, **kwargs)
+		elif callable(analyze):
+			self.rtudown_all = analyze(*args, force=force, **kwargs)
+		else:
+			raise AttributeError('Atttribute error.', name='fast_analyze() / analyze()', obj=self.__class__.__name__)
+
+		result = super().calculate(start, stop, *args, **kwargs)
+		delta_time = time.time() - time_start
+		self._process_duration = round(delta_time, 3)
+		print(f'Perhitungan downtime RTU {self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")} selesai. (durasi={delta_time:.2f}s, error={len(self.errors)})')
+		return result
+
+	async def async_calculate(
+			self,
+			start: Optional[datetime.datetime] = None,
+			stop: Optional[datetime.datetime] = None,
+			force: bool = False,
+			*args,
+			**kwargs
+		) -> CalcResult:
+		"""Coroutine of calculation function which used to work together with async_analyze.
+
+		Args:
+			start : oldest date limit
+			stop : newest date limit
+
+		Result:
+			Calculation result as dict and process duration time
+		"""
+		time_start = time.time()
+		self.rtudown_all = await self.async_analyze(*args, force=force, **kwargs)
+		self.progress.init('Menghitung availability')
+		result = super().calculate(start, stop, *args, **kwargs)
+		self.progress.update(1.0)
+		delta_time = time.time() - time_start
+		self._process_duration = round(delta_time, 3)
+		print(f'Perhitungan downtime RTU {self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")} selesai. (durasi={delta_time:.2f}s, error={len(self.errors)})')
+		return result
 
 	def prepare_export(self, generate_formula: bool = False, **kwargs):
 		"""Applying excel formulas to output file.
@@ -878,65 +996,67 @@ class SOEtoAVRS(_Export, _IFSAnalyzer, _AVRSBaseCalculation):
 			Dict of sheet name & data
 		"""
 		if not self.analyzed: raise SyntaxError('Jalankan calculate() terlebih dahulu!')
-
-		# Define soe as reference on generating hyperlink in prepare_export()
-		kwargs.update(soe=self.post_process, generate_formula=generate_formula)
-
 		return {
 			'HIS_MESSAGES': self.post_process,
-			**super().prepare_export(**kwargs)
+			**super().prepare_export(soe=self.post_process, generate_formula=generate_formula, **kwargs)
 		}
 
 
 class AVRSCollective(AVRSFileReader, AVRS):
 
-	def __init__(self, filepaths: Union[str, list], **kwargs):
-		super().__init__(filepaths, **kwargs)
+	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
+		super().__init__(files, **kwargs)
 
-
-class AVRSFromOFDB(SpectrumOfdbClient, SOEtoAVRS):
-
-	def __init__(self, date_start: datetime.datetime, date_stop: datetime.datetime = None, **kwargs):
-		super().__init__(date_start, date_stop, **kwargs)
+	def load(self, **kwargs):
+		rtudown_all = super().load(**kwargs)
+		self.rtudown_all = rtudown_all
+		return rtudown_all
+	
+	async def async_load(self, **kwargs):
+		rtudown_all = await super().async_load(**kwargs)
+		self.rtudown_all = rtudown_all
+		return rtudown_all
 
 
 class AVRSFromFile(SpectrumFileReader, SOEtoAVRS):
 
-	def __init__(self, filepaths: Union[str, list], **kwargs):
-		super().__init__(filepaths, **kwargs)
+	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
+		super().__init__(files, **kwargs)
+
+	def load(self, **kwargs):
+		soe_all = super().load(**kwargs)
+		self.soe_all = soe_all
+		return soe_all
+
+	async def async_load(self, **kwargs):
+		soe_all = await super().async_load(**kwargs)
+		self.soe_all = soe_all
+		return soe_all
 
 
-def test_analyze_file(**params):
-	gc.collect()
-	av = AVRSFromFile('sample/sample_rtu*.xlsx')
-	print()
-	print(' TEST ANALYZE AVRS CONCURRENTLY '.center(CONSOLE_WIDTH, '#'))
-	# t0 = time.time()
-	av.calculate(force=True, fast=True)
-	# print(f'Durasi = {time.time()-t0:.2f}s')
-	print(' TEST ANALYZE AVRS '.center(CONSOLE_WIDTH, '#'))
-	# t1 = time.time()
-	av.calculate(force=True, fast=False)
-	# print(f'Durasi = {time.time()-t1:.2f}s')
-	if 'y' in input('Export hasil test? [y/n]  '):
-		av.to_excel(filename='test_analyze_rtu_spectrum')
-	return av
+class AVRSFromOFDB(SpectrumOfdbClient, SOEtoAVRS):
 
-def test_collective_file(**params):
-	gc.collect()
-	av = AVRSCollective('sample/sample_rtu*.xlsx')
-	print()
-	print(' TEST COLLECTIVE AVRS '.center(CONSOLE_WIDTH, '#'))
-	av.calculate()
-	if 'y' in input('Export hasil test? [y/n]  '):
-		av.to_excel(filename='test_collective_rtu')
-	return av
+	def __init__(self, date_start: datetime.datetime, date_stop: Optional[datetime.datetime] = None, **kwargs):
+		super().__init__(date_start, date_stop, **kwargs)
+
+
+def av_analyze_file(**params):
+	handler = AVRSFromFile
+	filepaths = 'sample/sample_rtu*.xlsx'
+	title = 'RTU'
+	return test_analyze(handler, title=title, filepaths=filepaths)
+
+def av_collective(**params):
+	handler = AVRSCollective
+	filepaths = 'sample/sample_rtu*.xlsx'
+	title = 'RTU'
+	return test_collective(handler, title=title, filepaths=filepaths)
 
 
 if __name__=='__main__':
 	test_list = [
-		('Test analisa file SOE Spectrum', test_analyze_file),
-		('Test menggabungkan file', test_collective_file)
+		('Test analisa file SOE Spectrum', av_analyze_file),
+		('Test menggabungkan file', av_collective)
 	]
 	ans = input('Confirm troubleshooting? [y/n]  ')
 	if ans=='y':

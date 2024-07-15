@@ -163,8 +163,9 @@ cython_debug/
 .conf
 .config
 .default
+.nicegui
 .setting
-cpoint.xlsx
+cpoint*.xlsx
 output/
 sample/
 *.bak

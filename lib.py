@@ -1,19 +1,29 @@
-import os, datetime, platform, time, warnings
+import os, datetime, functools, time, warnings
 from difflib import SequenceMatcher, get_close_matches
 from glob import glob
-from pathlib import Path
+from io import BytesIO
 from types import MappingProxyType
-from typing import Any, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import pandas as pd
-import xlsxwriter
-from xlsxwriter.utility import xl_col_to_name
 from lxml import etree as et
+
 
 _WIDTH = os.get_terminal_size()[0]
 MAX_WIDTH = 160
 CONSOLE_WIDTH = _WIDTH - 2 if _WIDTH<MAX_WIDTH else MAX_WIDTH
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
+
+
+class ProcessError(Exception):
+
+	def __init__(self, name: str = '', msg: str = '', *param) -> None:
+		self.name = name
+		self.msg = msg
+		self.param = param
+
+	def __str__(self) -> str:
+		return f'{self.name}: {self.msg} {" ".join(self.param)}'
 
 # decorator to calculate duration
 # taken by any function.
@@ -32,7 +42,18 @@ def calc_time(func):
 		return returned_value, tick-tock
 	return inner1
 
-def get_datetime(series: pd.Series) -> datetime.datetime:
+# See https://stackoverflow.com/questions/31174295/getattr-and-setattr-on-nested-objects
+def rsetattr(obj, attr: str, val):
+	pre, _, post = attr.rpartition('.')
+	return setattr(rgetattr(obj, pre) if pre else obj, post, val)
+
+# using wonder's beautiful simplification: https://stackoverflow.com/questions/31174295/getattr-and-setattr-on-nested-objects/31174427?noredirect=1#comment86638618_31174427
+def rgetattr(obj, attr: str, *args):
+	def _getattr(obj, attr):
+		return getattr(obj, attr, *args)
+	return functools.reduce(_getattr, [obj] + attr.split('.'))
+
+def get_datetime(series: pd.Series) -> tuple[datetime.datetime, datetime.datetime]:
 	"""Return set of RTU timestamp and system timestamp."""
 	return join_datetime(series['Time stamp'], series['Milliseconds']), join_datetime(series['System time stamp'], series['System milliseconds'])
 
@@ -91,25 +112,49 @@ def join_datetime(dt: pd.Series, ms: pd.Series) -> datetime.datetime:
 def load_cpoint(path: str):
 	"""
 	"""
+	filenames: List[str] = list()
+	errors: List = list()
+	valid_df: List[pd.DataFrame] = list()
+
+	for f in path.split(','):
+		if '*' in f:
+			g = glob(f.strip())
+			if len(g)>0:
+				filenames += g
+			else:
+				errors.append(ProcessError('LoadCPoint', f'File yang menyerupai "{f}" tidak ditemukan.'))
+				print(f'Warning: File yang menyerupai "{f}" tidak ditemukan.')
+		elif f.strip():
+			filenames.append(f.strip())
+
 	# Load point description
 	txt_prefix = '\nMemuat data "Point Name Description"...'.ljust(CONSOLE_WIDTH-5)
-	try:
-		# Open first sheet
-		df_cpoint = pd.read_excel(path, sheet_name=0).fillna('')
-		# Remove duplicates to prevent duplication in merge process
-		cpoint = validate_cpoint(df_cpoint)
-		print(f'{txt_prefix} OK!')
-	except FileNotFoundError:
-		raise FileNotFoundError(f'{txt_prefix} NOK!\nFile "{path}" tidak ditemukan.')
-	except Exception:
-		raise ValueError(f'{txt_prefix} NOK!\nGagal membuka file "{path}".')
-	return cpoint
+	for file in filenames:
+		try:
+			# Open first sheet
+			result = pd.read_excel(file, sheet_name=0).fillna('')
+			if isinstance(result, pd.DataFrame):
+				# Remove duplicates to prevent duplication in merge process
+				valid_df.append(validate_cpoint(result))
+				print(f'Memuat file {file.ljust(CONSOLE_WIDTH-18)} OK!')
+			else:
+				errors.append(ProcessError('LoadCPoint', 'Data tidak ditemukan.', f'file={file}'))
+		except FileNotFoundError:
+			raise FileNotFoundError(f'{txt_prefix} NOK!\nFile "{file}" tidak ditemukan.')
+		except Exception:
+			raise ValueError(f'{txt_prefix} NOK!\nGagal membuka file "{file}".')
+		
+	if len(valid_df)==0:
+		raise ProcessError('LoadCPoint', f'Semua data tidak valid. (Error={len(errors)})')
+	else:
+		# Keep last will make any file with 
+		return pd.concat(valid_df).drop_duplicates(subset=['B1', 'B2', 'B3'], keep='last')
 
-def load_workbook(filepath: str) -> dict[str, pd.DataFrame]:
+def load_workbook(file: Union[str, BytesIO]) -> dict[str, pd.DataFrame]:
 	"""Load whole excel file as dict of worksheets.
 
 	Args:
-		filepath : path of file
+		file : path of file
 
 	Result:
 		Dict of dataframe with sheetname as keys
@@ -117,14 +162,30 @@ def load_workbook(filepath: str) -> dict[str, pd.DataFrame]:
 	wb = {}
 
 	try:
-		wb = pd.read_excel(filepath, sheet_name=None, engine='openpyxl')
+		wb = pd.read_excel(file, sheet_name=None, engine='openpyxl')
 	except FileNotFoundError:
 		raise FileNotFoundError
 	except Exception:
 		raise ImportError
 	return wb
 
-def progress_bar(value:float, width:int=0, style:str='full-block'):
+def nested_dict(obj: Union[dict, Any], keys: Union[list, tuple], default: Any = None, raise_error: bool = False):
+	"""Get nested dictionary value."""
+	if isinstance(obj, dict) and len(keys)>0:
+		try:
+			_keys = list(keys).copy()
+			_key = _keys.pop(0)
+			_obj = obj[_key]
+		except Exception as e:
+			if raise_error:
+				raise e
+			else:
+				return default
+		return nested_dict(_obj, _keys, default)
+	else:
+		return obj
+
+def progress_bar(value: float, width: int = 0, style: str = 'full-block', *args, **kwargs):
 	"""Print progress bar on console."""
 	symbol = {'full-block': '█', 'left-half-block': '▌', 'right-half-block': '▐'}
 	if width==0: width = CONSOLE_WIDTH
@@ -136,7 +197,7 @@ def progress_bar(value:float, width:int=0, style:str='full-block'):
 	else:
 		print(f'\r {"Selesai... 100%".ljust(width, " ")}', flush=True)
 
-def read_xml(filepath:str, **kwargs):
+def read_xml(filepath:str, *args, **kwargs):
 	columns, rows = [], []
 
 	try:
@@ -241,147 +302,6 @@ def validate_cpoint(df: pd.DataFrame, verbose: bool = False):
 		return new_df
 	else:
 		return new_df[columns_base + columns_text]
-
-
-class BaseExportMixin:
-	"""Base class mixin for exporting dataframe into excel file."""
-	_sheet_parameter: MappingProxyType[str, dict[str, Any]] = immutable_dict({})
-	t0: datetime.datetime
-	t1: datetime.datetime
-	name: str
-	process_date: datetime.datetime
-	process_duration: float
-	base_dir = Path(__file__).parent.resolve()
-	output_dir = base_dir / 'output'
-	output_extension: str = 'xlsx'
-	output_prefix: str = ''
-
-	def _worksheet_writer(self, workbook: xlsxwriter.Workbook, sheet_name: str, sheet_data: pd.DataFrame, *extra_data):
-		"""Dataframe to excel sheet convertion.
-
-		Args:
-			workbook : current working workbook
-			sheet_name : sheet name
-			sheet_data : sheet content
-
-		Accepted extra_data:
-			Extra dataframe
-		"""
-		ws = workbook.add_worksheet(sheet_name)
-		# Worksheet formatting
-		format_header = {'num_format': '@', 'border': 1, 'bold': True, 'align': 'center', 'valign': 'top', 'font_color': 'black', 'bg_color': '#ededed'}
-		format_base = {'valign': 'vcenter'}
-		format_footer = {'bold': True, 'border': 0, 'font_color': 'black', 'bg_color': '#dcdcdc'}
-
-		nrow, ncol = sheet_data.shape
-		tbl_header = sheet_data.columns.to_list()
-
-		for x, col in enumerate(tbl_header):
-			# Write table header
-			ws.write(0, x, col, workbook.add_format({**self._sheet_parameter['format'].get(col, {}), **format_header}))
-			# Write table body
-			ws.write_column(1, x, sheet_data[col].fillna(''), workbook.add_format({**self._sheet_parameter['format'].get(col, {}), **format_base}))
-			# Append row if any
-			if extra_data:
-				try:
-					# Extra data must be in DataFrame type
-					ext_row = extra_data[0].shape[0]
-					if col in extra_data[0].columns:
-						ws.write_column(nrow+1, x, extra_data[0][col], workbook.add_format({**self._sheet_parameter['format'].get(col, {}), **format_footer}))
-					else:
-						ws.write_column(nrow+1, x, ['']*ext_row, workbook.add_format({**self._sheet_parameter['format'].get(col, {}), **format_footer}))
-				except Exception:
-					print(f'ERROR! Footer kolom "{col}"')
-
-		# Set worksheet general parameter
-		ws.set_paper(9)	# 9 = A4
-		ws.set_landscape()
-		ws.set_margins(0.25)
-		ws.center_horizontally()
-		ws.print_area(0, 0, nrow, ncol-1)
-		ws.autofilter(0, 0, 0, ncol-1)
-		ws.autofit()
-		ws.freeze_panes(1, 0)
-		ws.ignore_errors({'number_stored_as_text': f'A:{xl_col_to_name(ncol-1)}'})
-
-		# Set columns width
-		for x1, col1 in enumerate(tbl_header):
-			if col1 in self._sheet_parameter['width']: ws.set_column(x1, x1, self._sheet_parameter['width'].get(col1))
-
-	def get_xls_properties(self):
-		"""Define file properties."""
-		return {
-			'title': f'Hasil kalkulasi {self.name} tanggal {self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")}',
-			'subject': f'{self.name}',
-			'author': f'Python {platform.python_version()}',
-			'manager': 'Fasop SCADA',
-			'company': 'PLN UP2B Sistem Makassar',
-			'category': 'Excel Automation',
-			'comments': f'File digenerate otomatis oleh program {self.name}'
-		}
-
-	def get_xls_filename(self, **kwargs) -> str:
-		"""Generate filename."""
-		filename = kwargs.get('filename')
-		if filename:
-			return filename
-		else:
-			return f'{self.output_prefix}_Output_{self.t0.strftime("%Y%m%d")}-{self.t1.strftime("%Y%m%d")}'
-
-	def get_sheet_info_data(self, **kwargs) -> list[tuple[str, str]]:
-		"""Generate sheet "Info" content."""
-		return [
-			('Source File', getattr(self, 'sources', '')),
-			('Output File', f'{kwargs.get("filepath", "")}'),
-			('Date Range', f'{self.t0.strftime("%d-%m-%Y")} s/d {self.t1.strftime("%d-%m-%Y")}'),
-			('Processed Date', self.process_date.strftime('%d-%m-%Y %H:%M:%S')),
-			('Execution Time', f'{self.process_duration}s'),
-			('PC', platform.node()),
-			('User', os.getlogin())
-		]
-
-	def prepare_export(self, **kwargs) -> dict[str, Any]:
-		"""Prepare result for excel export.
-		Override this function to handle process before export.
-		"""
-		return super().prepare_export(**kwargs)
-
-	def to_excel(self, **kwargs):
-		"""Export data into excel file."""
-		sheets_data = self.prepare_export(generate_formula=True, **kwargs)
-		# Check target directory of output file
-		if not os.path.isdir(self.output_dir): os.mkdir(self.output_dir)
-
-		filename = self.get_xls_filename(**kwargs)
-		file_list = glob(f'{self.output_dir}/{filename}*.{self.output_extension}')
-
-		if len(file_list)>0: filename += f'_rev{len(file_list)}'
-
-		output_file_properties = self.get_xls_properties()
-		output_filepath = self.output_dir / f'{filename}.{self.output_extension}'
-		# Create excel file
-		with xlsxwriter.Workbook(output_filepath) as wb:
-			# Set excel workbook file properties
-			wb.set_properties(output_file_properties)
-
-			for name, sheet in sheets_data.items():
-				if isinstance(sheet, (tuple, list)):
-					self._worksheet_writer(wb, name, sheet[0], *sheet[1:])
-				else:
-					self._worksheet_writer(wb, name, sheet)
-
-			# Write worksheet info
-			ws_info = wb.add_worksheet('Info')
-			rows = self.get_sheet_info_data(filepath=output_filepath)
-
-			for i, row in enumerate(rows):
-				ws_info.write_row(i, 0, row)
-
-			ws_info.autofit()
-			ws_info.set_column(0, 0, None, wb.add_format({'valign': 'vcenter', 'num_format': '@', 'bold': True}))
-			ws_info.set_column(1, 1, 100, wb.add_format({'valign': 'vcenter', 'num_format': '@', 'text_wrap': True}))
-
-		print(f'Data berhasil di-export pada "{self.output_dir / filename}.{self.output_extension}".')
 
 
 if __name__ == '__main__':

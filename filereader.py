@@ -1,152 +1,243 @@
-import re
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import os, re, time
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from glob import glob
+from io import BytesIO
 from types import MappingProxyType
-from typing import Any, Union
+from typing import Any, Dict, List, Callable, Literal, Optional, Tuple, TypeAlias, Union
 
 import pandas as pd
 from global_parameters import RCD_COLUMNS, RTU_COLUMNS, SOE_COLUMNS, SOE_COLUMNS_DTYPE
-from lib import CONSOLE_WIDTH, calc_time, immutable_dict, join_datetime, load_cpoint, load_workbook, read_xml, test_datetime_format, truncate
+from lib import CONSOLE_WIDTH, ProcessError, calc_time, immutable_dict, join_datetime, load_cpoint, load_workbook, read_xml, test_datetime_format, truncate
+from worker import run_cpu_bound
+
+
+FilePaths: TypeAlias = List[str]
+FileDict: TypeAlias = Dict[str, BytesIO]
+DtypeMapping: TypeAlias = MappingProxyType[str, Dict[str, Any]]
 
 
 class _FileReader:
 	"""Base class for reading files (xls, xlsx, xml) into dataframe.
 
 	Args:
-		filepaths : path of file(s)
+		files : path of file(s)
 
 	Accepted kwargs:
 		switching_element : elements to be monitored
 		date_start : oldest date limit of data
 		date_stop : newest date limit of data
 	"""
-	__slot__: list[str] = ['switching_element']
-	_errors: int = 0
-	column_list: list[str] = []
+	__slot__: List[str] = ['switching_element']
+	_errors: List[Any]
+	_warnings: List[Any]
+	filenames: FilePaths
+	iobuffers: FileDict
+	exception_prefix: str = 'LoadFileError'
+	column_list: List[str] = list()
 	keep_duplicate: str = 'last'
 	sheet_name: str = 'Sheet1'
 	time_series_column: str = 'Timestamp'
 
-	def __init__(self, filepaths: Union[str, list], **kwargs):
-		self._date_range = None
+	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
+		self._date_range = (None, None)
+		self._loaded = False
+		self._errors = list()
+		self._warnings = list()
+		self._files = files
 		self.cached_file = dict()
-		self.filepaths = list()
-
-		if isinstance(filepaths, str):
-			for f in filepaths.split(','):
-				if '*' in f:
-					g = glob(f.strip())
-					if len(g)>0:
-						self.filepaths += g
-					else:
-						print(f'Warning: File yang menyerupai "{f}" tidak ditemukan.')
-				elif f.strip():
-					self.filepaths.append(f.strip())
-		elif isinstance(filepaths, list):
-			self.filepaths = filepaths
-
+		self.filenames = list()
+		self.iobuffers = dict()
 		self.switching_element = kwargs['switching_element'] if 'switching_element' in kwargs else ['CB']
-		# Set date_range if defined in kwargs
-		if 'date_start' in kwargs and 'date_stop' in kwargs:
-			self.set_date_range(
-				date_start=kwargs['date_start'].replace(hour=0, minute=0, second=0, microsecond=0),
-				date_stop=kwargs['date_stop'].replace(hour=23, minute=59, second=59, microsecond=999999)
-			)
-
-		if len(self.filepaths)>0:
-			self.load()
 		# Need this for cooperative multiple-inheritance
 		super().__init__(**kwargs)
 
-	@calc_time
+	def initialize(self) -> None:
+		self._date_range = (None, None)
+		self._loaded = False
+		self._errors = list()
+		self._warnings = list()
+		self.cached_file = dict()
+		self.filenames = list()
+		self.iobuffers = dict()
+		try:
+			# Chaining initialize method as Mixin Class
+			super().initialize()
+		except AttributeError:
+			pass
+
+	def file_setup(self) -> FilePaths:
+		"""Get list of exact filepaths from given input."""
+		filenames = list()
+		if isinstance(self._files, str):
+			for f in self._files.split(','):
+				if '*' in f:
+					g = glob(f.strip())
+					if len(g)>0:
+						filenames += g
+					else:
+						self._errors.append(ProcessError(self.exception_prefix, f'File yang menyerupai "{f}" tidak ditemukan.'))
+						print(f'Warning: File yang menyerupai "{f}" tidak ditemukan.')
+				elif f.strip():
+					filenames.append(f.strip())
+		elif isinstance(self._files, list):
+			filenames = self._files
+		elif isinstance(self._files, dict):
+			filenames = list(self._files.keys())
+			self.iobuffers = self._files
+		return filenames
+
+	def open_multiple_files(self, files: FilePaths, *args, **kwargs):
+		"""Open multiple files with Threads.
+
+		Args:
+			files : list of files
+		"""
+		fpath_list: FilePaths = list()
+		data_list: List[pd.DataFrame] = list()
+
+		for i, file in enumerate(files):
+			data = self.open_file(file, sheet_name=self.sheet_name, table_header=self.column_list, base_column=self.time_series_column)
+			fpath_list.append(files[i])
+			data_list.append(data)
+
+		return fpath_list, data_list
+
+	def open_files_multiprocess(self, files: FilePaths, *args, **kwargs):
+		"""Optimize file loading with ProcessPoolExecutor.
+
+		Args:
+			files : list of files
+		"""
+		fpath_list: FilePaths = list()
+		data_list: List[pd.DataFrame] = list()
+		n = os.cpu_count()
+		chunksize = len(files)//n + 1
+
+		with ProcessPoolExecutor(n) as ppe:
+			futures = list()
+
+			for i in range(0, len(files), chunksize):
+				_files = files[i:(i+chunksize)]
+				future = ppe.submit(self.open_multiple_files, _files)
+				futures.append(future)
+
+			for x, future in enumerate(as_completed(futures)):
+				fpaths, datas = future.result()
+				fpath_list.extend(fpaths)
+				data_list.extend(datas)
+
+		return fpath_list, data_list
+
 	def _load(self, **kwargs):
-		errors = 0
-		count = len(self.filepaths)
+		errors = list()
+		count = len(self.filenames)
+		df_result = None
 
 		if count==0:
-			raise SyntaxError('Input file belum ditentukan!')
+			err = ProcessError(self.exception_prefix, 'Input file belum ditentukan!')
+			errors.append(err)
 		if count==1:
-			df = self.open_file(filepath=self.filepaths[0], sheet_name=self.sheet_name, table_header=self.column_list, base_column=self.time_series_column)
-	
-			if isinstance(df, pd.DataFrame):
-				df = self.post_open_file(df)
-				df_result = df.drop_duplicates(keep=self.keep_duplicate)
+			result = self.open_file(
+				file=self.filenames[0],
+				sheet_name=self.sheet_name,
+				table_header=self.column_list,
+				base_column=self.time_series_column
+			)
+			if isinstance(result, pd.DataFrame):
+				result = self.post_open_file(result)
+				df_result = result.drop_duplicates(keep=self.keep_duplicate)
 			else:
-				df_result = None
-				errors += 1
+				errors.append(result)
 		else:
-			# Optimize file loading with ProcessPoolExecutor
 			valid_df = list()
-			n = 8
-			chunksize = len(self.filepaths)//n + 1
+			fpath_list, data_list = self.open_files_multiprocess(files=self.filenames, callback=kwargs.get('callback'))
 
-			with ProcessPoolExecutor(n) as ppe:
-				futures = list()
+			for result in data_list:
+				if isinstance(result, pd.DataFrame):
+					df = self.post_open_file(result)
+					valid_df.append(df)
+				else:
+					errors.append(result)
 
-				for i in range(0, len(self.filepaths), chunksize):
-					fpaths = self.filepaths[i:(i+chunksize)]
-					future = ppe.submit(self.open_files_concurrently, fpaths)
-					futures.append(future)
-
-				for future in as_completed(futures):
-					result_list, fpaths = future.result()
-
-					for result in result_list:
-						if isinstance(result, pd.DataFrame):
-							df = self.post_open_file(result)
-							valid_df.append(df)
-						else:
-							errors += 1
-
-			if len(valid_df)==0: raise RuntimeError(f'Semua data tidak valid. (Error={errors})')
-			# Combine each Dataframe in data list into one and eleminate duplicated rows
-			df_result = pd.concat(valid_df).drop_duplicates(keep=self.keep_duplicate)
-
-		self._errors = errors
-		self.sources = ',\n'.join(self.filepaths)
-		return df_result
-
-	def load(self, **kwargs) -> None:
-		"""Load each file in filepaths into dataframe.
-		"""
-		print(f'\nTotal {len(self.filepaths)} file...')
-		df, t = self._load()
-		print(f'(durasi={t:.2f}s, error={self.errors})')
-
-		if self.errors:
-			choice = input(f'Terdapat {self.errors} error, tetap lanjutkan? [y/n]  ')
-			if 'y' in choice:
-				# Continue
-				pass
+			if len(valid_df)==0:
+				err = ProcessError(self.exception_prefix, f'Semua data tidak valid. (Error={len(errors)})')
+				errors.append(err)
 			else:
-				raise RuntimeError(f'Proses dihentikan oleh user. (Error={self.errors})')
+				# Combine each Dataframe in data list into one and eleminate duplicated rows
+				df_result = pd.concat(valid_df).drop_duplicates(keep=self.keep_duplicate)
 
-		self.post_load(df)
+		return df_result, errors
 
-	def post_load(self, df: pd.DataFrame) -> None:
+	def load(self, **kwargs) -> Union[pd.DataFrame, None]:
+		"""Load each file in filepaths into dataframe."""
+		self.initialize(**kwargs)
+		self.filenames = self.file_setup()
+		print(f'\nTotal {len(self.filenames)} file...')
+		t0 = time.time()
+		df, errors = self._load(**kwargs)
+		delta_time = time.time() - t0
+		self.errors.extend(errors)
+		self._duration = delta_time
+		print(f'(durasi={delta_time:.2f}s, error={len(self.errors)})')
+
+		if errors:
+			# If any error occured, do something here
+			pass
+
+		if isinstance(df, pd.DataFrame):
+			return self.post_load(df)
+		else:
+			return df
+		
+	async def async_load(self, **kwargs) -> Union[pd.DataFrame, None]:
+		"""Load each file in filepaths asynchronously & concurrently into dataframe."""
+		self.initialize(**kwargs)
+		self.filenames = self.file_setup()
+		print(f'\nTotal {len(self.filenames)} file...')
+		time_start = time.time()
+		# Execute CPU Bound process in different processes
+		df, errors = await run_cpu_bound(self._load, **kwargs)
+		delta_time = time.time() - time_start
+		self.errors.extend(errors)
+		self._duration = delta_time
+		print(f'(durasi={delta_time:.2f}s, error={len(self.errors)})')
+
+		if errors:
+			# If any error occured, do something here
+			pass
+
+		if isinstance(df, pd.DataFrame):
+			return self.post_load(df)
+		else:
+			return df
+
+	def post_load(self, df: pd.DataFrame) -> pd.DataFrame:
 		"""Executed method right after all files loaded.
 
 		Args:
 			df : Dataframe
 		"""
-		if self._date_range==None: self.set_date_range(date_start=df[self.time_series_column].min(), date_stop=df[self.time_series_column].max())
+		self.set_date_range(
+			date_start=df[self.time_series_column].min(),
+			date_stop=df[self.time_series_column].max()
+		)
+		self.sources = ',\n'.join(self.filenames)
+		self._loaded = True
+		return df
 
-	def open_files_concurrently(self, filepaths: list):
-		"""Open multiple files with Threads.
-		
-		Args:
-			filepaths : list of filepaths
-		"""
-		with ThreadPoolExecutor(len(filepaths)) as tpe:
-			futures = [tpe.submit(self.open_file, filepath, sheet_name=self.sheet_name, table_header=self.column_list, base_column=self.time_series_column) for filepath in filepaths]
-			data_list = [future.result() for future in futures]
-			return data_list, filepaths
-
-	def open_file(self, filepath: str, sheet_name: str = None, table_header: Union[list, tuple] = None, base_column: str = None, **kwargs):
+	def open_file(
+			self,
+			file: str,
+			sheet_name: Optional[str] = None,
+			table_header: Union[List, Tuple] = None,
+			base_column: str = None,
+			*args,
+			**kwargs
+		) -> Union[pd.DataFrame, Exception]:
 		"""Open single file into dataframe.
 
 		Args:
-			filepath : file source to be opened
+			file : file source to be opened
 			sheet_name : defined sheet name
 			table_header : defined header for validation
 			base_column : base column for sorting & filtering
@@ -160,13 +251,13 @@ class _FileReader:
 
 		if sheet_name is None and table_header is None: first_sheet = True		# Sheet name & header not defined, load first sheet
 
-		if len(txt_prefix)+len(filepath)+4>txt_info_len:
-			txt_path = f'"{truncate(text=filepath, max_length=txt_info_len-len(txt_prefix)-4, on="left")}"'
+		if len(txt_prefix)+len(file)+4>txt_info_len:
+			txt_path = f'"{truncate(text=file, max_length=txt_info_len-len(txt_prefix)-4, on="left")}"'
 		else:
-			txt_path = f'"{filepath}"'.ljust(txt_info_len-len(txt_prefix)-2)
+			txt_path = f'"{file}"'.ljust(txt_info_len-len(txt_prefix)-2)
 
 		try:
-			wb = load_workbook(filepath)
+			wb = load_workbook(self.iobuffers.get(file, file))
 
 			if first_sheet:
 				# Get first sheet name in workbook
@@ -182,6 +273,7 @@ class _FileReader:
 						df = ws
 						txtstatus = 'OK!'
 					else:
+						result = ProcessError(self.exception_prefix, 'Header tabel tidak sesuai', f'file={file}')
 						txtstatus = f'NOK!\r\nHeader tabel tidak sesuai.'
 			else:
 				for ws_name, sheet in wb.items():
@@ -191,24 +283,30 @@ class _FileReader:
 						txtstatus = 'OK!'
 						break
 
-				if df is None: txtstatus = f'NOK!\r\nData tidak ditemukan!'
+				if df is None:
+					result = ProcessError(self.exception_prefix, 'Data tidak ditemukan.', f'file={file}')
+					txtstatus = f'NOK!\r\nData tidak ditemukan!'
 
-			if isinstance(df, pd.DataFrame) and base_column is not None:
-				# Neglect null value on base column
-				df = df[df[base_column].notnull()]
+			if isinstance(df, pd.DataFrame):
+				if base_column is not None:
+					# Neglect null value on base column
+					df = df[df[base_column].notnull()]
+				result = df
 
 		except (ValueError, ImportError):
 			try:
 				# Attempting to open file with xml format
-				df = read_xml(filepath, **kwargs)
+				result = read_xml(file, **kwargs)
 			except (ValueError, ImportError):
+				result = ProcessError(self.exception_prefix, 'Gagal membuka file.', f'file={file}')
 				txtstatus = 'NOK!\r\nGagal membuka file.'
 		except FileNotFoundError:
+			result = ProcessError(self.exception_prefix, 'File tidak ditemukan.', f'file={file}')
 			txtstatus = 'NOK!\r\nFile tidak ditemukan.'
 
-		self.cached_file[filepath] = df
+		self.cached_file[file] = df
 		print(f'{txt_prefix} {txt_path} {txtstatus}')
-		return df
+		return result
 
 	def post_open_file(self, df: pd.DataFrame) -> pd.DataFrame:
 		"""Process right after file opened.
@@ -227,10 +325,11 @@ class _FileReader:
 		"""
 		dtstart = date_start.to_pydatetime() if isinstance(date_start, pd.Timestamp) else date_start
 		dtstop = date_stop.to_pydatetime() if isinstance(date_stop, pd.Timestamp) else date_stop
-
-		self._date_start = dtstart
-		self._date_stop = dtstop
 		self._date_range = (dtstart, dtstop)
+
+	def set_file(self, files: Union[str, FilePaths, FileDict]) -> None:
+		self._files = files
+		self.initialize()
 
 	@property
 	def date_range(self):
@@ -238,36 +337,65 @@ class _FileReader:
 
 	@property
 	def date_start(self):
-		return self._date_start
+		return self.date_range[0]
 
 	@property
 	def date_stop(self):
-		return self._date_stop
+		return self.date_range[1]
+	
+	@property
+	def duration(self) -> float:
+		return getattr(self, '_duration', None)
 
 	@property
 	def errors(self):
 		return self._errors
+
+	@property
+	def loaded(self):
+		return self._loaded
+
+	@property
+	def warnings(self):
+		return self._warnings
 
 
 class SpectrumFileReader(_FileReader):
 	"""This class used generally for loading Spectrum's Sequence of Events (SOE) files.
 
 	Args:
-		filepaths : path of file(s)
+		files : path of file(s)
 	"""
-	column_dtype: Union[dict, MappingProxyType] = immutable_dict(SOE_COLUMNS_DTYPE)
-	column_list: list = SOE_COLUMNS
+	column_dtype: DtypeMapping = immutable_dict(SOE_COLUMNS_DTYPE)
+	column_list: List[str] = SOE_COLUMNS
 	sheet_name: str = 'HIS_MESSAGES'
 	time_series_column: str = 'Time stamp'
-	cpoint_file: str = 'cpoint.xlsx'
+	cpoint_file: str = 'cpoint*.xlsx'
+	soe_control_disable: pd.DataFrame
+	soe_local_remote: pd.DataFrame
+	soe_rtu_updown: pd.DataFrame
+	soe_switching: pd.DataFrame
+	soe_synchro: pd.DataFrame
+	soe_trip: pd.DataFrame
+	soe_all: pd.DataFrame
 
-	def __init__(self, filepaths: Union[str, list], **kwargs):
-		# Load point description
-		self.cpoint_description = load_cpoint(self.cpoint_file)
+	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
 		# Need this for cooperative multiple-inheritance
-		super().__init__(filepaths, **kwargs)
+		super().__init__(files, **kwargs)
 
-	def post_load(self, df: pd.DataFrame) -> None:
+	def load(self, **kwargs) -> Tuple[pd.DataFrame, List[Any], float]:
+		"""Load each file in filepaths into dataframe."""
+		# Load point description
+		self.point_description = load_cpoint(self.cpoint_file)
+		return super().load(**kwargs)
+
+	async def async_load(self, **kwargs) -> Tuple[pd.DataFrame, List[Any], float]:
+		"""Load each file in filepaths asynchronously & concurrently into dataframe."""
+		# Load point description
+		self.point_description = load_cpoint(self.cpoint_file)
+		return await super().async_load(**kwargs)
+
+	def post_load(self, df: pd.DataFrame) -> pd.DataFrame:
 		"""Executed method right after all files loaded.
 
 		Args:
@@ -278,11 +406,12 @@ class SpectrumFileReader(_FileReader):
 			df['System time stamp'] = df['System time stamp'].map(lambda x: test_datetime_format(x))
 		# Format B2 as string value
 		df['B2'] = df['B2'].map(lambda x: re.sub(r'\.\d+', '', str(x)))
+		df_post = super().post_load(df)
+		soe_all = self.prepare_data(df_post)
+		# self.soe_all = soe_all
+		return soe_all
 
-		super().post_load(df)
-		self._soe_all = self.prepare_data(df)
-
-	def prepare_data(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+	def prepare_data(self, df: pd.DataFrame, *args, **kwargs) -> pd.DataFrame:
 		"""Filtering, convertion & validation process of dataframe input then split into specific purposes.
 
 		Args:
@@ -305,8 +434,8 @@ class SpectrumFileReader(_FileReader):
 		new_df['Status'] = new_df['Status'].str.title()
 
 		# Change B1, B2, B3 from description style into mnemonic style
-		if hasattr(self, 'cpoint_description'):
-			df_trans = self.cpoint_description.copy()
+		if hasattr(self, 'point_description'):
+			df_trans = self.point_description.copy()
 			b1_avg_len, b3_avg_len = new_df['B1'].str.len().mean(), new_df['B3'].str.len().mean()
 			is_longtext = b1_avg_len>9 or b3_avg_len>9
 			if is_longtext:
@@ -323,7 +452,8 @@ class SpectrumFileReader(_FileReader):
 			if new_df[without_description].shape[0]>0:
 				# List unknown (nan) Point Description
 				no_description = new_df.loc[without_description, col1].drop_duplicates(keep='first').values
-				print(f'{len(no_description)} poin tidak terdaftar dalam "Point Description".\n{"; ".join([str(x) for i, x in enumerate(no_description) if i<5])}{" ..." if len(no_description)>5 else ""}\nSilahkan update melalui SpectrumOfdbClient atau menambahkan manual pada file cpoint.xlsx!')
+				self.warnings.extend([f'{"/".join(map(lambda s: str(s), point))} tidak terdaftar dalam Point Description.' for point in no_description])
+				print(f'\n{len(no_description)} poin tidak terdaftar dalam "Point Description".\n{"; ".join([str(x) for i, x in enumerate(no_description) if i<5])}{" ..." if len(no_description)>5 else ""}\nSilahkan update melalui SpectrumOfdbClient atau menambahkan manual pada file cpoint.xlsx!')
 				# Fill unknown (nan) Point Description B1, B2, B3 with its own text
 				new_df.loc[without_description, col2] = new_df.loc[without_description, col1].values
 
@@ -334,58 +464,31 @@ class SpectrumFileReader(_FileReader):
 			new_df = new_df[SOE_COLUMNS + col2]
 
 		# Split into DataFrames for each purposes, not reset index
-		self._soe_control_disable = new_df[(new_df['Element']=='CD') & (new_df['Status'].isin(['Disable', 'Enable', 'Dist.']))].copy()
-		self._soe_local_remote = new_df[(new_df['Element']=='LR') & (new_df['Status'].isin(['Local', 'Remote', 'Dist.']))].copy()
-		self._soe_rtu_updown = new_df[(new_df['B1']=='IFS') & (new_df['B2']=='RTU_P1') & (new_df['Status'].isin(['Up', 'Down']))].copy()
-		self._soe_switching = new_df[(new_df['Element'].isin(self.switching_element)) & (new_df['Status'].isin(['Open', 'Close', 'Dist.']))].copy()
-		self._soe_synchro = new_df[(new_df['Element']=='CSO') & (new_df['Status'].isin(['Off', 'On', 'Dist.']))].copy()
-		self._soe_trip = new_df[new_df['Element'].isin(['CBTR', 'MTO'])].copy()
+		self.soe_control_disable = new_df[(new_df['Element']=='CD') & (new_df['Status'].isin(['Disable', 'Enable', 'Dist.']))].copy()
+		self.soe_local_remote = new_df[(new_df['Element']=='LR') & (new_df['Status'].isin(['Local', 'Remote', 'Dist.']))].copy()
+		self.soe_rtu_updown = new_df[(new_df['B1']=='IFS') & (new_df['B2']=='RTU_P1') & (new_df['Status'].isin(['Up', 'Down']))].copy()
+		self.soe_switching = new_df[(new_df['Element'].isin(self.switching_element)) & (new_df['Status'].isin(['Open', 'Close', 'Dist.']))].copy()
+		self.soe_synchro = new_df[(new_df['Element']=='CSO') & (new_df['Status'].isin(['Off', 'On', 'Dist.']))].copy()
+		self.soe_trip = new_df[new_df['Element'].isin(['CBTR', 'MTO'])].copy()
 		return new_df
-
-	@property
-	def soe_all(self):
-		return self._soe_all if hasattr(self, '_soe_all') else self.load()
-
-	@property
-	def soe_control_disable(self):
-		return self._soe_control_disable if hasattr(self, '_soe_control_disable') else self.load()
-
-	@property
-	def soe_local_remote(self):
-		return self._soe_local_remote if hasattr(self, '_soe_local_remote') else self.load()
-
-	@property
-	def soe_rtu_updown(self):
-		return self._soe_rtu_updown if hasattr(self, '_soe_rtu_updown') else self.load()
-
-	@property
-	def soe_switching(self):
-		return self._soe_switching if hasattr(self, '_soe_switching') else self.load()
-
-	@property
-	def soe_synchro(self):
-		return self._soe_synchro if hasattr(self, '_soe_synchro') else self.load()
-
-	@property
-	def soe_trip(self):
-		return self._soe_trip if hasattr(self, '_soe_trip') else self.load()
 
 
 class RCFileReader(_FileReader):
 	"""This class used for collecting / combining multiple RCD files.
 
 	Args:
-		filepaths : path of file(s)
+		files : path of file(s)
 	"""
-	column_list: list = RCD_COLUMNS
+	column_list: List[str] = RCD_COLUMNS
 	sheet_name: str = 'RC_ONLY'
 	time_series_column: str = 'Order Time'
+	rcd_all: pd.DataFrame
 
-	def __init__(self, filepaths: Union[str, list], **kwargs):
+	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
 		# Need this for cooperative multiple-inheritance
-		super().__init__(filepaths, **kwargs)
+		super().__init__(files, **kwargs)
 
-	def post_load(self, df:pd.DataFrame) -> None:
+	def post_load(self, df: pd.DataFrame) -> pd.DataFrame:
 		"""Executed method right after all files loaded.
 
 		Args:
@@ -393,11 +496,12 @@ class RCFileReader(_FileReader):
 		"""
 		# Format B2 as string value
 		df['B2'] = df['B2'].map(lambda x: re.sub(r'\.\d+', '', str(x)))
+		df_post = super().post_load(df)
+		rcd_all = self.prepare_data(df_post)
+		# self.rcd_all = rcd_all
+		return rcd_all
 
-		super().post_load(df)
-		self._rcd_all = self.prepare_data(df)
-
-	def prepare_data(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+	def prepare_data(self, df: pd.DataFrame, *args, **kwargs) -> pd.DataFrame:
 		"""Filtering & convertion process of dataframe input.
 
 		Args:
@@ -405,22 +509,20 @@ class RCFileReader(_FileReader):
 		"""
 		# Filter new DataFrame
 		new_df = df.loc[(df[self.time_series_column]>=self.date_range[0]) & (df[self.time_series_column]<=self.date_range[1]), self.column_list].copy()
-		new_df = new_df.fillna('').sort_values([self.time_series_column], ascending=[True]).reset_index(drop=True)
+		new_df = new_df.fillna('')\
+			.sort_values([self.time_series_column], ascending=[True])\
+			.reset_index(drop=True)
 		return new_df
-
-	@property
-	def rcd_all(self):
-		return self._rcd_all if hasattr(self, '_rcd_all') else self.load()
 
 
 class AVRSFileReader(_FileReader):
 	"""Class used for collecting / combining multiple AVRS files.
 
 	Args:
-		filepaths : path of file(s)
+		files : path of file(s)
 	"""
-	column_list: list = RTU_COLUMNS
-	column_mark: list = [
+	column_list: List[str] = RTU_COLUMNS
+	column_mark: List[str] = [
 		'Marked Maintenance',
 		'Marked Link Failure',
 		'Marked RTU Failure',
@@ -428,21 +530,24 @@ class AVRSFileReader(_FileReader):
 	]
 	sheet_name: str = 'DOWNTIME'
 	time_series_column: str = 'Down Time'
+	rtudown_all: pd.DataFrame
 
-	def __init__(self, filepaths: Union[str, list], **kwargs):
+	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
 		# Need this for cooperative multiple-inheritance
-		super().__init__(filepaths, **kwargs)
+		super().__init__(files, **kwargs)
 
-	def post_load(self, df: pd.DataFrame) -> None:
+	def post_load(self, df: pd.DataFrame) -> pd.DataFrame:
 		"""Executed method right after all files loaded.
 
 		Args:
 			df : Dataframe
 		"""
-		super().post_load(df)
-		self._rtudown_all = self.prepare_data(df)
+		df_post = super().post_load(df)
+		rtudown_all = self.prepare_data(df_post)
+		# self.rtudown_all = rtudown_all
+		return rtudown_all
 
-	def prepare_data(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+	def prepare_data(self, df: pd.DataFrame, *args, **kwargs) -> pd.DataFrame:
 		"""Filtering & convertion process of dataframe input.
 
 		Args:
@@ -470,34 +575,35 @@ class AVRSFileReader(_FileReader):
 		new_df = new_df.fillna('').sort_values([self.time_series_column], ascending=[True]).reset_index(drop=True)
 		return new_df
 
-	@property
-	def rtudown_all(self):
-		return self._rtudown_all if hasattr(self, '_rtudown_all') else self.load()
-
 
 class SurvalentFileReader(_FileReader):
-	column_dtype: MappingProxyType[str, dict[str, Any]] = immutable_dict(SOE_COLUMNS_DTYPE)
-	column_list: list[str] = ['Time', 'Point', 'Message', 'Operator']
+	column_dtype: DtypeMapping = immutable_dict(SOE_COLUMNS_DTYPE)
+	column_list: List[str] = ['Time', 'Point', 'Message', 'Operator']
 	sheet_name: str = 'Report'
 	time_series_column: str = 'Time'
 	datetime_format: str = '%Y-%m-%d %H:%M:%S.%f'
-	elements: list[str] = ['CBTR', 'CD', 'CSO', 'LR', 'MTO']
-	statuses: dict[str, str] = {'opened': 'Open', 'closed': 'Close', 'enabled': 'Enable', 'disabled': 'Disable', 'appear': 'Appeared'}
-	b3_dict: dict[str, str] = dict()
-	cmd_order: list[int] = list()
-	cmd_neg_feedback: list[int] = list()
+	elements: List[str] = ['CBTR', 'CD', 'CSO', 'LR', 'MTO']
+	statuses: Dict[str, str] = {'opened': 'Open', 'closed': 'Close', 'enabled': 'Enable', 'disabled': 'Disable', 'appear': 'Appeared'}
+	b3_dict: Dict[str, str] = dict()
+	cmd_order: List[int] = list()
+	cmd_neg_feedback: List[int] = list()
+	soe_all: pd.DataFrame
 
-	def post_load(self, df: pd.DataFrame) -> None:
+	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
+		super().__init__(files, **kwargs)
+
+	def post_load(self, df: pd.DataFrame) -> pd.DataFrame:
 		"""Executed method right after all files loaded.
 
 		Args:
 			df : Dataframe
 		"""
 		df_extracted = self.extractor(df)
-		self._soe_all = df_extracted
+		self.soe_all = df_extracted
 		# Change time series reference
 		self.time_series_column = 'Time stamp'
-		super().post_load(df_extracted)
+		df_post = super().post_load(df_extracted)
+		return df_post
 
 	def find_cmd_status(self, df: pd.DataFrame, feedback_index: int) -> str:
 		"""Find negative feedback "Status" parameter from previous command.
@@ -529,7 +635,7 @@ class SurvalentFileReader(_FileReader):
 		df0[['Point B3', 'Element']] = df0['Point'].str.split(',', expand=True)
 
 		# Filter only required element
-		df0 = df0[(df0['Element'].isin(self.elements + self.switching_element)) & ~((df0['Message'].str.contains('Put in scan')) | (df0['Message'].str.contains('ALL ALARMS BLOCKED')) | (df0['Message'].str.contains('Blocked')) | (df0['Message'].str.contains('Unblocked')))].reset_index(drop=True)
+		df0 = df0[(df0['Element'].isin(self.elements + self.switching_element)) & ~((df0['Message'].str.contains('Put in scan')) | (df0['Message'].str.contains('ALL ALARMS BLOCKED')) | (df0['Message'].str.contains('Blocked')) | (df0['Message'].str.contains('Unblocked')) | (df0['Message'].str.contains('Manual input')))].reset_index(drop=True)
 		df0['A'] = ''
 		df0[['Time stamp', 'Milliseconds']] = df0['Time'].str.split('.', expand=True)
 		df0[['System time stamp', 'System milliseconds']] = df0[['Time stamp', 'Milliseconds']]
@@ -547,17 +653,14 @@ class SurvalentFileReader(_FileReader):
 		# Modify columns for statuses
 		for elm1 in self.elements + self.switching_element:
 			self.extract_status(df0, elm1)
-
 		# Update b3_dict
 		# Used in defining command's B1 column
 		b3_unique = df0.loc[df0['B1']!='', ['B1', 'B3']].drop_duplicates(keep='first').values
 		for vb1, vb3 in b3_unique:
 			if vb3!='': self.b3_dict[vb3] = vb1
-
 		# Modify columns for commands
 		for elm2 in self.switching_element:
 			self.extract_command(df0, elm2)
-
 		# Modify columns for negative feedback
 		for ind in self.cmd_neg_feedback:
 			cmd_sts = self.find_cmd_status(df0, ind)
@@ -598,7 +701,9 @@ class SurvalentFileReader(_FileReader):
 				b3 = ''
 				sts = self.statuses[_rsplit[0].lower()] if _rsplit[0].lower() in self.statuses else _rsplit[0].title()
 			else:
-				raise IndexError(f'Error extracting value! key="{msg}", string=[{pb3}, {elm}]')
+				err = ProcessError('', 'Gagal mengekstrak event status!', f'key="{msg}", string=[{pb3}, {elm}]')
+				self._errors.append(err)
+				raise err
 
 			df.loc[i, ['B1', 'B3', 'Status', 'RTU ID']] = [b1, b3, sts, pointid]
 
@@ -633,14 +738,11 @@ class SurvalentFileReader(_FileReader):
 					self.cmd_order.append(i)
 				b1 = self.b3_dict.get(b3, '')
 			else:
-				raise IndexError(f'Error extracting value! index={i} key="{msg}", string=[{b3}, {elm}]')
+				err = ProcessError('', 'Gagal mengekstrak event kontrol!', f'key="{msg}", string=[{b3}, {elm}]')
+				self._errors.append(err)
+				raise err
 
 			df.loc[i, ['B1', 'B3', 'Status', 'Tag']] = [b1, b3, sts, tag]
-
-
-	@property
-	def soe_all(self):
-		return self._soe_all if hasattr(self, '_soe_all') else self.load()
 
 
 def test_random_file(**params):
@@ -657,35 +759,39 @@ def test_random_file(**params):
 def test_file_not_exist(**params):
 	print(' TEST FILE NOT FOUND '.center(CONSOLE_WIDTH, '#'))
 	f = SpectrumFileReader('sample/file_not_existed.xlsx')
+	f.load()
 	return f
 
 def test_wrong_file(**params):
 	print(' TEST WRONG FILE '.center(CONSOLE_WIDTH, '#'))
 	f = SpectrumFileReader('sample/wrong_file_1.xlsx')
+	f.load()
 	return f
 
 def test_file_spectrum(**params):
 	print(' TEST FILE SOE SPECTRUM '.center(CONSOLE_WIDTH, '#'))
-	f = SpectrumFileReader('sample/sample_rcd*.xlsx')
+	f = SpectrumFileReader('sample/sample_rcd*.xlsx, /home/fasop/Documents/HW_SPEC_SCADA.xlsx')
 	print('\r\n' + ' TEST FILE SOE SPECTRUM CONCURRENTLY '.center(CONSOLE_WIDTH, '#'))
-	# f.load_()
+	f.load()
 	return f
 
 def test_file_survalent(**params):
 	print(' TEST FILE SOE SURVALENT '.center(CONSOLE_WIDTH, '#'))
 	f = SurvalentFileReader('sample/survalent/sample_soe*.XLSX')
 	print('\r\n' + ' TEST FILE SOE SURVALENT CONCURRENTLY '.center(CONSOLE_WIDTH, '#'))
-	# f.load_()
+	f.load()
 	return f
 
 def test_file_rcd_collective(**params):
 	print(' TEST FILE RCD COLLECTIVE '.center(CONSOLE_WIDTH, '#'))
 	f = RCFileReader('sample/sample_rcd*.xlsx')
+	f.load()
 	return f
 
 def test_file_rtu_collective(**params):
 	print(' TEST FILE RTU COLLECTIVE '.center(CONSOLE_WIDTH, '#'))
 	f = AVRSFileReader('sample/sample_rtu*.xlsx')
+	f.load()
 	return f
 
 if __name__=='__main__':
@@ -703,7 +809,6 @@ if __name__=='__main__':
 		print('\r\n'.join([f'  {no+1}.'.ljust(6) + tst[0] for no, tst in enumerate(test_list)]))
 		choice = int(input(f'\r\nPilih modul test [1-{len(test_list)}] :  ')) - 1
 		if choice in range(len(test_list)):
-			print()
 			test = test_list[choice][1]()
 		else:
 			print('Pilihan tidak valid!')

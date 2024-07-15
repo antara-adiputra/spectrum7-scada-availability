@@ -71,6 +71,7 @@ class ConsoleApp:
 				pu.clear()
 				try:
 					calc = instance(filepaths)
+					calc.load()
 					calc.calculate()
 
 					if pu.confirm_answer('y', f'\nExport hasil?'):
