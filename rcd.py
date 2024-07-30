@@ -4,6 +4,7 @@ from io import BytesIO
 from types import MappingProxyType
 from typing import Any, Dict, List, Callable, Iterable, Optional, Tuple, TypeAlias, Union
 
+import config
 import numpy as np
 import pandas as pd
 from xlsxwriter.utility import xl_col_to_name
@@ -31,7 +32,7 @@ class _Export(XLSExportMixin):
 	rc_element: List[str]
 	check_repetition: bool
 	result: Dict[str, Dict[str, Any]]
-	threshold_variable: int
+	reduction_ratio_threshold: int
 	output_prefix: str = 'RCD'
 
 	def get_sheet_info_data(self, **kwargs):
@@ -43,7 +44,7 @@ class _Export(XLSExportMixin):
 			('SETTING', ''),
 			('RC Element', ', '.join(self.rc_element)),
 			('RC Repetition', 'last-occurrence-only' if self.check_repetition else 'calculate-all'),
-			('Threshold (default=1)', self.threshold_variable),
+			('Threshold (default=1)', self.reduction_ratio_threshold),
 			('', ''),
 			('SUMMARY', ''),
 			('Success Percentage', self.result['overall']['percentage']),
@@ -940,7 +941,7 @@ class _RCDBaseCalculation(BaseAvailability):
 		**
 	"""
 	name: str = 'Remote Control SCADA'
-	threshold_variable: int = 1
+	reduction_ratio_threshold: int = 1
 	rcd_all: pd.DataFrame
 	station: pd.DataFrame
 	bay: pd.DataFrame
@@ -1534,6 +1535,7 @@ class SOEtoRCD(_RCDBaseCalculation, _SOEAnalyzer, _Export):
 
 
 class RCDCollective(RCFileReader, RCD):
+	__params__: set = {'calculate_bi', 'check_repetition', 'reduction_ratio_threshold'}
 
 	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
 		super().__init__(files, **kwargs)
@@ -1550,6 +1552,7 @@ class RCDCollective(RCFileReader, RCD):
 
 
 class RCDFromFile(SpectrumFileReader, SOEtoRCD):
+	__params__: set = {'calculate_bi', 'check_repetition', 'success_mark', 'failed_mark', 'unused_mark', 'reduction_ratio_threshold'}
 
 	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
 		super().__init__(files, **kwargs)
@@ -1566,6 +1569,7 @@ class RCDFromFile(SpectrumFileReader, SOEtoRCD):
 
 
 class RCDFromFile2(SurvalentFileReader, SOEtoRCD):
+	__params__: set = {'calculate_bi', 'check_repetition', 'success_mark', 'failed_mark', 'unused_mark', 'reduction_ratio_threshold'}
 
 	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
 		super().__init__(files, **kwargs)
@@ -1582,8 +1586,9 @@ class RCDFromFile2(SurvalentFileReader, SOEtoRCD):
 
 
 class RCDFromOFDB(SpectrumOfdbClient, SOEtoRCD):
+	__params__: set = {'calculate_bi', 'check_repetition', 'success_mark', 'failed_mark', 'unused_mark', 'reduction_ratio_threshold'}
 
-	def __init__(self, date_start: datetime, date_stop: Optional[datetime.datetime] = None, **kwargs):
+	def __init__(self, date_start: Optional[datetime.datetime] = None, date_stop: Optional[datetime.datetime] = None, **kwargs):
 		super().__init__(date_start, date_stop, **kwargs)
 
 

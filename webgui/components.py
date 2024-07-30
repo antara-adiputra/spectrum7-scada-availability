@@ -1,14 +1,16 @@
 import asyncio
 from io import BytesIO
-from typing import Any, Dict, List, Callable, Optional, Tuple, TypeAlias, Union
+from typing import Any, Dict, List, Callable, Literal, Optional, Tuple, TypeAlias, Union
 
+import config
 import pandas as pd
 from avrs import AVRSFromOFDB, AVRSFromFile, AVRSCollective
 from rcd import RCDFromOFDB, RCDFromFile, RCDFromFile2, RCDCollective
 from lib import rgetattr
 from nicegui import ui, events
-from worker import BackgroundWorker, run_cpu_bound
-from .state import FileProcessorState
+from nicegui.elements.mixins.value_element import ValueElement
+from worker import run_cpu_bound
+from .state import FileProcessorState, OfdbProcessorState
 
 
 FileCalcObjects: TypeAlias = Union[AVRSFromFile, AVRSCollective, RCDFromFile, RCDFromFile2, RCDCollective]
@@ -22,7 +24,7 @@ class MenuTitle(ui.label):
 
 	def __init__(self, text: str = '') -> None:
 		super().__init__(text)
-		self._classes = ['text-h5', 'font-extrabold', 'w-full', 'text-teal-700']
+		self.classes('text-2xl md:text-3xl font-extrabold w-full text-teal-700')
 
 
 class MenuSubtitle(ui.label):
@@ -31,14 +33,14 @@ class MenuSubtitle(ui.label):
 
 	def __init__(self, text: str = '') -> None:
 		super().__init__(text)
-		self._classes = ['text-subtitle1', 'font-bold', 'w-full', 'text-teal-400']
+		self.classes('text-base md:text-lg font-bold w-full text-teal-400')
 
 
 class Button(ui.button):
 	"""Extended nicegui ui.button.
 	Add contexts into button element attributes.
 	"""
-	__used__: set = {'add_resource', 'add_slot', 'bind_enabled', 'bind_enabled_from', 'bind_enabled_to', 'bind_text', 'bind_text_from', 'bind_text_to', 'bind_visibility', 'bind_visibility_from', 'bind_visibility_to', 'classes', 'clear', 'clicked', 'client', 'component', 'default_classes', 'default_props', 'default_slot', 'default_style', 'delete', 'disable', 'enable', 'enabled', 'exposed_libraries', 'extra_libraries', 'id', 'ignores_events_when_disabled', 'ignores_events_when_hidden', 'is_deleted', 'is_ignoring_events', 'libraries', 'move', 'on', 'on_click', 'parent_slot', 'props', 'remove', 'run_method', 'set_enabled', 'set_text', 'set_visibility', 'slots', 'style', 'tag', 'tailwind', 'text', 'tooltip', 'update', 'visible'}
+	__used__: set
 
 	def __init__(self,
 		text: str = '',
@@ -49,22 +51,69 @@ class Button(ui.button):
 		**contexts
 	) -> None:
 		super().__init__(text, on_click=on_click, color=color, icon=icon)
+		self.__used__ = set([attr for attr in dir(ui.button) if not (attr.startswith('_') and attr.endswith('_'))])
 		# Add custom attribute
 		for key in contexts:
 			if not key.startswith('_') and key not in self.__used__: setattr(self, key, contexts[key])
 
 
+class ObjectDebugger(ui.expansion):
+	"""Component which used to display object attributes for debug purpose only."""
+	__used__: set
+	excluded: List[str]
+	included: List[str]
+
+	def __init__(
+		self,
+		text: str = '',
+		object: Optional[Any] = None,
+		*,
+		caption: Optional[str] = None,
+		icon: Optional[str] = None,
+		group: Optional[str] = None,
+		value: bool = False,
+		on_value_change: Optional[Callable[..., Any]] = None,
+		**contexts
+	) -> None:
+		title = text if text else repr(object)
+		super().__init__(text=title, caption=caption, icon=icon, group=group, value=value, on_value_change=on_value_change)
+		self.__used__ = set([attr for attr in dir(ui.expansion) if not (attr.startswith('_') and attr.endswith('_'))])
+		self._object = object
+		self.props(add='dense')
+		self.classes('w-full')
+		if 'included' not in contexts: self.included = list()
+		if 'excluded' not in contexts: self.excluded = list()
+		# Add custom attribute
+		for key in contexts:
+			if not key.startswith('_') and key not in self.__used__: setattr(self, key, contexts[key])
+
+	def render(self) -> ui.expansion:
+		with self:
+			with ui.grid(columns='auto auto').classes('w-full gap-0'):
+				for attr in dir(self._object):
+					if not attr.startswith('__') or (attr in self.included and attr not in self.excluded):
+						ui.label(attr).classes('border')
+						ui.label('').classes('border').bind_text_from(self._object, attr, lambda x: repr(x) if callable(x) else str(x))
+		return self
+
+	def refresh(self) -> None:
+		"""Refreshable content"""
+		self.clear()
+		self.render()
+
+
 class _Stepper(ui.stepper):
 	"""
 	"""
-	__used__: set = {'add_resource', 'add_slot', 'bind_value', 'bind_value_from', 'bind_value_to', 'bind_visibility', 'bind_visibility_from', 'bind_visibility_to', 'classes', 'clear', 'component', 'default_classes', 'default_props', 'default_style', 'delete', 'exposed_libraries', 'extra_libraries', 'is_deleted', 'is_ignoring_events', 'libraries', 'move', 'next', 'on', 'on_value_change', 'previous', 'props', 'remove', 'run_method', 'set_value', 'set_visibility', 'style', 'tooltip', 'update', 'value', 'visible'}
+	__used__: set
 	step_contents: List[Dict[str, Any]] = list()
 	button_classes: str = 'px-2'
 	button_props: str = 'dense no-caps size=md'
 	auto_next: bool = True
 	auto_next_delay: float = 1.5
 
-	def __init__(self,
+	def __init__(
+		self,
 		*,
 		value: Union[str, ui.step, None] = None,
 		on_value_change: Optional[Callable[..., Any]] = None,
@@ -72,8 +121,7 @@ class _Stepper(ui.stepper):
 		**contexts
 	) -> None:
 		super().__init__(value=value, on_value_change=on_value_change, keep_alive=keep_alive)
-
-		self.worker = BackgroundWorker()
+		self.__used__ = set([attr for attr in dir(ui.stepper) if not (attr.startswith('_') and attr.endswith('_'))])
 		self._step_objects = dict()
 		self.props(add='vertical flat done-color=positive active-color=accent active-icon=my_location error-color=negative')
 		self.classes('w-full h-full p-0')
@@ -145,7 +193,7 @@ class FilePicker(ui.dialog):
 
 	def render(self) -> ui.dialog:
 		with self, ui.card().classes('p-0 gap-y-0'):
-			self._fileupload = ui.upload(label='Upload File Excel', multiple=True, on_multi_upload=self._handle_uploaded_multiple)\
+			self._fileupload = ui.upload(label='Upload File Excel', multiple=True, max_files=config.MAX_FILES, max_file_size=config.MAX_FILE_SIZE, max_total_size=config.MAX_TOTAL_SIZE, on_multi_upload=self._handle_uploaded_multiple)\
 				.props(self.upload_props)\
 				.classes(self.upload_classes)\
 				.on('added', self._handle_queue_added)\
@@ -237,7 +285,16 @@ class FilePicker(ui.dialog):
 
 
 class FileProcessor(_Stepper):
-	"""
+	"""Display component that handle calculation from files.
+
+	Args:
+		instance :
+		value :
+		on_value_change :
+		keep_alive :
+
+	Acceptable contexts:
+
 	"""
 	instance: FileCalcObjects
 	step_contents: List[Dict[str, Any]] = [
@@ -278,6 +335,7 @@ class FileProcessor(_Stepper):
 			'navigation': [
 				{'text': 'Kembali', 'on_click': 'previous'},
 				{'text': 'Hitung', 'on_click': '_handle_calculate'},
+				{'text': 'Lihat Hasil', 'on_click': '_handle_preview_result'},
 				{'text': 'Lanjut', 'on_click': 'next'},
 			]
 		},
@@ -289,7 +347,6 @@ class FileProcessor(_Stepper):
 			'navigation': [
 				{'text': 'Kembali', 'on_click': 'previous'},
 				{'text': 'Unduh', 'on_click': '_handle_download_result'},
-				{'text': 'Lihat Hasil', 'on_click': '_handle_preview_result'},
 				{'text': 'Selesai', 'on_click': 'next'},
 			]
 		},
@@ -304,17 +361,19 @@ class FileProcessor(_Stepper):
 		},
 	]
 
-	def __init__(self,
+	def __init__(
+		self,
 		*,
+		instance: Optional[Any] = None,
 		value: Union[str, ui.step, None] = None,
 		on_value_change: Optional[Callable[..., Any]] = None,
 		keep_alive: bool = True,
 		**contexts
 	) -> None:
 		super().__init__(value=value, on_value_change=on_value_change, keep_alive=keep_alive, **contexts)
+		self.instance = instance
 		self.state = FileProcessorState()
 		self.filepicker = self._init_filepicker()
-		self.instance = None
 		self.result = list()
 
 	def _init_filepicker(self) -> FilePicker:
@@ -426,7 +485,7 @@ class FileProcessor(_Stepper):
 						.classes(self.button_classes)
 					if btn['text']=='Hitung':
 						qbtn.bind_enabled_from(self.state, 'is_calculating', lambda state: not state)
-					elif btn['text']=='Lanjut':
+					elif btn['text']=='Lanjut' or btn['text']=='Lihat Hasil':
 						qbtn.bind_visibility_from(self.state, 'calculated')
 				self.calculation_progress()
 				ui.icon(name='check_circle_outline', size='sm', color='positive')\
@@ -573,9 +632,11 @@ class FileProcessor(_Stepper):
 					.classes('w-full') as warning_info:
 					with ui.list().props(f'dense').classes('w-full pr-0 text-sm'):
 						for wrn in warnings:
-							with ui.item():
+							with ui.item().props('dense clickable'):
 								with ui.item_section():
-									ui.label(str(wrn))
+									with ui.row(wrap=False, align_items='center').classes('p-0'):
+										ui.icon('report_problem', size='xs', color='warning')
+										ui.label(str(wrn))
 				with ui.expansion(f'error ({len(errors)})')\
 					.bind_visibility_from(self.instance, 'errors', lambda err: len(err)>0)\
 					.props('dense dense-toggle header-class="px-2 text-red-700" expand-icon=more_horiz expanded-icon=expand_less')\
@@ -614,30 +675,31 @@ class FileProcessor(_Stepper):
 class OfdbProcessor(_Stepper):
 	"""
 	"""
+	instance: OfdbCalcObjects
 	step_contents: List[Dict[str, Any]] = [
 		{
 			'name': 'setup',
 			'title': 'Setup',
 			'icon': 'tune',
-			'description': 'Tahap persiapan.',
+			'description': 'Persiapan koneksi ke OFDB untuk pengambilan data kinerja.',
 			'navigation': [
 				{'text': 'Mulai', 'on_click': '_handle_setup'},
 			]
 		},
 		{
-			'name': 'connection_check',
+			'name': 'server_check',
 			'title': 'Koneksi Server',
 			'icon': 'cable',
-			'description': 'Periksa konektivitas perangkat dengan server OFDB.',
+			'description': 'Periksa konektivitas dengan server OFDB.',
 			'navigation': [
 				{'text': 'Cek', 'on_click': '_handle_server_connection'},
 			]
 		},
 		{
-			'name': 'query_data',
+			'name': 'query',
 			'title': 'Query Data',
 			'icon': 'cloud_download',
-			'description': 'Tahap proses query data dari server OFDB.',
+			'description': 'Proses pengambilan data dari server OFDB.',
 			'navigation': [
 				{'text': 'Query', 'on_click': '_handle_query_data'},
 				{'text': 'Lihat Data', 'on_click': '_handle_preview_query'},
@@ -647,7 +709,7 @@ class OfdbProcessor(_Stepper):
 			'name': 'calculate',
 			'title': 'Hitung Availability',
 			'icon': 'calculate',
-			'description': 'Tahap analisa dan perhitungan availability.',
+			'description': 'Analisa dan lakukan proses perhitungan kinerja.',
 			'navigation': [
 				{'text': 'Hitung', 'on_click': '_handle_calculate'},
 			]
@@ -656,7 +718,7 @@ class OfdbProcessor(_Stepper):
 			'name': 'download',
 			'title': 'Unduh Hasil',
 			'icon': 'file_download',
-			'description': 'Export hasil kalkulasi kedalam bentuk file Excel?',
+			'description': 'Export hasil perhitungan kedalam bentuk file Excel.',
 			'navigation': [
 				{'text': 'Unduh', 'on_click': '_handle_download_result'},
 				{'text': 'Lihat Hasil', 'on_click': '_handle_preview_result'},
@@ -674,14 +736,70 @@ class OfdbProcessor(_Stepper):
 		},
 	]
 
+	def __init__(
+		self,
+		*,
+		instance: Optional[Any] = None,
+		value: Union[str, ui.step, None] = None,
+		on_value_change: Optional[Callable[..., Any]] = None,
+		keep_alive: bool = True,
+		**contexts
+	) -> None:
+		super().__init__(value=value, on_value_change=on_value_change, keep_alive=keep_alive, **contexts)
+		self.instance = instance
+		self.state = OfdbProcessorState()
+
 	def reset(self, *args, **kwargs) -> None:
 		self.set_value(self.step_contents[0]['name'])
+		self.state.reset()
+
+	def render_server_check(
+		self,
+		name: str,
+		title: str,
+		icon: Optional[str] = None,
+		navigation: List[Dict[str, str]] = [],
+		description: str = ''
+	) -> ui.step:
+		_icon = 'none' if icon is None else icon
+		with ui.step(name=name, title=title, icon=_icon) as qstep:
+			ui.label(description)
+			with ui.stepper_navigation().style('padding: 0; align-items: center;') as qstep_nav:
+				for btn in navigation:
+					handler = getattr(self, btn['on_click'], None)
+					Button(text=btn['text'], on_click=handler)\
+						.bind_enabled_from(self.state, 'connecting_to_server', lambda x: not x)\
+						.props(self.button_props)\
+						.classes(self.button_classes)
+				Button(text='Lanjut', on_click=self.next)\
+						.bind_enabled_from(self.state, 'server_available')\
+						.props(self.button_props)\
+						.classes(self.button_classes)
+				ui.icon(name='check_circle_outline', size='sm', color='positive')\
+					.bind_visibility_from(self, 'state', lambda state: state.initialized and state.server_available)\
+					.tooltip('Koneksi server OK')
+				ui.icon(name='error_outline', size='sm', color='negative')\
+					.bind_visibility_from(self, 'state', lambda state: state.initialized and not state.server_available)\
+					.tooltip('Koneksi server NOK')
+				ui.spinner('radio')\
+					.bind_visibility_from(self.state, 'connecting_to_server')\
+					.props('size=sm thickness=5 color=accent')
+		return qstep
 
 	async def _handle_setup(self, e: events.ClickEventArguments) -> None:
 		self.next()
 
 	async def _handle_server_connection(self, e: events.ClickEventArguments) -> None:
-		pass
+		self.state.pre_communication()
+		self.state.connecting_to_server = True
+		server_available = await run_cpu_bound(self.instance.check_server)
+		if server_available:
+			ui.notify(f'Berhasil terhubung ke server.', color='positive')
+		else:
+			ui.notify(f'Gagal menghubungkan ke server.', color='negative')
+		self.state.connecting_to_server = False
+		self.state.initialized = True
+		self.state.server_available = server_available
 
 	async def _handle_query_data(self, e: events.ClickEventArguments) -> None:
 		pass
@@ -700,3 +818,206 @@ class OfdbProcessor(_Stepper):
 
 	async def _handle_completed(self, e: events.ClickEventArguments) -> None:
 		pass
+
+
+class BaseSettingMenu(ui.list):
+	"""Base setting menu"""
+	parameters: List[Dict[str, Any]] = list()
+
+	def __init__(self) -> None:
+		super().__init__()
+		# self.props(add='bordered')
+		self.classes('py-2')
+		self._params: List[str] = list()
+		self._cfg = self._regenerate_params()
+		self._changed: bool = False
+		self.config_instance: Dict[str, Any] = self.get_configuration()
+
+	def _regenerate_params(self) -> Dict[str, List[Dict[str, Any]]]:
+		cfg: Dict[str, List[Dict[str, Any]]] = dict()
+		for dcfg in self.parameters:
+			group = dcfg.get('config_group', '')
+			if group in cfg:
+				cfg[group].append(dcfg)
+			else:
+				cfg[group] = [dcfg]
+			self._params.append(dcfg['config_name'].upper())
+		return cfg
+	
+	def get_configuration(self) -> Dict[str, Any]:
+		return {param: getattr(config, param) for param in self._params}
+	
+	def parse_props_from_dict(self, **props: Dict[str, Any]) -> str:
+		_props = list()
+		for pkey, pval in props.items():
+			if type(pval)==str:
+				_props.append(f'{pkey}="{pval}"')
+			elif type(pval) in (int, float):
+				_props.append(f'{pkey}={pval}')
+			else:
+				_props.append(pkey)
+		return ' '.join(_props)
+	
+	def parse_style_from_dict(self, **styles: Dict[str, Any]) -> str:
+		_styles = list()
+		for skey, sval in styles.items():
+			_styles.append(f'{skey}:{sval}')
+		return ';'.join(_styles)
+
+	def render(self) -> ui.list:
+		group_idx = 0
+		with self:
+			for group, configs in self._cfg.items():
+				if group_idx>0: ui.separator().classes('my-2')
+				if group: ui.item_label(group.upper()).props('header').classes('font-extrabold')
+				for cfg in configs:
+					if globals().get(cfg['comp']) is not None:
+						# Using custom defined component
+						element = globals()[cfg['comp']]
+						with ui.item().props(f'dense').style('padding: 0;'):
+							element(**cfg.get('comp_kwargs', {}))\
+								.bind_value(self.config_instance, cfg['config_name'].upper())\
+								.on_value_change(self._handle_config_change)\
+								.props(self.parse_props_from_dict(**cfg.get('comp_props', {})))\
+								.classes(' '.join(cfg.get('comp_classes', [])))\
+								.style(self.parse_style_from_dict(**cfg.get('comp_style', {})))
+					else:
+						# Using nucegui component
+						element = getattr(ui, cfg['comp'], ui.input)
+						with ui.item().props(f'dense {"tag=label" if cfg["comp"] in ("input", "select") else ""}'):
+							with ui.item_section():
+								helper = cfg.get('description')
+								with ui.row(align_items='center').classes('p-0 gap-0'):
+									ui.item_label(cfg['config_label'])
+									if helper:
+										ui.icon('help_outline', size='xs', color='teal')\
+											.classes('pl-3 pb-px')\
+											.tooltip(helper).props("anchor='bottom left' self='top left' max-width=8rem")
+							with ui.item_section().props('side'):
+								if cfg['config_name']=='dark_mode':
+									element(**cfg.get('comp_kwargs', {}))\
+										.bind_value(ui.dark_mode(config.DARK_MODE))\
+										.on_value_change(self._handle_dark_mode_change)\
+										.props(self.parse_props_from_dict(**cfg.get('comp_props', {})))\
+										.classes(' '.join(cfg.get('comp_classes', [])))\
+										.style(self.parse_style_from_dict(**cfg.get('comp_style', {})))
+								else:
+									element(**cfg.get('comp_kwargs', {}))\
+										.bind_value(self.config_instance, cfg['config_name'].upper())\
+										.on_value_change(self._handle_config_change)\
+										.props(self.parse_props_from_dict(**cfg.get('comp_props', {})))\
+										.classes(' '.join(cfg.get('comp_classes', [])))\
+										.style(self.parse_style_from_dict(**cfg.get('comp_style', {})))
+				group_idx += 1
+			with ui.item().props('dense').classes('flex-row-reverse pt-4'):
+				with ui.row(align_items='center').classes('p-0 gap-x-0.5'):
+					button = Button.default_props('dense no-caps').default_classes('px-2')
+					# button('Print', on_click=lambda: print(self.config_instance))
+					button('Reset Default', on_click=self._handle_restore_default)
+					button('Batal', on_click=self._handle_fetch_config).bind_enabled_from(self, 'changed')
+					button('Simpan', on_click=self._handle_save_config).bind_enabled_from(self, 'changed')
+		return self
+
+	async def _handle_config_change(self, e: events.ValueChangeEventArguments) -> None:
+		self._changed = True
+
+	async def _handle_dark_mode_change(self, e: events.ValueChangeEventArguments) -> None:
+		self.config_instance['DARK_MODE'] = e.value
+		self._changed = True
+
+	async def _handle_fetch_config(self, e: events.ClickEventArguments) -> None:
+		self.config_instance.update(self.get_configuration())
+		await asyncio.sleep(0.25)	# Make some delay for event bindings
+		self._changed = False
+
+	async def _handle_save_config(self, e: events.ClickEventArguments) -> None:
+		try:
+			config.save(**self.config_instance)
+			ui.notify('Pengaturan berhasil disimpan.', type='positive')
+			self._changed = False
+		except Exception as err:
+			ui.notify(f'Gagal menyimpan pengaturan! {". ".join(err.args)}', type='negative')
+
+	async def _handle_restore_default(self, e: events.ClickEventArguments) -> None:
+		try:
+			# Load default configuration
+			default = {dkey: dval for dkey, dval in config.__DEFAULT__.items() if dkey in self._params}
+			# Restore only owned parameters
+			self.config_instance.update(default)
+			ui.notify('Parameter telah dipulihkan ke pengaturan default.\nSilahkan "Simpan" untuk menerapkan pengaturan.', type='info', multi_line=True, classes='multi-line-notification')
+		except Exception as err:
+			ui.notify(f'Gagal memulihkan ke pengaturan default! {". ".join(err.args)}', type='negative')
+
+	@property
+	def changed(self):
+		return self._changed
+
+
+class DowntimeRulesInput(ValueElement, ui.list):
+	""""""
+
+	def __init__(self, value: List[List[Any]], on_change: Optional[Callable[..., Any]] = None) -> None:
+		super().__init__(value=value, on_value_change=on_change)
+		self.classes('w-full')
+		self.value1 = {label: hour for label, hour in value}
+		self._render()
+
+	def _render(self) -> ui.list:
+		with self:
+			for name in self.value1:
+				with ui.item().props('dense tag=label') as item:
+					# with ui.row(align_items='center').classes('w-full gap-1 justify-between'):
+					with ui.item_section():
+						ui.label(name)
+					with ui.item_section().props('side'):
+						with ui.input()\
+							.bind_value(self.value1, name, forward=lambda x: int(x))\
+							.on_value_change(self._handle_value1_change)\
+							.props(f'dense square filled standout type=number')\
+							.classes('md:w-80') as qinput:
+							with qinput.add_slot('prepend'):
+								ui.label('>').classes('text-sm')
+							with qinput.add_slot('append'):
+								ui.label('jam').classes('text-sm')
+		return self
+	
+	def _handle_value_change(self, value: Any) -> None:
+		super()._handle_value_change(value)
+		# Refresh component when value changed
+		self.value1 = {label: hour for label, hour in value}
+		self.clear()
+		self._render()
+	
+	def _handle_value1_change(self, e: events.ValueChangeEventArguments) -> None:
+		self.set_value([[key, val] for key, val in self.value1.items()])
+
+
+class GeneralSettingMenu(BaseSettingMenu):
+	"""General setting menu component"""
+	parameters = [
+		{
+			'config_name': 'dark_mode',
+			'config_type': 'bool',
+			'config_label': 'Mode Gelap',
+			'config_group': '',
+			'description': 'Aktifkan atau matikan mode gelap.',
+			'comp': 'switch',
+			'comp_kwargs': {},
+			'comp_props': {},
+		}
+	]
+
+
+class OfdbSettingMenu(BaseSettingMenu):
+	"""RCD setting menu component."""
+	parameters = config.PARAMETER_OFDB
+
+
+class RCDSettingMenu(BaseSettingMenu):
+	"""RCD setting menu component."""
+	parameters = config.PARAMETER_RCD
+
+
+class AVRSSettingMenu(BaseSettingMenu):
+	"""RCD setting menu component."""
+	parameters = config.PARAMETER_AVRS

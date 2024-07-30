@@ -1,99 +1,92 @@
-import socket
+import socket, datetime
 from configparser import ConfigParser
-from datetime import datetime, timedelta
-from typing import Union
+from types import MappingProxyType
+from typing import Any, Dict, List, Callable, Literal, Optional, Tuple, TypeAlias, Union
 
+import config
 import pandas as pd
-import pyodbc
 import sqlalchemy as sa
 from global_parameters import SOE_COLUMNS, SOE_COLUMNS_DTYPE
 from lib import calc_time, immutable_dict, load_cpoint, validate_cpoint
 
 
+DtypeMapping: TypeAlias = MappingProxyType[str, Dict[str, Any]]
+
+
 class SpectrumOfdbClient:
 	__slot__ = ['connection_driver', 'switching_element']
-	_dbotbl_analog = 'dbo.scd_his_10_anat'
-	_dbotbl_cpoint = 'dbo.scd_c_point'
-	_dbotbl_digital = 'dbo.scd_his_11_digitalt'
-	_dbotbl_hismsg = 'dbo.scd_his_message'
+	_errors: List[Any]
+	_warnings: List[Any]
+	_dbo_point: str = config.OFDB_TABLE_POINT
+	_dbo_digital: str = config.OFDB_TABLE_DIGITAL
+	_dbo_historical: str = config.OFDB_TABLE_HISTORICAL
+	_schemas: str = config.OFDB_SCHEMA
+	_tables: MappingProxyType = immutable_dict({
+		'point': config.OFDB_TABLE_POINT,
+		'digital': config.OFDB_TABLE_DIGITAL,
+		'historical': config.OFDB_TABLE_HISTORICAL,
+	})
 	_conf_path = '.config'
-	column_dtype = immutable_dict(SOE_COLUMNS_DTYPE)
-	column_list = SOE_COLUMNS
-	cpoint_file = 'cpoint.xlsx'
-	# Timezone for Asia/Makassar
-	tzone = timedelta(hours=8)
-	keep_duplicate = 'last'
+	column_dtype: DtypeMapping = immutable_dict(SOE_COLUMNS_DTYPE)
+	column_list: List[str] = SOE_COLUMNS
+	point_desc_file: str = 'cpoint.xlsx'
+	tzone: datetime.timedelta = datetime.timedelta(hours=8)	# Timezone for Asia/Makassar
+	keep_duplicate: str = 'last'
+	t_timeout: float = config.COMMUNICATION_TIMEOUT
+	filter_his = {'ack': '', 'path4': 'CB', 'path5': 'Status', 'value': '-NULL'}
+	filter_ifs = {'path1': 'IFS', 'path2': 'RTU_P1', 'path4': 'IFS-RTU'}
 
-	def __init__(self, date_start:datetime=None, date_stop:datetime=None, **kwargs):
-		self.available_drivers = pyodbc.drivers()
-		self.his_filter = {
-			'ack': '',
-			'path4': 'CB',
-			'path5': 'Status',
-			'value': '-NULL'
-		}
-		self.ifs_filter = {
-			'path1': 'IFS',
-			'path2': 'RTU_P1',
-			'path4': 'IFS-RTU'
-		}
+	def __init__(self, date_start: datetime.datetime = None, date_stop: datetime.datetime = None, **kwargs):
+		self._date_range = None
+		self.available_drivers = config.DB_DRIVERS
 
 		self._init_connection()
-		self.sources = f'DRIVER={self._conn_driver};SERVER={self._conn_host};PORT={self._conn_port};'
+		self.sources = f'DRIVER={config.OFDB_DRIVER};SERVER={config.OFDB_HOSTNAME};PORT={config.OFDB_PORT};'
 		self.switching_element = kwargs['switching_element'] if 'switching_element' in kwargs else ['CB']
 		# Set date_range if defined in kwargs
-		if date_start is not None:
+		if isinstance(date_start, datetime.datetime):
 			self.set_date_range(date_start, date_stop)
-		else:
-			self._date_range = None
-			self.date_isset = False
-		# Automatically update Point Description
-		if self.test_server():
-			self.dump_point_description()
-		else:
-			# Load point description
-			self._cpoint_description = load_cpoint(self.cpoint_file)
-		# Need this for cooperative multiple-inheritance
+		# # Automatically update Point Description
+		# if self.check_server():
+		# 	self.dump_point_description()
+		# else:
+		# 	# Load point description
+		# 	self._cpoint_description = load_cpoint(self.point_desc_file)
 		super().__init__(**kwargs)
 
 	def _init_connection(self):
-		"""
-		"""
-
+		"""Initialize server connection."""
 		# Load configuration
 		self.setting = ConfigParser(default_section='GENERAL')
 		self.setting.read(self._conf_path)
 
 		if self.setting.has_section('CONNECTION'):
 			c = self.setting['CONNECTION']
-			self.set_connection(host=c.get('HOST'), port=c.get('PORT'), user=c.get('USER'), pswd=c.get('PSWD'), database=c.get('DATABASE'), driver=c.get('DRIVER'))
+			self.set_connection(host=config.OFDB_HOSTNAME, port=config.OFDB_PORT, user=c.get('USER'), pswd=c.get('PSWD'), database=config.OFDB_DATABASE, driver=config.OFDB_DRIVER)
 		else:
 			# .config file can be not exist or no connection section
 			self.setting.add_section('CONNECTION')
 			self.set_connection()
 
 	def _run_task(self, **kwargs):
-		"""
-		"""
+		"""Run multiple task queries."""
+		df_list = [
+			self.read_query_control_disable(**kwargs),
+			self.read_query_local_remote(**kwargs),
+			self.read_query_rtu_updown(**kwargs),
+			self.read_query_switching(**kwargs),
+			self.read_query_synchro(**kwargs),
+			self.read_query_trip(**kwargs)
+		]
+		return df_list
 
-		if len(kwargs)>0:
-			df_list = [
-				self.read_query_control_disable(**kwargs),
-				self.read_query_local_remote(**kwargs),
-				self.read_query_rtu_updown(**kwargs),
-				self.read_query_switching(**kwargs),
-				self.read_query_synchro(**kwargs),
-				self.read_query_trip(**kwargs)
-			]
-			
-			return df_list
+	def all(self, force: bool = False, **kwargs):
+		"""Concatenate all soe data into single DataFrame.
 
-	def all(self, force:bool=False, **kwargs):
+		Args:
+			force : 
 		"""
-		Concatenate all soe data into single DataFrame.
-		"""
-
-		if force or not hasattr(self, '_soe_all'):
+		if force or not hasattr(self, 'soe_all'):
 			df_list = self._run_task(force=True)
 
 			if all([type(x)==pd.DataFrame for x in df_list]):
@@ -104,18 +97,14 @@ class SpectrumOfdbClient:
 				df = None
 				print('Gagal memuat data dari server.')
 
-			self._soe_all = df
+			self.soe_all = df
 		
-		return self._soe_all
+		return self.soe_all
 
-	def test_server(self, timeout:int=5):
-		"""
-		Check connection to host.
-		"""
-
+	def check_server(self):
+		"""Check connection to server."""
 		sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-		sock.settimeout(timeout)
-
+		sock.settimeout(self.t_timeout)
 		try:
 			sock.connect((self._conn_host, int(self._conn_port)))
 		except Exception:
@@ -138,56 +127,72 @@ class SpectrumOfdbClient:
 		self._cpoint_description = validate_cpoint(df)
 
 		print('Menyimpan kedalam file...', end='', flush=True)
-		self.cpoint_description.to_excel(self.cpoint_file, index=False)
-		print(f'\rData berhasil disimpan kedalam file {self.cpoint_file}.')
+		self.cpoint_description.to_excel(self.point_desc_file, index=False)
+		print(f'\rData berhasil disimpan kedalam file {self.point_desc_file}.')
 
-	def filter_to_querystring(self, filter:dict, operator:str):
-		"""
-		Create SQL "WHERE" query from dict-like filter and "AND/OR" operator.
-		"""
+	def sql_conditional_from_dict(self, filter: Dict[str, Any], operator: str):
+		"""Create SQL conditional query from dict-like filter and "AND/OR" operator.
 
-		buffer = []
+		Args:
+			filter : dict of key & value filters
+			operator : logical operator
+
+		Result:
+			SQL conditional query string
+		"""
+		buffer = list()
 		oper = f' {operator} '
+
 		for xkey, xval in filter.items():
 			if xkey in ['AND', 'OR']:
 				# x is logic operand
-				if xval: buffer.append(self.filter_to_querystring(xval, xkey))
+				if xval: buffer.append(self.sql_conditional_from_dict(xval, xkey))
 			elif str(xkey).endswith('time_stamp'):
-				tim0, tim1 = xval[0].strftime('%Y-%m-%d %H:%M:%S'), xval[1].strftime('%Y-%m-%d %H:%M:%S')
-				buffer.append(f"({xkey} BETWEEN '{tim0}' AND '{tim1}')")
+				time0, time1 = xval[0].strftime('%Y-%m-%d %H:%M:%S'), xval[1].strftime('%Y-%m-%d %H:%M:%S')
+				buffer.append(f"({xkey} BETWEEN '{time0}' AND '{time1}')")
 			else:
-				if type(xval)==list:
-					multival = []
-					for val in xval:
-						multival.append(f"RTRIM({xkey})='{val}'")
-					buffer.append(f'({" OR ".join(multival)})')
+				if isinstance(xval, list):
+					multival = [f"RTRIM({xkey}) = '{val}'" for val in xval]
+					buffer.append(f"({' OR '.join(multival)})")
 				elif xval=='':
-					buffer.append(f"({xkey} IS NULL OR RTRIM({xkey})='')")
+					buffer.append(f"({xkey} IS NULL OR RTRIM({xkey}) = '')")
 				elif str(xval).endswith('NULL'):
-					adv = 'IS NOT' if str(xval).startswith('-') else 'IS'
-					buffer.append(f'{xkey} {adv} NULL')
+					buffer.append(f"{xkey} {'IS NOT' if str(xval).startswith('-') else 'IS'} NULL")
 				else:
-					adv = '<>' if type(xval)==str and str(xval).startswith('-') else '='
-					buffer.append(f"RTRIM({xkey})='{xval}'")
-
+					buffer.append(f"RTRIM({xkey}) {'<>' if isinstance(xval, str) and str(xval).startswith('-') else '='} '{xval}'")
 		return f"({oper.join(buffer)})"
 
-	def get_cpoint_querystring(self, sort:str='ASC', filters:dict={}, count=None):
-		"""
-		Create SQL querystring to read CPoint table.
-		"""
+	def sql_order_from_list(self, columns: List[str], operator: str):
+		"""Create SQL order by query from list.
 
-		new_filters = {**filters}
-		qs_where = self.filter_to_querystring(new_filters, 'AND')
+		Args:
+			columns : list of table columns
 
-		querystring = f"""SELECT
-		point_number, path1, path2, path3, path4, path5, point_name, point_text
-		FROM {self._dbotbl_cpoint}
-		WHERE {qs_where}
-		ORDER BY path1 {sort}, path2 {sort}, path3 {sort}, path4 {sort};
+		Result:
+			SQL order by query string
 		"""
+		buffer = list()
+		for column in columns:
+			how = 'DESC' if column.startswith('-') else 'ASC'
+			buffer.append(f"{column} {how}")
+		return ", ".join(buffer)
 
-		return querystring
+	def get_cpoint_querystring(self, sort: Literal['ASC', 'DESC'] = 'ASC', filters: dict = {}, count: Optional[int] = None):
+		"""Create SQL querystring to read Point table.
+
+		Args:
+			sort : how to sort the query
+			filters : sql conditional rules
+			count : count of the rows
+
+		Result:
+			SQL querystring text
+		"""
+		new_filters = filters.copy()
+		qs_column = ', '.join(['point_number', 'path1', 'path2', 'path3', 'path4', 'path5', 'point_name', 'point_text'])
+		qs_where = self.sql_conditional_from_dict(new_filters, 'AND')
+		qs_order = self.sql_order_from_list(['path1', 'path2', 'path3', 'path4'])
+		return f"SELECT {qs_column} FROM {self._dbo_point} WHERE {qs_where} ORDER BY {qs_order};"
 
 	def get_digital_cpoint_querystring(self, sort:str='ASC', count=None):
 		"""
@@ -195,14 +200,14 @@ class SpectrumOfdbClient:
 		"""
 
 		if not self.date_isset: raise AttributeError(f'"date_range" is not defined. Run set_date_range first.')
-		tbl1 = self._dbotbl_digital
+		tbl1 = self._dbo_digital
 		tbl1_alias = 'dgtl'
-		tbl2 = self._dbotbl_cpoint
+		tbl2 = self._dbo_point
 		tbl2_alias = 'cpnt'
 
-		new_filters = {f'{tbl1_alias}.system_time_stamp': self.date_range_utc, **{f'{tbl2_alias}.{key}': val for key, val in self.ifs_filter.items()}}
+		new_filters = {f'{tbl1_alias}.system_time_stamp': self.date_range_utc, **{f'{tbl2_alias}.{key}': val for key, val in self.filter_ifs.items()}}
 		qs_count = f'TOP {str(count)}' if type(count)==int else ''
-		qs_where = self.filter_to_querystring(new_filters, 'AND')
+		qs_where = self.sql_conditional_from_dict(new_filters, 'AND')
 
 		querystring = f"""SELECT {qs_count}
 		{tbl1_alias}.time_stamp, {tbl1_alias}.msec, {tbl1_alias}.system_time_stamp, {tbl1_alias}.system_msec, {tbl2_alias}.path1, {tbl2_alias}.path2, {tbl2_alias}.path3, {tbl2_alias}.path4, {tbl2_alias}.path5, {tbl1_alias}.value, {tbl1_alias}.quality_code_scada, {tbl2_alias}.point_text
@@ -222,11 +227,11 @@ class SpectrumOfdbClient:
 		if not self.date_isset: raise AttributeError(f'"date_range" is not defined. Run set_date_range first.')
 		new_filters = {'system_time_stamp': self.date_range_utc, **filters}
 		qs_count = f'TOP {str(count)}' if type(count)==int else ''
-		qs_where = self.filter_to_querystring(new_filters, 'AND')
+		qs_where = self.sql_conditional_from_dict(new_filters, 'AND')
 
 		querystring = f"""SELECT {qs_count}
 		ack, time_stamp, msec, system_time_stamp, system_msec, path1, path2, path3, path4, path5, value, priority, tag, msgoperator, msgclass, message_text, comment_text, path1text, path2text, path3text, elem, msgstatus
-		FROM {self._dbotbl_hismsg}
+		FROM {self._dbo_historical}
 		WHERE {qs_where}
 		ORDER BY system_time_stamp {sort}, system_msec {sort};
 		"""
@@ -341,11 +346,11 @@ class SpectrumOfdbClient:
 
 		return df
 
-	def query_element(self, element:Union[str, list]):
+	def query_element(self, element: Union[str, list]):
 		"""
 		"""
 
-		filters = self.his_filter.copy()
+		filters = self.filter_his.copy()
 		filters['path4'] = element
 		
 		querystring = self.get_message_querystring(filters=filters)
@@ -361,7 +366,7 @@ class SpectrumOfdbClient:
 		Create instance of database connection and execute query
 		"""
 
-		if self.test_server():
+		if self.check_server():
 			# Server connection OK
 			connection_string = f'DRIVER={self._conn_driver};SERVER={self._conn_host};PORT={self._conn_port};DATABASE={self._conn_database};UID={self._conn_user};PWD={self._conn_pswd};Trusted_Connection=No;'
 			connection_url = sa.engine.URL.create('mssql+pyodbc', query={"odbc_connect": connection_string})
@@ -527,11 +532,13 @@ class SpectrumOfdbClient:
 
 		return self._soe_trip
 
-	def save_connection(self, prompt:bool=True):
-		"""
-		"""
+	def save_config(self, prompt: bool = True):
+		"""Save database configuration.
 
-		__slot__ = ['host', 'port', 'user', 'pswd', 'database', 'driver']
+		Args:
+			prompt : prompt before save
+		"""
+		allowed = ['host', 'port', 'user', 'pswd', 'database', 'driver']
 		commit = False
 
 		if prompt:
@@ -541,57 +548,50 @@ class SpectrumOfdbClient:
 			commit = True
 
 		if commit:
-			for opt in __slot__:
+			for opt in allowed:
 				self.setting.set('CONNECTION', opt.upper(), getattr(self, f'_conn_{opt}', ''))
-
 			# Save config file
 			with open(self._conf_path, 'w') as conf:
 				self.setting.write(conf)
 
 	def select_driver(self):
-		"""
-		"""
-
+		"""Select installed pyodbc driver (for console user only)."""
 		retry = 0
 		count = len(self.available_drivers)
 
 		if count>0:
 			valid = False
 			print('List driver ODBC yang terinstall :')
-			
-			for i, d in enumerate(self.available_drivers):
-				print(f'{i+1}. {d}')
+			for i, drv in enumerate(self.available_drivers):
+				print(f'{i+1}. {drv}')
 
 			while not valid:
 				try:
-					index = int(input(f'\nPilih driver (1-{count}) : ')) - 1
+					selected = int(input(f'\nPilih driver (1-{count}) : ')) - 1
 				except ValueError:
-					index = -1
+					selected = -1
 					retry += 1
 
-				if index in range(count):
-					driver = self.available_drivers[index]
+				if selected in range(count):
+					driver = self.available_drivers[selected]
 					valid = True
 				else:
 					retry += 1
 
 				if retry>3:
 					raise ValueError('Program terhenti. Gagal 3 kali percobaan.')
-
 			return driver
 		else:
 			raise ImportError('Tidak ada driver ODBC yang terinstall!')
 
 	def set_connection(self, **conf):
-		"""
-		"""
-
-		__slot__ = ['host', 'port', 'user', 'pswd', 'database', 'driver']
+		"""Attach configuration into instance."""
+		allowed = ['host', 'port', 'user', 'pswd', 'database', 'driver']
 
 		if conf:
 			# Set connection parameter
 			for opt, val in conf.items():
-				if opt in __slot__:
+				if opt in allowed:
 					setattr(self, f'_conn_{opt.lower()}', str(val))
 				else:
 					raise KeyError(f'Variabel {opt} tidak dikenal!')
@@ -603,68 +603,62 @@ class SpectrumOfdbClient:
 			self._conn_database = input('Database\t: ')
 			print('')
 			self._conn_driver = self.select_driver()
-			self.save_connection(prompt=False)
+			self.save_config(prompt=False)
 
-	def set_date_range(self, date_start:datetime, date_stop:datetime=None):
+	def set_date_range(self, date_start: datetime.datetime, date_stop: Optional[datetime.datetime] = None):
+		"""Set date range from given parameters.
+
+		Args:
+			date_start : oldest date limit
+			date_stop : newest date limit
 		"""
-		Set start and stop date of query data.
-		"""
+		dtstart = date_start.to_pydatetime() if isinstance(date_start, pd.Timestamp) else date_start
+		dtstop = date_stop.to_pydatetime() if isinstance(date_stop, pd.Timestamp) else date_stop
 	
-		if date_stop==None:
+		if date_stop is None:
 			# date_stop is not defined
-			if date_start<datetime.now():
+			if date_start<datetime.datetime.now():
 				# valid date_start
-				if (datetime.now()-date_start).days>31:
-					dt0 = date_start.replace(hour=0, minute=0, second=0, microsecond=0)
-					dt1 = date_start.replace(hour=23, minute=59, second=59, microsecond=999999) + timedelta(days=29)
+				if (datetime.datetime.now()-date_start).days>31:
+					dtstart = date_start.replace(hour=0, minute=0, second=0, microsecond=0)
+					dtstop = date_start.replace(hour=23, minute=59, second=59, microsecond=999999) + datetime.timedelta(days=29)
 				else:
-					dt0 = date_start.replace(hour=0, minute=0, second=0, microsecond=0)
-					dt1 = datetime.now().replace(hour=23, minute=59, second=59, microsecond=999999)
+					dtstart = date_start.replace(hour=0, minute=0, second=0, microsecond=0)
+					dtstop = datetime.datetime.now().replace(hour=23, minute=59, second=59, microsecond=999999)
 			else:
 				raise ValueError('"date_start" should not greater than "current_time".')
 		else:
 			# date_start and date_stop are defined
 			if date_start>date_stop:
-				dt0 = date_stop.replace(hour=0, minute=0, second=0, microsecond=0)
-				dt1 = date_start.replace(hour=23, minute=59, second=59, microsecond=999999)
+				dtstop = date_stop.replace(hour=0, minute=0, second=0, microsecond=0)
+				dtstart = date_start.replace(hour=23, minute=59, second=59, microsecond=999999)
 			else:
-				dt0 = date_start.replace(hour=0, minute=0, second=0, microsecond=0)
-				dt1 = date_stop.replace(hour=23, minute=59, second=59, microsecond=999999)
+				dtstart = date_start.replace(hour=0, minute=0, second=0, microsecond=0)
+				dtstop = date_stop.replace(hour=23, minute=59, second=59, microsecond=999999)
 
-		self._date_start = dt0
-		self._date_stop = dt1
-		self._date_range = (dt0, dt1)
+		self._date_range = (dtstart, dtstop)
 		self.date_isset = True
-
-		return dt0, dt1
 
 
 	@property
 	def cpoint_description(self):
 		return self._cpoint_description if hasattr(self, '_cpoint_description') else self.read_query_cpoint()
-	
+
 	@property
 	def date_range(self):
 		return self._date_range
 
 	@property
 	def date_range_utc(self):
-		if self.date_range:
-			return (self._date_start - self.tzone, self._date_stop - self.tzone)
-		else:
-			return None
+		return (self.date_start-self.tzone, self.date_stop-self.tzone) if self.date_range else None
 
 	@property
 	def date_start(self):
-		return self._date_start
+		return self.date_range[0] if self.date_range else None
 
 	@property
 	def date_stop(self):
-		return self._date_stop
-
-	@property
-	def soe_all(self):
-		return self._soe_all if hasattr(self, '_soe_all') else self.all()
+		return self.date_range[1] if self.date_range else None
 
 	@property
 	def soe_control_disable(self):

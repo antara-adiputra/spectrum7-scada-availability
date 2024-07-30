@@ -47,6 +47,7 @@ class Progress:
 
 class BaseAvailability:
 	"""Basic parameter of availability analyze & calculation"""
+	__params__: set = set()
 	_errors: List[Any]
 	_warnings: List[Any]
 	keep_duplicate: Literal['first', 'last', 'none'] = 'last'
@@ -56,7 +57,10 @@ class BaseAvailability:
 		self._errors = list()
 		self._warnings = list()
 		self.progress = Progress()
-		super().__init__(**kwargs)
+		# Add accepted attribute
+		for key in kwargs:
+			if key in self.__params__: setattr(self, key, kwargs[key])
+		# super().__init__(**kwargs)
 
 	def initialize(self) -> None:
 		self._errors = list()

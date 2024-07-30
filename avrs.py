@@ -5,6 +5,7 @@ from io import BytesIO
 from types import MappingProxyType
 from typing import Any, Dict, List, Callable, Literal, Optional, Tuple, TypeAlias, Union
 
+import config
 import numpy as np
 import pandas as pd
 from xlsxwriter.utility import xl_col_to_name
@@ -51,16 +52,11 @@ class _IFSAnalyzer(BaseAvailability):
 		**
 	"""
 	maintenance_mark: str = '**maintenance**'
-	linkfailure_mark: str = '**link**'
-	rtufailure_mark: str = '**rtu**'
-	otherfailure_mark: str = '**other**'
+	link_failure_mark: str = '**link**'
+	rtu_failure_mark: str = '**rtu**'
+	other_failure_mark: str = '**other**'
 	# List of downtime categorization (<category>, <value on hour>), ordered by the most significant category
-	category: List[Tuple[str, int]] = [
-		('Critical', 72),
-		('Major', 24),
-		('Intermediate', 8),
-		('Minor', 3)
-	]
+	downtime_rules: List[Tuple[str, int]] = config.DOWNTIME_RULES
 	soe_all: pd.DataFrame
 
 	def __init__(self, data: Optional[pd.DataFrame] = None, **kwargs):
@@ -80,7 +76,7 @@ class _IFSAnalyzer(BaseAvailability):
 		"""
 		result = None
 
-		for rule in self.category:
+		for rule in self.downtime_rules:
 			if downtime>datetime.timedelta(hours=rule[1]):
 				result = f'Downtime > {rule[1]} jam ({rule[0]})'
 				break
@@ -167,13 +163,13 @@ class _IFSAnalyzer(BaseAvailability):
 				if self.maintenance_mark in comment:
 					data['Marked Maintenance'] = '*'
 					notes.append('User menandai downtime akibat pemeliharaan**')
-				elif self.linkfailure_mark in comment:
+				elif self.link_failure_mark in comment:
 					data['Marked Link Failure'] = '*'
 					notes.append('User menandai downtime akibat gangguan telekomunikasi**')
-				elif self.rtufailure_mark in comment:
+				elif self.rtu_failure_mark in comment:
 					data['Marked RTU Failure'] = '*'
 					notes.append('User menandai downtime akibat gangguan RTU**')
-				elif self.otherfailure_mark in comment:
+				elif self.other_failure_mark in comment:
 					data['Marked Other Failure'] = '*'
 					notes.append('User menandai downtime akibat gangguan lainnya**')
 				else:
@@ -364,13 +360,13 @@ class _IFSAnalyzer(BaseAvailability):
 					if self.maintenance_mark in comment:
 						data['Marked Maintenance'] = '*'
 						notes.append('User menandai downtime akibat pemeliharaan**')
-					elif self.linkfailure_mark in comment:
+					elif self.link_failure_mark in comment:
 						data['Marked Link Failure'] = '*'
 						notes.append('User menandai downtime akibat gangguan telekomunikasi**')
-					elif self.rtufailure_mark in comment:
+					elif self.rtu_failure_mark in comment:
 						data['Marked RTU Failure'] = '*'
 						notes.append('User menandai downtime akibat gangguan RTU**')
-					elif self.otherfailure_mark in comment:
+					elif self.other_failure_mark in comment:
 						data['Marked Other Failure'] = '*'
 						notes.append('User menandai downtime akibat gangguan lainnya**')
 					else:
@@ -1003,6 +999,7 @@ class SOEtoAVRS(_AVRSBaseCalculation, _IFSAnalyzer, _Export):
 
 
 class AVRSCollective(AVRSFileReader, AVRS):
+	__params__: set = {'maintenance_mark', 'link_failure_mark', 'rtu_failure_mark', 'other_failure_mark', 'downtime_rules'}
 
 	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
 		super().__init__(files, **kwargs)
@@ -1019,6 +1016,7 @@ class AVRSCollective(AVRSFileReader, AVRS):
 
 
 class AVRSFromFile(SpectrumFileReader, SOEtoAVRS):
+	__params__: set = {'maintenance_mark', 'link_failure_mark', 'rtu_failure_mark', 'other_failure_mark', 'downtime_rules'}
 
 	def __init__(self, files: Union[str, FilePaths, FileDict, None] = None, **kwargs):
 		super().__init__(files, **kwargs)
@@ -1035,8 +1033,9 @@ class AVRSFromFile(SpectrumFileReader, SOEtoAVRS):
 
 
 class AVRSFromOFDB(SpectrumOfdbClient, SOEtoAVRS):
+	__params__: set = {'maintenance_mark', 'link_failure_mark', 'rtu_failure_mark', 'other_failure_mark', 'downtime_rules'}
 
-	def __init__(self, date_start: datetime.datetime, date_stop: Optional[datetime.datetime] = None, **kwargs):
+	def __init__(self, date_start: Optional[datetime.datetime] = None, date_stop: Optional[datetime.datetime] = None, **kwargs):
 		super().__init__(date_start, date_stop, **kwargs)
 
 

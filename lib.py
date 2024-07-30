@@ -53,6 +53,9 @@ def rgetattr(obj, attr: str, *args):
 		return getattr(obj, attr, *args)
 	return functools.reduce(_getattr, [obj] + attr.split('.'))
 
+def instance_factory(cls, *initargs, **initkwargs) -> object:
+	return cls(*initargs, **initkwargs)
+
 def get_datetime(series: pd.Series) -> tuple[datetime.datetime, datetime.datetime]:
 	"""Return set of RTU timestamp and system timestamp."""
 	return join_datetime(series['Time stamp'], series['Milliseconds']), join_datetime(series['System time stamp'], series['System milliseconds'])
@@ -254,9 +257,6 @@ def timedelta_split(td: datetime.timedelta):
 	ss = sec % 60
 
 	return dd, hh, mm, ss
-
-def test():
-	pass
 
 def truncate(text:str, max_length:int, on:str='left', debug:bool=False):
 	"""

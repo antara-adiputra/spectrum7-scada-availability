@@ -3,7 +3,7 @@ Aplikasi yang digunakan untuk penghitungan availability SCADA pada bagian Fasili
 
 >Python3.9+, 
 >pandas, 
->Xlsxwriter
+>Xlsxwriter,
 >nicegui
 
 
