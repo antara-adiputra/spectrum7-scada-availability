@@ -1,6 +1,6 @@
 import json, pyodbc
 from configparser import ConfigParser
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from nicegui import ui
 
@@ -8,6 +8,16 @@ from nicegui import ui
 __conf = ConfigParser(default_section='GENERAL')
 __conf.read('.config')
 __DEFAULT__: Dict[str, Any] = dict()
+HOST: str = '0.0.0.0'
+PORT: int = 8000
+TITLE: str = 'Aplikasi Perhitungan Availability'
+VIEWPORT: str = 'width=device-width, initial-scale=1'
+FAVICON: Optional[str] = None
+BINDING_REFRESH_INTERVAL: float = 0.1
+AUTO_SHOW: bool = True
+AUTO_RELOAD: bool = True
+ON_AIR: bool = False
+ENDPOINT_DOCUMENTATION: Literal['none', 'internal', 'page', 'all'] = 'none'
 MAX_PROPAGATION_TIME = 0.01	 # default 0.01
 DARK_MODE: bool = False
 MAX_FILES = None

@@ -1,5 +1,6 @@
 import asyncio, datetime, os, re, time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
 from io import BytesIO
 from types import MappingProxyType
 from typing import Any, Dict, List, Callable, Iterable, Optional, Tuple, TypeAlias, Union
@@ -14,7 +15,6 @@ from global_parameters import RCD_BOOK_PARAM, RCD_COLUMNS
 from lib import ProcessError, calc_time, get_datetime, get_execution_duration, get_termination_duration, immutable_dict, join_datetime, nested_dict, progress_bar
 from ofdb import SpectrumOfdbClient
 from test import *
-from worker import run_cpu_bound
 
 
 FilePaths: TypeAlias = List[str]
@@ -640,6 +640,10 @@ class _SOEAnalyzer(BaseAvailability):
 		data_list: ListLikeDataFrame = list()
 		soe_update: CellUpdate = dict()
 
+		async def run_background(proc: ProcessPoolExecutor, fn: Callable, *fnargs, **fnkwargs):
+			loop = asyncio.get_running_loop() or asyncio.get_event_loop()
+			return await loop.run_in_executor(proc, partial(fn, *fnargs, **fnkwargs))
+
 		def done(_f: asyncio.Future):
 			result_list, soe_dict = _f.result()
 			data_list.extend(result_list)
@@ -654,11 +658,17 @@ class _SOEAnalyzer(BaseAvailability):
 		chunksize = kwargs.get('chunksize', len(bay_list)//n + 1)	# The fastest process duration proven from some tests
 		self.progress.init('Menganalisa RC', raw_max_value=self.get_order_count())
 
-		async with asyncio.TaskGroup() as tg:
-			for i in range(0, len(bay_list), chunksize):
-				bay_segment = bay_list[i:(i+chunksize)]
-				task = tg.create_task(run_cpu_bound(self.analyze_rcd_bays, df, bay_segment))
-				task.add_done_callback(done)
+		tasks: set = set()
+		executor = ProcessPoolExecutor(n)
+		for i in range(0, len(bay_list), chunksize):
+			bay_segment = bay_list[i:(i+chunksize)]
+			task = asyncio.create_task(run_background(executor, self.analyze_rcd_bays, df, bay_segment))
+			task.add_done_callback(done)
+			tasks.add(task)
+
+		await asyncio.gather(*tasks)
+		tasks.clear()
+		executor.shutdown()
 
 		for cell in soe_update:
 			val = soe_update[cell]

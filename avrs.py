@@ -1,5 +1,5 @@
 import asyncio, datetime, gc, os, re, time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial
 from io import BytesIO
 from types import MappingProxyType
@@ -15,7 +15,6 @@ from global_parameters import RTU_BOOK_PARAM
 from lib import ProcessError, calc_time, immutable_dict, join_datetime, load_cpoint, nested_dict, progress_bar, timedelta_split
 from ofdb import SpectrumOfdbClient
 from test import *
-from worker import run_cpu_bound
 
 
 CalcResult : TypeAlias = Dict[str, Dict[str, Any]]
@@ -456,12 +455,17 @@ class _IFSAnalyzer(BaseAvailability):
 		chunksize = 1	# The fastest process duration proven from some tests
 		self.progress.init('Menganalisa updown RTU', raw_max_value=self.get_rtu_count())
 
-		with ProcessPoolExecutor(n) as ppe:
-			async with asyncio.TaskGroup() as tg:
-				for i in range(0, len(rtu_list), chunksize):
-					rtu_segment = rtu_list[i:(i+chunksize)]
-					task = tg.create_task(run_background(ppe, self.analyze_rtus, df, rtu_segment))
-					task.add_done_callback(done)
+		tasks: set = set()
+		executor = ProcessPoolExecutor(n)
+		for i in range(0, len(rtu_list), chunksize):
+			rtu_segment = rtu_list[i:(i+chunksize)]
+			task = asyncio.create_task(run_background(executor, self.analyze_rtus, df, rtu_segment))
+			task.add_done_callback(done)
+			tasks.add(task)
+
+		await asyncio.gather(*tasks)
+		tasks.clear()
+		executor.shutdown()
 
 		# Create new DataFrame from list of dict data
 		df_downtime = pd.DataFrame(data=data_list).sort_values(['Down Time', 'Up Time'], ascending=[True, True]).reset_index(drop=True)
