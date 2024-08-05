@@ -173,7 +173,7 @@ class _IFSAnalyzer(BaseAvailability):
 					notes.append('User menandai downtime akibat gangguan lainnya**')
 				else:
 					# Eleminate unnecessary character
-					txt = re.sub('^\W*|\s*$', '', comment)
+					txt = re.sub(r'^\W*|\s*$', '', comment)
 					notes += txt.split('\n')
 
 			if status=='Up':
@@ -370,7 +370,7 @@ class _IFSAnalyzer(BaseAvailability):
 						notes.append('User menandai downtime akibat gangguan lainnya**')
 					else:
 						# Eleminate unnecessary character
-						txt = re.sub('^\W*|\s*$', '', comment)
+						txt = re.sub(r'^\W*|\s*$', '', comment)
 						notes += txt.split('\n')
 
 				if status=='Up':
@@ -450,7 +450,8 @@ class _IFSAnalyzer(BaseAvailability):
 		self.init_analyze()
 		df = self.soe_setup(start=start, stop=stop, **kwargs)
 		rtu_list = self.get_rtus()
-		n = kwargs.get('nprocess', os.cpu_count())
+		# Get machine's CPU count, and limit to MAX_CPU_USAGE (usefull for Windows & Mac)
+		n = min(os.cpu_count(), config.MAX_CPU_USAGE)
 		# chunksize = len(rtu_list)//n + 1
 		chunksize = 1	# The fastest process duration proven from some tests
 		self.progress.init('Menganalisa updown RTU', raw_max_value=self.get_rtu_count())
@@ -528,7 +529,8 @@ class _AVRSBaseCalculation(BaseAvailability):
 
 	def initialize(self) -> None:
 		"""Re-initiate parameter"""
-		self.init_calculate()
+		self._calculated = False
+		self.availability = None
 		super().initialize()
 
 	def init_calculate(self):
@@ -542,7 +544,7 @@ class _AVRSBaseCalculation(BaseAvailability):
 		else:
 			cpoint = load_cpoint(self.cpoint_file)
 			# Remove duplicates to prevent duplication in merge process
-			self.cpoint_ifs = cpoint[(cpoint['B1']=='IFS') & (cpoint['B2']=='RTU_P1')].drop_duplicates(subset=['B1 text', 'B2 text', 'B3 text'], keep='first')
+			self.cpoint_ifs = cpoint[(cpoint['B1']=='IFS') & (cpoint['B2']=='RTU_P1')].drop_duplicates(subset=['B1 text', 'B2 text', 'B3 text'], keep='last')
 
 	@calc_time
 	def _calculate(self, **kwargs) -> CalcResult:
@@ -1041,6 +1043,17 @@ class AVRSFromOFDB(SpectrumOfdbClient, SOEtoAVRS):
 
 	def __init__(self, date_start: Optional[datetime.datetime] = None, date_stop: Optional[datetime.datetime] = None, **kwargs):
 		super().__init__(date_start, date_stop, **kwargs)
+
+	def fetch_all(self, **kwargs):
+		soe_all = super().fetch_rtu_updown(**kwargs)
+		self.soe_all = soe_all
+		return soe_all
+
+	async def async_fetch_all(self, **kwargs):
+		# soe_all = await super().async_fetch_all(**kwargs)
+		# self.soe_all = soe_all
+		# return soe_all
+		pass
 
 
 def av_analyze_file(**params):

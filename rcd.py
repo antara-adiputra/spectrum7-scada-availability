@@ -418,7 +418,7 @@ class _SOEAnalyzer(BaseAvailability):
 			for cmt in user_comment:
 				if cmt and '**' not in cmt:
 					# Eleminate unnecessary character
-					txt = re.sub('^\W*|\s*$', '', cmt)
+					txt = re.sub(r'^\W*|\s*$', '', cmt)
 					data['Annotations'].append(txt)
 
 			# Event marked by user
@@ -517,7 +517,8 @@ class _SOEAnalyzer(BaseAvailability):
 		"""
 		data_list: ListLikeDataFrame = list()
 		soe_update: CellUpdate = dict()
-		n = kwargs.get('nprocess', os.cpu_count())
+		# Get machine's CPU count, and limit to MAX_CPU_USAGE (usefull for Windows & Mac)
+		n = min(os.cpu_count(), config.MAX_CPU_USAGE)
 		chunksize = kwargs.get('chunksize', len(bays)//n + 1)	# The fastest process duration proven from some tests
 		if callable(callback):
 			cb = callback
@@ -1600,6 +1601,17 @@ class RCDFromOFDB(SpectrumOfdbClient, SOEtoRCD):
 
 	def __init__(self, date_start: Optional[datetime.datetime] = None, date_stop: Optional[datetime.datetime] = None, **kwargs):
 		super().__init__(date_start, date_stop, **kwargs)
+
+	def fetch_all(self, **kwargs):
+		soe_all = super().fetch_all(**kwargs)
+		self.soe_all = soe_all
+		return soe_all
+
+	async def async_fetch_all(self, **kwargs):
+		# soe_all = await super().async_fetch_all(**kwargs)
+		# self.soe_all = soe_all
+		# return soe_all
+		pass
 
 
 def summary_template(**kwargs):

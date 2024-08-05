@@ -1,3 +1,5 @@
+# This is user configurable variable which can be updated on runtime 
+
 import json, pyodbc
 from configparser import ConfigParser
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
@@ -20,9 +22,10 @@ ON_AIR: bool = False
 ENDPOINT_DOCUMENTATION: Literal['none', 'internal', 'page', 'all'] = 'none'
 MAX_PROPAGATION_TIME = 0.01	 # default 0.01
 DARK_MODE: bool = False
-MAX_FILES = None
-MAX_FILE_SIZE = None
-MAX_TOTAL_SIZE = None
+MAX_FILES: Optional[int] = None
+MAX_FILE_SIZE: Optional[int] = None
+MAX_TOTAL_SIZE: Optional[int] = None
+MAX_CPU_USAGE: int = 8
 # OFDB
 DB_DRIVERS: List[str] = pyodbc.drivers()
 OFDB_HOSTNAME: str = '192.168.1.1'

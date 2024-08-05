@@ -167,7 +167,7 @@ class Menu:
 		return _dict
 
 	def update(self):
-		with ui.list().classes('w-full overflow-y-scroll') as menu:
+		with ui.list().classes('w-full overflow-y-auto') as menu:
 			for item in self._menus:
 				item_id = item['id']
 				with ui.item().classes('p-0'):
@@ -262,10 +262,10 @@ class WebGUIv2(ui.card):
 					with ui.element('div').classes('w-full') as div_description:
 						ui.label('<Content description>').bind_text_from(self.menu.state, 'description')
 					# CONTENT
-					self.panel_content = ui.element('div').classes('overflow-y-scroll').style('width: 100%; height: 100%;')
+					self.panel_content = ui.element('div').classes('overflow-y-auto').style('width: 100%; height: 100%;')
 					# self.create_process_display()
 		with ui.dialog() as debug, ui.card().classes('w-1/2 md:w-full p-0 gap-y-0'):
-			with ui.element('div').classes('w-full border overflow-y-scroll'):
+			with ui.element('div').classes('w-full border overflow-y-auto'):
 				debug_menu_state = ObjectDebugger('menu.state', self.menu.state).render()
 				debug_config = ObjectDebugger('config', config).render()
 				# self.create_debug_table('stepper.filepicker', self.components['stepper']['file'].filepicker)
