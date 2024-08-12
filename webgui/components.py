@@ -1,16 +1,16 @@
-import asyncio
+import asyncio, datetime, os
 from io import BytesIO
 from typing import Any, Dict, List, Callable, Literal, Optional, Tuple, TypeAlias, Union
 
-import config
+import config, cryptography.fernet
 import pandas as pd
 from avrs import AVRSFromOFDB, AVRSFromFile, AVRSCollective
 from rcd import RCDFromOFDB, RCDFromFile, RCDFromFile2, RCDCollective
 from lib import rgetattr
-from nicegui import ui, events
+from nicegui import background_tasks, events, ui
 from nicegui.elements.mixins.value_element import ValueElement
 from worker import run_cpu_bound
-from .state import FileProcessorState, OfdbProcessorState
+from .state import CalculationState, FileInputState, OfdbInputState
 
 
 FileCalcObjects: TypeAlias = Union[AVRSFromFile, AVRSCollective, RCDFromFile, RCDFromFile2, RCDCollective]
@@ -100,69 +100,6 @@ class ObjectDebugger(ui.expansion):
 		"""Refreshable content"""
 		self.clear()
 		self.render()
-
-
-class _Stepper(ui.stepper):
-	"""
-	"""
-	__used__: set
-	step_contents: List[Dict[str, Any]] = list()
-	button_classes: str = 'px-2'
-	button_props: str = 'dense no-caps size=md'
-	auto_next: bool = True
-	auto_next_delay: float = 1.5
-
-	def __init__(
-		self,
-		*,
-		value: Union[str, ui.step, None] = None,
-		on_value_change: Optional[Callable[..., Any]] = None,
-		keep_alive: bool = True,
-		**contexts
-	) -> None:
-		super().__init__(value=value, on_value_change=on_value_change, keep_alive=keep_alive)
-		self.__used__ = set([attr for attr in dir(ui.stepper) if not (attr.startswith('_') and attr.endswith('_'))])
-		self._step_objects = dict()
-		self.props(add='vertical flat done-color=positive active-color=accent active-icon=my_location error-color=negative')
-		self.classes('w-full h-full p-0')
-		# Add custom attribute
-		for key in contexts:
-			if not key.startswith('_') and key not in self.__used__: setattr(self, key, contexts[key])
-
-	def default_renderer(
-		self,
-		name: str,
-		title: str,
-		icon: Optional[str] = None,
-		navigation: List[Dict[str, str]] = [],
-		description: str = ''
-	) -> ui.step:
-		_icon = 'none' if icon is None else icon
-		with ui.step(name=name, title=title, icon=_icon) as qstep:
-			ui.label(description)
-			with ui.stepper_navigation().style('padding: 0;') as qstep_nav:
-				for btn in navigation:
-					handler = getattr(self, btn['on_click'], None)
-					Button(text=btn['text'], on_click=handler)\
-						.props(self.button_props)\
-						.classes(self.button_classes)
-		return qstep
-
-	def get_renderer(self, key: str) -> Callable:
-		_key = key.replace(' ', '_').replace('-', '_')
-		renderer = getattr(self, 'render_' + _key, None)
-		return renderer if callable(renderer) else self.default_renderer
-
-	def render(self) -> ui.stepper:
-		with self:
-			for step in self.step_contents:
-				renderer = self.get_renderer(step['name'])
-				qstep = renderer(**step)
-				self._step_objects.update({step['name']: qstep})
-		return self
-
-	def reset(self, *args, **kwargs) -> None:
-		pass
 
 
 class FilePicker(ui.dialog):
@@ -284,49 +221,15 @@ class FilePicker(ui.dialog):
 		return len(self._queued_files)
 
 
-class FileProcessor(_Stepper):
-	"""Display component that handle calculation from files.
-
-	Args:
-		instance :
-		value :
-		on_value_change :
-		keep_alive :
-
-	Acceptable contexts:
-
+class CalculationStepper(ui.stepper):
 	"""
-	instance: FileCalcObjects
-	step_contents: List[Dict[str, Any]] = [
-		{
-			'name': 'setup',
-			'title': 'Setup',
-			'icon': 'tune',
-			'description': 'Persiapkan file yang digunakan dalam perhitungan kinerja.',
-			'navigation': [
-				{'text': 'Mulai', 'on_click': '_handle_setup'},
-			]
-		},
-		{
-			'name': 'upload',
-			'title': 'Unggah File',
-			'icon': 'upload_file',
-			'description': 'Unggah file yang akan digunakan dalam perhitungan kinerja (ekstensi file Excel).',
-			'navigation': [
-				{'text': 'Pilih File', 'on_click': '_handle_filepicker'},
-			]
-		},
-		{
-			'name': 'validate',
-			'title': 'Validasi',
-			'icon': 'verified',
-			'description': 'Validasi data pada file yang telah diunggah.',
-			'navigation': [
-				{'text': 'Kembali', 'on_click': 'previous'},
-				{'text': 'Validasi', 'on_click': '_handle_file_validate'},
-				{'text': 'Lanjut', 'on_click': 'next'},
-			]
-		},
+	"""
+	__used__: set
+	instance: CalcObjects
+	# List of steps_input + steps_calculation
+	steps_list: List[Dict[str, Any]]
+	steps_input: List[Dict[str, Any]] = list()
+	steps_calculation: List[Dict[str, Any]] = [
 		{
 			'name': 'calculate',
 			'title': 'Hitung Kinerja',
@@ -360,6 +263,10 @@ class FileProcessor(_Stepper):
 			]
 		},
 	]
+	button_classes: str = 'px-2'
+	button_props: str = 'dense no-caps size=md'
+	auto_next: bool = True
+	auto_next_delay: float = 1.5
 
 	def __init__(
 		self,
@@ -370,11 +277,223 @@ class FileProcessor(_Stepper):
 		keep_alive: bool = True,
 		**contexts
 	) -> None:
-		super().__init__(value=value, on_value_change=on_value_change, keep_alive=keep_alive, **contexts)
+		super().__init__(value=value, on_value_change=on_value_change, keep_alive=keep_alive)
+		self.__used__ = set([attr for attr in dir(ui.stepper) if not (attr.startswith('_') and attr.endswith('_'))])
+		self._step_objects = dict()
 		self.instance = instance
-		self.state = FileProcessorState()
+		self.state = CalculationState()
+		self.steps_list = self.steps_input + self.steps_calculation
+		# Set graphical props, classes and style
+		self.props(add='vertical flat done-color=positive active-color=accent active-icon=my_location error-color=negative')
+		self.classes('w-full h-full p-0')
+		# Add custom attribute
+		for key in contexts:
+			if not key.startswith('_') and key not in self.__used__: setattr(self, key, contexts[key])
+
+	def default_renderer(
+		self,
+		name: str,
+		title: str,
+		icon: Optional[str] = None,
+		navigation: List[Dict[str, str]] = [],
+		description: str = ''
+	) -> ui.step:
+		_icon = 'none' if icon is None else icon
+		with ui.step(name=name, title=title, icon=_icon) as qstep:
+			ui.label(description)
+			with ui.stepper_navigation().style('padding: 0;') as qstep_nav:
+				for btn in navigation:
+					handler = getattr(self, btn['on_click'], None)
+					Button(text=btn['text'], on_click=handler)\
+						.props(self.button_props)\
+						.classes(self.button_classes)
+		return qstep
+
+	def get_renderer(self, key: str) -> Callable:
+		_key = key.replace(' ', '_').replace('-', '_')
+		renderer = getattr(self, 'render_' + _key, None)
+		return renderer if callable(renderer) else self.default_renderer
+
+	def render(self) -> ui.stepper:
+		with self:
+			for step in self.steps_list:
+				renderer = self.get_renderer(step['name'])
+				qstep = renderer(**step)
+				self._step_objects.update({step['name']: qstep})
+		return self
+
+	def reset(self, *args, **kwargs) -> None:
+		pass
+
+	def render_calculate(
+		self,
+		name: str,
+		title: str,
+		icon: Optional[str] = None,
+		navigation: List[Dict[str, str]] = [],
+		description: str = ''
+	) -> ui.step:
+		_icon = 'none' if icon is None else icon
+		with ui.step(name=name, title=title, icon=_icon) as qstep:
+			ui.label(description)
+			self.calculation_summary()
+			with ui.stepper_navigation().style('padding: 0; align-items: center;') as qstep_nav:
+				for btn in navigation:
+					handler = getattr(self, btn['on_click'], None)
+					qbtn = Button(text=btn['text'], on_click=handler)\
+						.props(self.button_props)\
+						.classes(self.button_classes)
+					if btn['text']=='Hitung':
+						qbtn.bind_enabled_from(self.state, 'is_calculating', lambda state: not state)
+					elif btn['text']=='Lanjut' or btn['text']=='Lihat Hasil':
+						qbtn.bind_visibility_from(self.state, 'calculated')
+				self.calculation_progress()
+				ui.icon(name='check_circle_outline', size='sm', color='positive')\
+					.bind_visibility_from(self.state, 'calculated')\
+					.tooltip('Perhitungan Kinerja OK')
+		return qstep
+
+	def render_download(
+		self,
+		name: str,
+		title: str,
+		icon: Optional[str] = None,
+		navigation: List[Dict[str, str]] = [],
+		description: str = ''
+	) -> ui.step:
+		_icon = 'none' if icon is None else icon
+		with ui.step(name=name, title=title, icon=_icon) as qstep:
+			ui.label(description)
+			with ui.stepper_navigation().style('padding: 0; align-items: center;') as qstep_nav:
+				for btn in navigation:
+					handler = getattr(self, btn['on_click'], None)
+					qbtn = Button(text=btn['text'], on_click=handler)\
+						.props(self.button_props)\
+						.classes(self.button_classes)
+					if btn['text']=='Unduh':
+						qbtn.bind_enabled_from(self.state, 'is_exporting', lambda state: not state)
+				with ui.row(align_items='center').classes('p-0 m-0 gap-1').bind_visibility_from(self.state, 'is_exporting'):
+					ui.spinner('hourglass').props('size=sm thickness=5 color=accent')
+					ui.label('Menyiapkan file...').classes('italic text-accent')
+		return qstep
+
+	async def handle_auto_next(self) -> None:
+		if self.auto_next:
+			await asyncio.sleep(self.auto_next_delay)
+			self.next()
+
+	async def _handle_calculate(self, e: events.ClickEventArguments) -> None:
+		self.state.pre_calculate()
+		if not getattr(self.instance, 'analyzed', True): self.state.is_analyzing = True
+		self.state.is_calculating = True
+		result = await self.instance.async_calculate(force=True)
+		self.state.is_analyzing = False
+		self.state.is_calculating = False
+		self.state.analyzed = getattr(self.instance, 'analyzed', True)
+		self.state.calculated = self.instance.calculated
+		self.state.result = result
+		self.calculation_summary.refresh()
+		ui.notify(f'Perhitungan kinerja selesai. ({self.instance.process_duration:.2f}s)', color='positive')
+		await self.handle_auto_next()
+
+	async def _handle_preview_result(self, e: events.ClickEventArguments) -> None:
+		ui.notify('Sedang dikembangkan, mohon bersabar yaa :)')
+
+	async def _handle_download_result(self, e: events.ClickEventArguments) -> None:
+		self.state.is_exporting = True
+		content = await run_cpu_bound(self.instance.to_excel, as_iobuffer=True)
+		self.state.is_exporting = False
+		filename = f'{self.instance.get_xls_filename()}.{self.instance.output_extension}'
+		ui.download(src=content, filename=filename)
+		await self.handle_auto_next()
+
+	async def _handle_completed(self, e: events.ClickEventArguments) -> None:
+		last_step = self.slots['default'].children[0]
+		last_step.props('done')
+
+	@ui.refreshable
+	def calculation_summary(self) -> None:
+		if self.state.calculated:
+			with ui.element('div').bind_visibility_from(self.state, 'calculated'):
+				ui.html('<strong>Hasil perhitungan :</strong>').classes('py-2')
+				with ui.list().props(f'dense bordered separator').classes('w-80 pr-0'):
+					for key, val in self.state.result['overall'].items():
+						with ui.item():
+							with ui.item_section():
+								ui.item_label(' '.join(key.split('_')).title()).props('lines=1')
+							with ui.item_section().props('side'):
+								ui.item_label(val)
+
+	@ui.refreshable
+	def calculation_progress(self) -> None:
+		with ui.row(align_items='center').classes('p-0 m-0 gap-1').bind_visibility_from(self.state, 'is_calculating'):
+			ui.spinner('hourglass').props('size=sm thickness=5 color=accent')
+			ui.label('Proses perhitungan...')\
+				.bind_text_from(self.instance, 'progress', lambda prg: f'{getattr(prg, "name", "Proses perhitungan")}... ')\
+				.classes('italic text-accent')
+			ui.label('')\
+				.bind_text_from(self.instance, 'progress', lambda prg: f'{getattr(prg, "value", 0.0)*100:.1f}%')\
+				.classes('ml-2 italic text-accent')
+
+
+class FileProcessor(CalculationStepper):
+	"""Display component that handle calculation from files.
+
+	Args:
+		instance :
+		value :
+		on_value_change :
+		keep_alive :
+
+	Acceptable contexts:
+
+	"""
+	instance: FileCalcObjects
+	steps_input: List[Dict[str, Any]] = [
+		{
+			'name': 'setup',
+			'title': 'Setup',
+			'icon': 'tune',
+			'description': 'Persiapkan file yang digunakan dalam perhitungan kinerja.',
+			'navigation': [
+				{'text': 'Mulai', 'on_click': '_handle_setup'},
+			]
+		},
+		{
+			'name': 'upload',
+			'title': 'Unggah File',
+			'icon': 'upload_file',
+			'description': 'Unggah file yang akan digunakan dalam perhitungan kinerja (ekstensi file Excel).',
+			'navigation': [
+				{'text': 'Pilih File', 'on_click': '_handle_filepicker'},
+			]
+		},
+		{
+			'name': 'validate',
+			'title': 'Validasi',
+			'icon': 'verified',
+			'description': 'Validasi data pada file yang telah diunggah.',
+			'navigation': [
+				{'text': 'Kembali', 'on_click': 'previous'},
+				{'text': 'Validasi', 'on_click': '_handle_file_validate'},
+				{'text': 'Lanjut', 'on_click': 'next'},
+			]
+		},
+	]
+
+	def __init__(
+		self,
+		*,
+		instance: Optional[Any] = None,
+		value: Union[str, ui.step, None] = None,
+		on_value_change: Optional[Callable[..., Any]] = None,
+		keep_alive: bool = True,
+		**contexts
+	) -> None:
+		super().__init__(instance=instance, value=value, on_value_change=on_value_change, keep_alive=keep_alive, **contexts)
+		self.state = FileInputState()
 		self.filepicker = self._init_filepicker()
-		self.result = list()
+		# self.result = list()
 
 	def _init_filepicker(self) -> FilePicker:
 		filepicker = FilePicker(on_file_change=self.update_from_filepicker)\
@@ -386,11 +505,8 @@ class FileProcessor(_Stepper):
 		for attr in attrs:
 			setattr(self.state, attr, getattr(self.filepicker, attr))
 
-	def get_result(self, result: Any):
-		self.result.append(result)
-
 	def reset(self, *args, **kwargs) -> None:
-		self.set_value(self.step_contents[0]['name'])
+		self.set_value(self.steps_list[0]['name'])
 		self.filepicker.reset()
 		self.state.reset()
 		self.uploaded_files.refresh()
@@ -465,63 +581,6 @@ class FileProcessor(_Stepper):
 					.tooltip('Validasi NOK')
 		return qstep
 
-	def render_calculate(
-		self,
-		name: str,
-		title: str,
-		icon: Optional[str] = None,
-		navigation: List[Dict[str, str]] = [],
-		description: str = ''
-	) -> ui.step:
-		_icon = 'none' if icon is None else icon
-		with ui.step(name=name, title=title, icon=_icon) as qstep:
-			ui.label(description)
-			self.calculation_summary()
-			with ui.stepper_navigation().style('padding: 0; align-items: center;') as qstep_nav:
-				for btn in navigation:
-					handler = getattr(self, btn['on_click'], None)
-					qbtn = Button(text=btn['text'], on_click=handler)\
-						.props(self.button_props)\
-						.classes(self.button_classes)
-					if btn['text']=='Hitung':
-						qbtn.bind_enabled_from(self.state, 'is_calculating', lambda state: not state)
-					elif btn['text']=='Lanjut' or btn['text']=='Lihat Hasil':
-						qbtn.bind_visibility_from(self.state, 'calculated')
-				self.calculation_progress()
-				ui.icon(name='check_circle_outline', size='sm', color='positive')\
-					.bind_visibility_from(self.state, 'calculated')\
-					.tooltip('Perhitungan Kinerja OK')
-		return qstep
-
-	def render_download(
-		self,
-		name: str,
-		title: str,
-		icon: Optional[str] = None,
-		navigation: List[Dict[str, str]] = [],
-		description: str = ''
-	) -> ui.step:
-		_icon = 'none' if icon is None else icon
-		with ui.step(name=name, title=title, icon=_icon) as qstep:
-			ui.label(description)
-			with ui.stepper_navigation().style('padding: 0; align-items: center;') as qstep_nav:
-				for btn in navigation:
-					handler = getattr(self, btn['on_click'], None)
-					qbtn = Button(text=btn['text'], on_click=handler)\
-						.props(self.button_props)\
-						.classes(self.button_classes)
-					if btn['text']=='Unduh':
-						qbtn.bind_enabled_from(self.state, 'is_exporting', lambda state: not state)
-				with ui.row(align_items='center').classes('p-0 m-0 gap-1').bind_visibility_from(self.state, 'is_exporting'):
-					ui.spinner('hourglass').props('size=sm thickness=5 color=accent')
-					ui.label('Menyiapkan file...').classes('italic text-accent')
-		return qstep
-
-	async def handle_auto_next(self) -> None:
-		if self.auto_next:
-			await asyncio.sleep(self.auto_next_delay)
-			self.next()
-
 	async def _handle_filepicker_display_change(self, e: events.ValueChangeEventArguments) -> None:
 		if e.value:
 			self.uploaded_files.refresh()
@@ -577,35 +636,6 @@ class FileProcessor(_Stepper):
 				self.validation_info.refresh()
 				ui.notify(f'Validasi file gagal. (error = {len(self.instance.errors)})', color='negative')
 
-	async def _handle_calculate(self, e: events.ClickEventArguments) -> None:
-		self.state.pre_calculate()
-		if not getattr(self.instance, 'analyzed', True): self.state.is_analyzing = True
-		self.state.is_calculating = True
-		result = await self.instance.async_calculate(force=True)
-		self.state.is_analyzing = False
-		self.state.is_calculating = False
-		self.state.analyzed = getattr(self.instance, 'analyzed', True)
-		self.state.calculated = self.instance.calculated
-		self.state.result = result
-		self.calculation_summary.refresh()
-		ui.notify(f'Perhitungan kinerja selesai. ({self.instance.process_duration:.2f}s)', color='positive')
-		await self.handle_auto_next()
-
-	async def _handle_preview_result(self, e: events.ClickEventArguments) -> None:
-		ui.notify('Sedang dikembangkan, mohon bersabar yaa :)')
-
-	async def _handle_download_result(self, e: events.ClickEventArguments) -> None:
-		self.state.is_exporting = True
-		content = await run_cpu_bound(self.instance.to_excel, as_iobuffer=True)
-		self.state.is_exporting = False
-		filename = f'{self.instance.get_xls_filename()}.{self.instance.output_extension}'
-		ui.download(src=content, filename=filename)
-		await self.handle_auto_next()
-
-	async def _handle_completed(self, e: events.ClickEventArguments) -> None:
-		last_step = self.slots['default'].children[0]
-		last_step.props('done')
-
 	@ui.refreshable
 	def uploaded_files(self) -> None:
 		count = self.state.filecount
@@ -647,36 +677,21 @@ class FileProcessor(_Stepper):
 								with ui.item_section():
 									ui.label(str(err))
 
-	@ui.refreshable
-	def calculation_summary(self) -> None:
-		if self.state.calculated:
-			with ui.element('div').bind_visibility_from(self.state, 'calculated'):
-				ui.html('<strong>Hasil perhitungan :</strong>').classes('py-2')
-				with ui.list().props(f'dense bordered separator').classes('w-80 pr-0'):
-					for key, val in self.state.result['overall'].items():
-						with ui.item():
-							with ui.item_section():
-								ui.item_label(' '.join(key.split('_')).title()).props('lines=1')
-							with ui.item_section().props('side'):
-								ui.item_label(val)
 
-	@ui.refreshable
-	def calculation_progress(self) -> None:
-		with ui.row(align_items='center').classes('p-0 m-0 gap-1').bind_visibility_from(self.state, 'is_calculating'):
-			ui.spinner('hourglass').props('size=sm thickness=5 color=accent')
-			ui.label('Proses perhitungan...')\
-				.bind_text_from(self.instance, 'progress', lambda prg: f'{getattr(prg, "name", "Proses perhitungan")}... ')\
-				.classes('italic text-accent')
-			ui.label('')\
-				.bind_text_from(self.instance, 'progress', lambda prg: f'{getattr(prg, "value", 0.0)*100:.1f}%')\
-				.classes('ml-2 italic text-accent')
+class OfdbProcessor(CalculationStepper):
+	"""Display component that handle calculation from Offline Database data.
 
+	Args:
+		instance :
+		value :
+		on_value_change :
+		keep_alive :
 
-class OfdbProcessor(_Stepper):
-	"""
+	Acceptable contexts:
+
 	"""
 	instance: OfdbCalcObjects
-	step_contents: List[Dict[str, Any]] = [
+	steps_input: List[Dict[str, Any]] = [
 		{
 			'name': 'setup',
 			'title': 'Setup',
@@ -688,50 +703,23 @@ class OfdbProcessor(_Stepper):
 		},
 		{
 			'name': 'server_check',
-			'title': 'Koneksi Server',
+			'title': 'Cek Server',
 			'icon': 'cable',
 			'description': 'Periksa konektivitas dengan server OFDB.',
 			'navigation': [
 				{'text': 'Cek', 'on_click': '_handle_server_connection'},
+				{'text': 'Lanjut', 'on_click': 'next'},
 			]
 		},
 		{
-			'name': 'query',
-			'title': 'Query Data',
+			'name': 'fetch_data',
+			'title': 'Ambil Data',
 			'icon': 'cloud_download',
-			'description': 'Proses pengambilan data dari server OFDB.',
-			'navigation': [
-				{'text': 'Query', 'on_click': '_handle_query_data'},
-				{'text': 'Lihat Data', 'on_click': '_handle_preview_query'},
-			]
-		},
-		{
-			'name': 'calculate',
-			'title': 'Hitung Availability',
-			'icon': 'calculate',
-			'description': 'Analisa dan lakukan proses perhitungan kinerja.',
-			'navigation': [
-				{'text': 'Hitung', 'on_click': '_handle_calculate'},
-			]
-		},
-		{
-			'name': 'download',
-			'title': 'Unduh Hasil',
-			'icon': 'file_download',
-			'description': 'Export hasil perhitungan kedalam bentuk file Excel.',
-			'navigation': [
-				{'text': 'Unduh', 'on_click': '_handle_download_result'},
-				{'text': 'Lihat Hasil', 'on_click': '_handle_preview_result'},
-			]
-		},
-		{
-			'name': 'completed',
-			'title': 'Selesai',
-			'icon': 'done_all',
-			'description': 'Selamat! Proses perhitungan availability telah selesai.',
+			'description': 'Proses pengambilan data dari server OFDB berdasarkan rentang waktu.',
 			'navigation': [
 				{'text': 'Kembali', 'on_click': 'previous'},
-				{'text': 'Selesai', 'on_click': '_handle_completed'},
+				{'text': 'Ambil Data', 'on_click': '_handle_fetch_data'},
+				{'text': 'Lanjut', 'on_click': 'next'},
 			]
 		},
 	]
@@ -745,13 +733,14 @@ class OfdbProcessor(_Stepper):
 		keep_alive: bool = True,
 		**contexts
 	) -> None:
-		super().__init__(value=value, on_value_change=on_value_change, keep_alive=keep_alive, **contexts)
-		self.instance = instance
-		self.state = OfdbProcessorState()
+		super().__init__(instance=instance, value=value, on_value_change=on_value_change, keep_alive=keep_alive, **contexts)
+		self.state = OfdbInputState()
 
 	def reset(self, *args, **kwargs) -> None:
-		self.set_value(self.step_contents[0]['name'])
+		self.set_value(self.steps_list[0]['name'])
 		self.state.reset()
+		self.instance.initialize()
+		self.instance.reset_date()
 
 	def render_server_check(
 		self,
@@ -767,24 +756,88 @@ class OfdbProcessor(_Stepper):
 			with ui.stepper_navigation().style('padding: 0; align-items: center;') as qstep_nav:
 				for btn in navigation:
 					handler = getattr(self, btn['on_click'], None)
-					Button(text=btn['text'], on_click=handler)\
-						.bind_enabled_from(self.state, 'connecting_to_server', lambda x: not x)\
+					qbtn = Button(text=btn['text'], on_click=handler)\
 						.props(self.button_props)\
 						.classes(self.button_classes)
-				Button(text='Lanjut', on_click=self.next)\
-						.bind_enabled_from(self.state, 'server_available')\
-						.props(self.button_props)\
-						.classes(self.button_classes)
+					if btn['text']=='Cek':
+						qbtn.bind_enabled_from(self.state, 'connecting_to_server', lambda x: not x)
+					elif btn['text']=='Lanjut':
+						qbtn.bind_enabled_from(self.state, 'server_available')
 				ui.icon(name='check_circle_outline', size='sm', color='positive')\
 					.bind_visibility_from(self, 'state', lambda state: state.initialized and state.server_available)\
 					.tooltip('Koneksi server OK')
 				ui.icon(name='error_outline', size='sm', color='negative')\
 					.bind_visibility_from(self, 'state', lambda state: state.initialized and not state.server_available)\
 					.tooltip('Koneksi server NOK')
-				ui.spinner('radio')\
+				ui.spinner('facebook')\
 					.bind_visibility_from(self.state, 'connecting_to_server')\
 					.props('size=sm thickness=5 color=accent')
 		return qstep
+
+	def render_fetch_data(
+		self,
+		name: str,
+		title: str,
+		icon: Optional[str] = None,
+		navigation: List[Dict[str, str]] = [],
+		description: str = ''
+	) -> ui.step:
+		_icon = 'none' if icon is None else icon
+		curr_date = datetime.datetime.now()
+		prev_month = curr_date.replace(month=curr_date.month-1) if curr_date.month>1 else curr_date.replace(year=curr_date.year-1, month=12)
+		with ui.step(name=name, title=title, icon=_icon) as qstep:
+			ui.label(description)
+			with ui.row(align_items='center').classes('p-0 m-0 gap-x-8'):
+				for name, label in [('from', 'Dari'), ('to', 'Sampai')]:
+					with ui.input(f'{label} Tanggal', on_change=getattr(self, 'set_date_' + name))\
+						.bind_enabled_from(self.state, 'is_fetching_data', lambda x: not x)\
+						.props('dense stack-label hide-hint hint="YYYY-MM-DD" color=teal') as date:
+						with ui.menu().props('no-parent-events') as date_menu:
+							ui.date(mask='YYYY-MM-DD').props(f'minimal color=teal default-year-month={prev_month.strftime("%Y/%m")}').bind_value(date)
+						with date.add_slot('append'):
+							ui.icon('edit_calendar').on('click', date_menu.open).classes('cursor-pointer')
+			ui.label('*Estimasi pengambilan data 2-5 menit').classes('text-sm italic text-neutral-400').bind_visibility_from(self.state, 'is_fetching_data')
+			self.validation_info()
+			with ui.stepper_navigation().style('padding: 0; align-items: center;') as qstep_nav:
+				for btn in navigation:
+					handler = getattr(self, btn['on_click'], None)
+					qbtn = Button(text=btn['text'], on_click=handler)\
+						.props(self.button_props)\
+						.classes(self.button_classes)
+					if btn['text']=='Ambil Data':
+						qbtn.bind_enabled_from(self, 'instance', lambda clc: getattr(clc, 'date_isset', False) and not self.state.is_fetching_data)
+					elif btn['text']=='Lanjut':
+						qbtn.bind_enabled_from(self.state, 'fetched')
+				with ui.row(align_items='center').classes('p-0 m-0 gap-1').bind_visibility_from(self.state, 'is_fetching_data'):
+					ui.spinner('hourglass').props('size=sm thickness=5 color=accent')
+					ui.label('').bind_text_from(self.state, 'timer', lambda t: datetime.datetime.fromtimestamp(t).strftime('%M:%S')).classes('pr-2 text-accent')
+					ui.label('Proses mengambil data...').classes('italic text-accent')
+				ui.icon(name='check_circle_outline', size='sm', color='positive')\
+					.bind_visibility_from(self, 'state', lambda state: state.fetched)\
+					.tooltip('Pengambilan data berhasil')
+				ui.icon(name='error_outline', size='sm', color='negative')\
+					.bind_visibility_from(self, 'instance', lambda clc: len(getattr(clc, 'errors', []))>0)\
+					.tooltip('Pengambilan data gagal')
+		return qstep
+
+	def set_date(self, key: str, value: str) -> None:
+		try:
+			val = datetime.datetime.strptime(value, '%Y-%m-%d')
+		except Exception:
+			val = None
+
+		setattr(self.state, 'date_' + key, val)
+		# Set date range to instance
+		if isinstance(self.state.date_from, datetime.datetime) and isinstance(self.state.date_to, datetime.datetime):
+			self.instance.set_date_range(self.state.date_from, self.state.date_to)
+		else:
+			self.instance._date_isset = False
+
+	def set_date_from(self, e: events.ValueChangeEventArguments) -> None:
+		self.set_date('from', e.value)
+
+	def set_date_to(self, e: events.ValueChangeEventArguments) -> None:
+		self.set_date('to', e.value)
 
 	async def _handle_setup(self, e: events.ClickEventArguments) -> None:
 		self.next()
@@ -793,31 +846,60 @@ class OfdbProcessor(_Stepper):
 		self.state.pre_communication()
 		self.state.connecting_to_server = True
 		server_available = await run_cpu_bound(self.instance.check_server)
+		self.state.connecting_to_server = False
+
 		if server_available:
+			self.state.initialized = True
 			ui.notify(f'Berhasil terhubung ke server.', color='positive')
 		else:
 			ui.notify(f'Gagal menghubungkan ke server.', color='negative')
-		self.state.connecting_to_server = False
-		self.state.initialized = True
+
 		self.state.server_available = server_available
 
-	async def _handle_query_data(self, e: events.ClickEventArguments) -> None:
-		pass
+	async def _handle_fetch_data(self, e: events.ClickEventArguments) -> None:
+		self.state.pre_fetch()
+		timer = ui.timer(1, self.state.tick)
+		self.state.is_fetching_data = True
+		df_fetch = await self.instance.async_fetch_all()
+		self.state.is_fetching_data = False
 
-	async def _handle_preview_query(self, e: events.ClickEventArguments) -> None:
-		pass
+		if isinstance(df_fetch, pd.DataFrame):
+			self.state.fetched = True
+			self.validation_info.refresh()
+			ui.notify(f'Pengambilan data berhasil. (error = {len(self.instance.errors)})', color='positive')
+			await self.handle_auto_next()
+		else:
+			ui.notify(f'Pengambilan data berhasil. (error = {len(self.instance.errors)})', color='negative')
 
-	async def _handle_calculate(self, e: events.ClickEventArguments) -> None:
-		pass
+		timer.cancel()
+		timer.clear()
 
-	async def _handle_preview_result(self, e: events.ClickEventArguments) -> None:
-		pass
-
-	async def _handle_download_result(self, e: events.ClickEventArguments) -> None:
-		pass
-
-	async def _handle_completed(self, e: events.ClickEventArguments) -> None:
-		pass
+	@ui.refreshable
+	def validation_info(self) -> None:
+		warnings = getattr(self.instance, 'warnings', [])
+		errors = getattr(self.instance, 'errors', [])
+		if self.state.fetched:
+			with ui.element('div').classes('w-full gap-1'):
+				with ui.expansion(f'warning ({len(warnings)})')\
+					.bind_visibility_from(self.instance, 'warnings', lambda wrn: len(wrn)>0)\
+					.props('dense dense-toggle header-class="px-2 text-yellow-700" expand-icon=more_horiz expanded-icon=expand_less')\
+					.classes('w-full') as warning_info:
+					with ui.list().props(f'dense').classes('w-full pr-0 text-sm'):
+						for wrn in warnings:
+							with ui.item().props('dense clickable'):
+								with ui.item_section():
+									with ui.row(wrap=False, align_items='center').classes('p-0'):
+										ui.icon('report_problem', size='xs', color='warning')
+										ui.label(str(wrn))
+				with ui.expansion(f'error ({len(errors)})')\
+					.bind_visibility_from(self.instance, 'errors', lambda err: len(err)>0)\
+					.props('dense dense-toggle header-class="px-2 text-red-700" expand-icon=more_horiz expanded-icon=expand_less')\
+					.classes('w-full') as error_info:
+					with ui.list().props(f'dense').classes('w-full pr-0 text-sm'):
+						for err in errors:
+							with ui.item():
+								with ui.item_section():
+									ui.label(str(err))
 
 
 class BaseSettingMenu(ui.list):
@@ -864,6 +946,39 @@ class BaseSettingMenu(ui.list):
 			_styles.append(f'{skey}:{sval}')
 		return ';'.join(_styles)
 
+	def get_item_renderer(self, key: str) -> Callable:
+		_key = key.replace(' ', '_').replace('-', '_')
+		renderer = getattr(self, 'render_' + _key, None)
+		return renderer if callable(renderer) else self.default_item_renderer
+
+	def default_item_renderer(self, **kwargs) -> ui.item:
+		if 'element' in kwargs:
+			element = kwargs['element']
+		else:
+			element = getattr(ui, kwargs['comp'], ui.input)
+
+		with ui.item().props(f'dense {"tag=label" if kwargs["comp"] in ("input", "select") else ""}') as item:
+			self.item_label(**kwargs)
+			with ui.item_section().props('side'):
+				element(**kwargs.get('comp_kwargs', {}))\
+					.bind_value(self.config_instance, kwargs['config_name'].upper())\
+					.on_value_change(self._handle_config_change)\
+					.props(self.parse_props_from_dict(**kwargs.get('comp_props', {})))\
+					.classes(' '.join(kwargs.get('comp_classes', [])))\
+					.style(self.parse_style_from_dict(**kwargs.get('comp_style', {})))
+		return item
+
+	def item_label(self, **kwargs) -> ui.item_section:
+		with ui.item_section() as item_section:
+			helper = kwargs.get('description')
+			with ui.row(align_items='center').classes('p-0 gap-0'):
+				ui.item_label(kwargs['config_label'])
+				if helper:
+					ui.icon('help_outline', size='xs', color='teal')\
+						.classes('pl-3 pb-px')\
+						.tooltip(helper).props("anchor='bottom left' self='top left' max-width=8rem")
+		return item_section
+
 	def render(self) -> ui.list:
 		group_idx = 0
 		with self:
@@ -871,43 +986,8 @@ class BaseSettingMenu(ui.list):
 				if group_idx>0: ui.separator().classes('my-2')
 				if group: ui.item_label(group.upper()).props('header').classes('font-extrabold')
 				for cfg in configs:
-					if globals().get(cfg['comp']) is not None:
-						# Using custom defined component
-						element = globals()[cfg['comp']]
-						with ui.item().props(f'dense').style('padding: 0;'):
-							element(**cfg.get('comp_kwargs', {}))\
-								.bind_value(self.config_instance, cfg['config_name'].upper())\
-								.on_value_change(self._handle_config_change)\
-								.props(self.parse_props_from_dict(**cfg.get('comp_props', {})))\
-								.classes(' '.join(cfg.get('comp_classes', [])))\
-								.style(self.parse_style_from_dict(**cfg.get('comp_style', {})))
-					else:
-						# Using nucegui component
-						element = getattr(ui, cfg['comp'], ui.input)
-						with ui.item().props(f'dense {"tag=label" if cfg["comp"] in ("input", "select") else ""}'):
-							with ui.item_section():
-								helper = cfg.get('description')
-								with ui.row(align_items='center').classes('p-0 gap-0'):
-									ui.item_label(cfg['config_label'])
-									if helper:
-										ui.icon('help_outline', size='xs', color='teal')\
-											.classes('pl-3 pb-px')\
-											.tooltip(helper).props("anchor='bottom left' self='top left' max-width=8rem")
-							with ui.item_section().props('side'):
-								if cfg['config_name']=='dark_mode':
-									element(**cfg.get('comp_kwargs', {}))\
-										.bind_value(ui.dark_mode(config.DARK_MODE))\
-										.on_value_change(self._handle_dark_mode_change)\
-										.props(self.parse_props_from_dict(**cfg.get('comp_props', {})))\
-										.classes(' '.join(cfg.get('comp_classes', [])))\
-										.style(self.parse_style_from_dict(**cfg.get('comp_style', {})))
-								else:
-									element(**cfg.get('comp_kwargs', {}))\
-										.bind_value(self.config_instance, cfg['config_name'].upper())\
-										.on_value_change(self._handle_config_change)\
-										.props(self.parse_props_from_dict(**cfg.get('comp_props', {})))\
-										.classes(' '.join(cfg.get('comp_classes', [])))\
-										.style(self.parse_style_from_dict(**cfg.get('comp_style', {})))
+					renderer = self.get_item_renderer(cfg['config_name'])
+					item = renderer(**cfg)
 				group_idx += 1
 			with ui.item().props('dense').classes('flex-row-reverse pt-4'):
 				with ui.row(align_items='center').classes('p-0 gap-x-0.5'):
@@ -968,12 +1048,12 @@ class DowntimeRulesInput(ValueElement, ui.list):
 				with ui.item().props('dense tag=label') as item:
 					# with ui.row(align_items='center').classes('w-full gap-1 justify-between'):
 					with ui.item_section():
-						ui.label(name)
+						ui.item_label(name)
 					with ui.item_section().props('side'):
 						with ui.input()\
 							.bind_value(self.value1, name, forward=lambda x: int(x))\
 							.on_value_change(self._handle_value1_change)\
-							.props(f'dense square filled standout type=number')\
+							.props(f'dense square filled color=teal type=number')\
 							.classes('md:w-80') as qinput:
 							with qinput.add_slot('prepend'):
 								ui.label('>').classes('text-sm')
@@ -1003,14 +1083,57 @@ class GeneralSettingMenu(BaseSettingMenu):
 			'description': 'Aktifkan atau matikan mode gelap.',
 			'comp': 'switch',
 			'comp_kwargs': {},
-			'comp_props': {},
+			'comp_props': {
+				'color': 'teal-5'
+			},
 		}
 	]
 
+	def render_dark_mode(self, **kwargs) -> ui.item:
+		element = getattr(ui, kwargs['comp'], ui.input)
+		with ui.item().props(f'dense {"tag=label" if kwargs["comp"] in ("input", "select") else ""}'):
+			self.item_label(**kwargs)
+			with ui.item_section().props('side'):
+				element(**kwargs.get('comp_kwargs', {}))\
+					.bind_value(ui.dark_mode(config.DARK_MODE))\
+					.on_value_change(self._handle_dark_mode_change)\
+					.props(self.parse_props_from_dict(**kwargs.get('comp_props', {})))\
+					.classes(' '.join(kwargs.get('comp_classes', [])))\
+					.style(self.parse_style_from_dict(**kwargs.get('comp_style', {})))
+
 
 class OfdbSettingMenu(BaseSettingMenu):
-	"""RCD setting menu component."""
+	"""OFDB setting menu component."""
 	parameters = config.PARAMETER_OFDB
+
+	def render_ofdb_token(self, **kwargs) -> ui.item:
+		def crypto_key():
+			secret = os.getenv('PRIVATE_KEY')
+			return cryptography.fernet.Fernet(secret)
+
+		def encrypt(pswd: str):
+			key = crypto_key()
+			return key.encrypt(pswd.encode()).decode()
+
+		def decrypt(token: str):
+			key = crypto_key()
+			try:
+				pwd = key.decrypt(token.encode()).decode()
+			except cryptography.fernet.InvalidToken:
+				pwd = ''
+			return pwd
+
+		element = getattr(ui, kwargs['comp'], ui.input)
+		with ui.item().props(f'dense {"tag=label" if kwargs["comp"] in ("input", "select") else ""}') as item:
+			self.item_label(**kwargs)
+			with ui.item_section().props('side'):
+				element(**kwargs.get('comp_kwargs', {}))\
+					.bind_value(self.config_instance, kwargs['config_name'].upper(), forward=lambda pwd: encrypt(pwd), backward=lambda pwd: decrypt(pwd))\
+					.on_value_change(self._handle_config_change)\
+					.props(self.parse_props_from_dict(**kwargs.get('comp_props', {})))\
+					.classes(' '.join(kwargs.get('comp_classes', [])))\
+					.style(self.parse_style_from_dict(**kwargs.get('comp_style', {})))
+		return item
 
 
 class RCDSettingMenu(BaseSettingMenu):
@@ -1019,5 +1142,16 @@ class RCDSettingMenu(BaseSettingMenu):
 
 
 class AVRSSettingMenu(BaseSettingMenu):
-	"""RCD setting menu component."""
+	"""AVRS setting menu component."""
 	parameters = config.PARAMETER_AVRS
+
+	def render_downtime_rules(self, **kwargs) -> ui.item:
+		element = DowntimeRulesInput
+		with ui.item().classes('p-0') as item:
+			element(**kwargs.get('comp_kwargs', {}))\
+				.bind_value(self.config_instance, kwargs['config_name'].upper())\
+				.on_value_change(self._handle_config_change)\
+				.props(self.parse_props_from_dict(**kwargs.get('comp_props', {})))\
+				.classes(' '.join(kwargs.get('comp_classes', [])))\
+				.style(self.parse_style_from_dict(**kwargs.get('comp_style', {})))
+		return item

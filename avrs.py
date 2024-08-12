@@ -5,9 +5,9 @@ from io import BytesIO
 from types import MappingProxyType
 from typing import Any, Dict, List, Callable, Literal, Optional, Tuple, TypeAlias, Union
 
-import config
 import numpy as np
 import pandas as pd
+import config, settings
 from xlsxwriter.utility import xl_col_to_name
 from core import BaseAvailability, XLSExportMixin
 from filereader import AVRSFileReader, SpectrumFileReader
@@ -451,7 +451,7 @@ class _IFSAnalyzer(BaseAvailability):
 		df = self.soe_setup(start=start, stop=stop, **kwargs)
 		rtu_list = self.get_rtus()
 		# Get machine's CPU count, and limit to MAX_CPU_USAGE (usefull for Windows & Mac)
-		n = min(os.cpu_count(), config.MAX_CPU_USAGE)
+		n = min(os.cpu_count(), settings.MAX_CPU_USAGE)
 		# chunksize = len(rtu_list)//n + 1
 		chunksize = 1	# The fastest process duration proven from some tests
 		self.progress.init('Menganalisa updown RTU', raw_max_value=self.get_rtu_count())
@@ -1045,15 +1045,14 @@ class AVRSFromOFDB(SpectrumOfdbClient, SOEtoAVRS):
 		super().__init__(date_start, date_stop, **kwargs)
 
 	def fetch_all(self, **kwargs):
-		soe_all = super().fetch_rtu_updown(**kwargs)
+		soe_all = asyncio.run(super().async_fetch_all('avrs', **kwargs))
 		self.soe_all = soe_all
 		return soe_all
 
 	async def async_fetch_all(self, **kwargs):
-		# soe_all = await super().async_fetch_all(**kwargs)
-		# self.soe_all = soe_all
-		# return soe_all
-		pass
+		soe_all = await super().async_fetch_all('avrs', **kwargs)
+		self.soe_all = soe_all
+		return soe_all
 
 
 def av_analyze_file(**params):

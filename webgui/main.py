@@ -179,7 +179,7 @@ class Menu:
 							for subitem in item['submenu']:
 								subitem_id = subitem['id']
 								Button(subitem['label'], identifier=f'{item_id}__{subitem_id}', on_click=self._handle_submenu_click)\
-									.props(f'flat no-wrap no-caps {"outline" if (item_id, subitem_id)==self.active else ""} align=left')\
+									.props(f'flat no-wrap no-caps text-color=teal-4 {"outline" if (item_id, subitem_id)==self.active else ""} align=left')\
 									.classes('w-full')
 		return menu
 
@@ -250,7 +250,7 @@ class WebGUIv2(ui.card):
 		with self:
 			with ui.row(wrap=False).classes('w-full h-full p-0 gap-1'):
 				with ui.column().classes('w-56 md:w-96 h-full p-2 md:p-4 border-r-2') as sidemenu:
-					ui.label('APLIKASI PERHITUNGAN KINERJA FASOP').classes('w-full text-2xl md:text-3xl font-extrabold text-teal-800')
+					ui.label('APLIKASI PERHITUNGAN KINERJA FASOP').classes('w-full text-2xl md:text-3xl font-extrabold text-teal-700')
 					ui.separator().classes('m-0')
 					# MENU
 					self.menu.update()

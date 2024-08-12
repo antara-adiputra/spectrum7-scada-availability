@@ -4,6 +4,7 @@ from functools import partial
 from multiprocessing import managers, Manager
 from typing import Any, Dict, List, Callable, Generator, Literal, TypeAlias, Union
 
+import settings
 from nicegui import background_tasks, ui
 
 
@@ -75,8 +76,9 @@ async def run_cpu_bound(fn, *fnargs, **fnkwargs):
 		loop = asyncio.get_running_loop()
 	except RuntimeError:
 		loop = asyncio.get_event_loop()
+	n = min(os.cpu_count(), settings.MAX_CPU_USAGE)
 	try:
-		with ProcessPoolExecutor(os.cpu_count()) as proc:
+		with ProcessPoolExecutor(n) as proc:
 			obj = await loop.run_in_executor(proc, partial(fn, *fnargs, **fnkwargs))
 		return obj
 	except Exception as e:

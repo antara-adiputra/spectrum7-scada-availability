@@ -2,36 +2,24 @@
 
 import json, pyodbc
 from configparser import ConfigParser
+from dotenv import load_dotenv
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
-
-from nicegui import ui
 
 
 __conf = ConfigParser(default_section='GENERAL')
 __conf.read('.config')
 __DEFAULT__: Dict[str, Any] = dict()
-HOST: str = '0.0.0.0'
-PORT: int = 8000
-TITLE: str = 'Aplikasi Perhitungan Availability'
-VIEWPORT: str = 'width=device-width, initial-scale=1'
-FAVICON: Optional[str] = None
-BINDING_REFRESH_INTERVAL: float = 0.1
-AUTO_SHOW: bool = True
-AUTO_RELOAD: bool = True
-ON_AIR: bool = False
-ENDPOINT_DOCUMENTATION: Literal['none', 'internal', 'page', 'all'] = 'none'
-MAX_PROPAGATION_TIME = 0.01	 # default 0.01
+__EXCLUDED__: List[str] = ['DB_DRIVERS', 'PARAMETER_OFDB', 'PARAMETER_RCD', 'PARAMETER_AVRS']
 DARK_MODE: bool = False
 MAX_FILES: Optional[int] = None
 MAX_FILE_SIZE: Optional[int] = None
 MAX_TOTAL_SIZE: Optional[int] = None
-MAX_CPU_USAGE: int = 8
 # OFDB
 DB_DRIVERS: List[str] = pyodbc.drivers()
 OFDB_HOSTNAME: str = '192.168.1.1'
 OFDB_PORT: Union[str, int] = 1024
-# OFDB_USER: str = ''
-# OFDB_PASSWORD: str = ''
+OFDB_USER: str = ''
+OFDB_TOKEN: str = ''
 OFDB_DATABASE: str = ''
 OFDB_DRIVER: str = ''
 OFDB_SCHEMA: str = 'dbo'
@@ -59,6 +47,11 @@ DOWNTIME_RULES: List[Tuple[str, int]] = [
 	['Minor', 3]
 ]
 
+def _satisfy(key: str) -> bool:
+	if key.isupper() and not (key.startswith('_') or key in __EXCLUDED__):
+		return True
+	else:
+		return False
 
 def load():
 	try:
@@ -73,7 +66,7 @@ def load():
 		print('Error!', e.args)
 
 def save(**newconfig):
-	_params: List[str] = [par for par in globals() if par.isupper() and not (par.startswith('_') or par.startswith('PARAMETER'))]
+	_params: List[str] = [par for par in globals() if _satisfy(par)]
 	# Get new value value in newconfig, or get current configuration by default
 	config: Dict[str, Any] = {param: newconfig.get(param, globals()[param]) for param in _params}
 	globals().update(config)
@@ -83,7 +76,7 @@ def save(**newconfig):
 
 def store_default():
 	global __DEFAULT__
-	config = {pkey: pval for pkey, pval in globals().items() if pkey.isupper() and not (pkey.startswith('_') or pkey.startswith('PARAMETER'))}
+	config = {pkey: pval for pkey, pval in globals().items() if _satisfy(pkey)}
 	__DEFAULT__.update(config)
 
 def get_config(*params: str) -> Dict[str, Any]:
@@ -93,6 +86,7 @@ def get_config(*params: str) -> Dict[str, Any]:
 	return config
 
 # Save default config first for fallback mode
+load_dotenv()
 store_default()
 load()
 
@@ -112,6 +106,8 @@ PARAMETER_OFDB = [
 		},
 		'comp_props': {
 			'dense': True,
+			'filled': True,
+			'square': True,
 			'readonly': True,
 			'input-class': 'md:w-80',	# set width 320px when in medium screen
 		},
@@ -130,9 +126,50 @@ PARAMETER_OFDB = [
 		},
 		'comp_props': {
 			'dense': True,
+			'filled': True,
+			'square': True,
 			'readonly': True,
 			'type': 'number',
 			'input-class': 'md:w-80',	# set width 320px when in medium screen
+		},
+	},
+	{
+		'config_name': 'ofdb_user',
+		'config_type': 'string',
+		'config_label': 'User',
+		'config_group': 'Koneksi Database',
+		'description': '',
+		'comp': 'input',
+		'comp_kwargs': {
+			'validation': {
+				'Tidak boleh kosong': lambda value: value!='',
+			}
+		},
+		'comp_props': {
+			'dense': True,
+			'filled': True,
+			'square': True,
+			'readonly': True,
+			'input-class': 'md:w-80',	# set width 320px when in medium screen
+		},
+	},
+	{
+		'config_name': 'ofdb_token',
+		'config_type': 'string',
+		'config_label': 'Password',
+		'config_group': 'Koneksi Database',
+		'description': '',
+		'comp': 'input',
+		'comp_kwargs': {
+			'password': True,
+			'password_toggle_button': False
+		},
+		'comp_props': {
+			'dense': True,
+			'filled': True,
+			'square': True,
+			'readonly': True,
+			'input-class': 'md:w-80',	# set width 320px (290px + 30px for toggle button) when in medium screen
 		},
 	},
 	{
@@ -149,6 +186,8 @@ PARAMETER_OFDB = [
 		},
 		'comp_props': {
 			'dense': True,
+			'filled': True,
+			'square': True,
 			'readonly': True,
 			'input-class': 'md:w-80',	# set width 320px when in medium screen
 		},
@@ -167,11 +206,11 @@ PARAMETER_OFDB = [
 		'comp_props': {
 			'dense': True,
 			'filled': True,
-			'standout': True,
+			'square': True,
 			'input-class': 'md:w-80',	# set width 320px when in medium screen
 		},
 		'comp_style': {
-			'width': '320px'
+			'width': '344px'
 		}
 	},
 ]
@@ -184,6 +223,9 @@ PARAMETER_RCD = [
 		'config_group': 'Perhitungan',
 		'description': 'Jika aktif, program akan menghitung keberhasilan kontrol PMT dan PMS Bus. Jika tidak, program hanya akan menghitung keberhasilan kontrol PMT. Default "Tidak Aktif"',
 		'comp': 'switch',
+		'comp_props': {
+			'color': 'teal-5'
+		},
 	},
 	{
 		'config_name': 'check_repetition',
@@ -192,6 +234,9 @@ PARAMETER_RCD = [
 		'config_group': 'Perhitungan',
 		'description': 'Jika aktif, program akan menghitung kegagalan kontrol berulang dalam hari yang sama sebagai satu kali gagal kontrol. Jika tidak, program akan menghitung semua kegagalan kontrol. Default "Aktif"',
 		'comp': 'switch',
+		'comp_props': {
+			'color': 'teal-5'
+		},
 	},
 	{
 		'config_name': 'success_mark',
@@ -210,6 +255,7 @@ PARAMETER_RCD = [
 			'dense': True,
 			'hide-hint': True,
 			'hint': 'Default **success**',
+			'color': 'teal',
 			'input-class': 'md:w-80',	# set width 320px when in medium screen
 		},
 	},
@@ -230,6 +276,7 @@ PARAMETER_RCD = [
 			'dense': True,
 			'hide-hint': True,
 			'hint': 'Default **failed**',
+			'color': 'teal',
 			'input-class': 'md:w-80',	# set width 320px when in medium screen
 		},
 	},
@@ -250,6 +297,7 @@ PARAMETER_RCD = [
 			'dense': True,
 			'hide-hint': True,
 			'hint': 'Default **unused**',
+			'color': 'teal',
 			'input-class': 'md:w-80',	# set width 320px when in medium screen
 		},
 	},
@@ -267,10 +315,12 @@ PARAMETER_RCD = [
 		},
 		'comp_props': {
 			'dense': True,
-			'mask': '#.##',
-			'fill-mask': '0',
 			'hide-hint': True,
 			'hint': 'Default 1.00',
+			'type': 'number',
+			'mask': '#.##',
+			'fill-mask': '0',
+			'color': 'teal',
 			'input-class': 'md:w-80',	# set width 320px when in medium screen
 		},
 	}
@@ -294,6 +344,7 @@ PARAMETER_AVRS = [
 			'dense': True,
 			'hide-hint': True,
 			'hint': 'Default **maintenance**',
+			'color': 'teal',
 			'input-class': 'md:w-80',	# set width 320px when in medium screen
 		},
 	},
@@ -314,6 +365,7 @@ PARAMETER_AVRS = [
 			'dense': True,
 			'hide-hint': True,
 			'hint': 'Default **link**',
+			'color': 'teal',
 			'input-class': 'md:w-80',	# set width 320px when in medium screen
 		},
 	},
@@ -334,6 +386,7 @@ PARAMETER_AVRS = [
 			'dense': True,
 			'hide-hint': True,
 			'hint': 'Default **rtu**',
+			'color': 'teal',
 			'input-class': 'md:w-80',	# set width 320px when in medium screen
 		},
 	},
@@ -354,6 +407,7 @@ PARAMETER_AVRS = [
 			'dense': True,
 			'hide-hint': True,
 			'hint': 'Default **other**',
+			'color': 'teal',
 			'input-class': 'md:w-80',	# set width 320px when in medium screen
 		},
 	},

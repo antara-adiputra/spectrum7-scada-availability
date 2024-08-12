@@ -5,9 +5,9 @@ from io import BytesIO
 from types import MappingProxyType
 from typing import Any, Dict, List, Callable, Iterable, Optional, Tuple, TypeAlias, Union
 
-import config
 import numpy as np
 import pandas as pd
+import settings
 from xlsxwriter.utility import xl_col_to_name
 from core import BaseAvailability, XLSExportMixin
 from filereader import RCFileReader, SpectrumFileReader, SurvalentFileReader
@@ -518,7 +518,7 @@ class _SOEAnalyzer(BaseAvailability):
 		data_list: ListLikeDataFrame = list()
 		soe_update: CellUpdate = dict()
 		# Get machine's CPU count, and limit to MAX_CPU_USAGE (usefull for Windows & Mac)
-		n = min(os.cpu_count(), config.MAX_CPU_USAGE)
+		n = min(os.cpu_count(), settings.MAX_CPU_USAGE)
 		chunksize = kwargs.get('chunksize', len(bays)//n + 1)	# The fastest process duration proven from some tests
 		if callable(callback):
 			cb = callback
@@ -655,7 +655,7 @@ class _SOEAnalyzer(BaseAvailability):
 		self.init_analyze()
 		df = self.soe_setup(start=start, stop=stop, **kwargs)
 		bay_list = self.get_bays()
-		n = kwargs.get('nprocess', os.cpu_count())
+		n = min(os.cpu_count(), settings.MAX_CPU_USAGE)
 		chunksize = kwargs.get('chunksize', len(bay_list)//n + 1)	# The fastest process duration proven from some tests
 		self.progress.init('Menganalisa RC', raw_max_value=self.get_order_count())
 
@@ -1603,15 +1603,14 @@ class RCDFromOFDB(SpectrumOfdbClient, SOEtoRCD):
 		super().__init__(date_start, date_stop, **kwargs)
 
 	def fetch_all(self, **kwargs):
-		soe_all = super().fetch_all(**kwargs)
+		soe_all = asyncio.run(super().async_fetch_all('avrcd', **kwargs))
 		self.soe_all = soe_all
 		return soe_all
 
 	async def async_fetch_all(self, **kwargs):
-		# soe_all = await super().async_fetch_all(**kwargs)
-		# self.soe_all = soe_all
-		# return soe_all
-		pass
+		soe_all = await super().async_fetch_all('avrcd', **kwargs)
+		self.soe_all = soe_all
+		return soe_all
 
 
 def summary_template(**kwargs):

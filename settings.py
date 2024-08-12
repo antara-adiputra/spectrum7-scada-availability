@@ -45,6 +45,7 @@ ENDPOINT_DOCUMENTATION: Literal['none', 'internal', 'page', 'all'] = 'none'
 
 BINDING_REFRESH_INTERVAL: float = 0.3
 MAX_PROPAGATION_TIME: float = 0.05	 # default 0.01
+MAX_CPU_USAGE: int = 8
 RECONNECT_TIMEOUT: float = 3.0
 
 HEAD_HTML_SOURCES: List[str] = [
