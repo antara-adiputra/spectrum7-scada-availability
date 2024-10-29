@@ -6,9 +6,10 @@ from types import MappingProxyType
 from typing import Any, Dict, List, Callable, Literal, Optional, Tuple, TypeAlias, Union
 
 import pandas as pd
-from global_parameters import RCD_COLUMNS, RTU_COLUMNS, SOE_COLUMNS, SOE_COLUMNS_DTYPE
-from lib import CONSOLE_WIDTH, ProcessError, calc_time, immutable_dict, join_datetime, load_cpoint, load_workbook, read_xml, test_datetime_format, truncate
-from worker import run_cpu_bound
+
+from .worker import run_cpu_bound
+from ..globals import RCD_COLUMNS, RTU_COLUMNS, SOE_COLUMNS, SOE_COLUMNS_DTYPE
+from ..lib import CONSOLE_WIDTH, ProcessError, calc_time, immutable_dict, join_datetime, load_cpoint, load_workbook, read_xml, test_datetime_format, truncate
 
 
 FilePaths: TypeAlias = List[str]
@@ -370,7 +371,7 @@ class SpectrumFileReader(_FileReader):
 	column_list: List[str] = SOE_COLUMNS
 	sheet_name: str = 'HIS_MESSAGES'
 	time_series_column: str = 'Time stamp'
-	cpoint_file: str = 'cpoint*.xlsx'
+	cpoint_file: str = 'availability/src/cpoint*.xlsx'
 	soe_control_disable: pd.DataFrame
 	soe_local_remote: pd.DataFrame
 	soe_rtu_updown: pd.DataFrame

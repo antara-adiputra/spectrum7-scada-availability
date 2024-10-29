@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Callable, Generator, Literal, Iterable, Opti
 import pandas as pd
 import xlsxwriter
 from xlsxwriter.utility import xl_col_to_name
-from lib import immutable_dict
+
+from ..lib import immutable_dict
 
 
 class Progress:

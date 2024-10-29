@@ -2,9 +2,10 @@
 
 import argparse
 
-import config, settings
 from nicegui import binding
-from webgui.main import ui
+
+from availability import config, settings
+from availability.webgui.main import ui
 
 
 def local_file(path: str) -> str:
@@ -19,7 +20,7 @@ def local_file(path: str) -> str:
 	return content
 
 
-ui.add_head_html(local_file('head.html'), shared=True)
+ui.add_head_html(local_file('availability/webgui/head.html'), shared=True)
 binding.MAX_PROPAGATION_TIME = settings.MAX_PROPAGATION_TIME
 
 if __name__ in {'__mp_main__', '__main__'}:

@@ -2,15 +2,15 @@ import asyncio, time
 from functools import partial
 from typing import Any, Dict, List, Callable, Generator, Literal, Tuple, TypeAlias, Union
 
-import config
-import webgui.components
-from webgui.components import Button, MenuSubtitle, MenuTitle, ObjectDebugger
-from webgui.state import MenuState, State
 from nicegui import app, events, ui
-from lib import nested_dict
-from avrs import AVRSFromOFDB, AVRSFromFile, AVRSCollective
-from rcd import RCDFromOFDB, RCDFromFile, RCDFromFile2, RCDCollective
-from lib import rgetattr, instance_factory
+
+from . import components
+from .components import Button, MenuSubtitle, MenuTitle, ObjectDebugger
+from .state import MenuState, State
+from ..import config
+from ..core.avrs import AVRSFromOFDB, AVRSFromFile, AVRSCollective
+from ..core.rcd import RCDFromOFDB, RCDFromFile, RCDFromFile2, RCDCollective
+from ..lib import instance_factory
 
 
 CalcOutputGen: TypeAlias = Generator[float, dict, dict]		# (percentage, state, result)
@@ -277,7 +277,7 @@ class WebGUIv2(ui.card):
 		self.menu.on_change(self._handle_menu_change)
 
 	async def _handle_menu_change(self, e: events.ValueChangeEventArguments) -> None:
-		comp = getattr(webgui.components, self.menu.state.component, None)
+		comp = getattr(components, self.menu.state.component, None)
 		kwargs = self.menu.state.comp_kwargs.copy()
 		self.panel_content.clear()
 

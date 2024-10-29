@@ -7,14 +7,15 @@ from typing import Any, Dict, List, Callable, Iterable, Optional, Tuple, TypeAli
 
 import numpy as np
 import pandas as pd
-import settings
 from xlsxwriter.utility import xl_col_to_name
-from core import BaseAvailability, XLSExportMixin
-from filereader import RCFileReader, SpectrumFileReader, SurvalentFileReader
-from global_parameters import RCD_BOOK_PARAM, RCD_COLUMNS
-from lib import ProcessError, calc_time, get_datetime, get_execution_duration, get_termination_duration, immutable_dict, join_datetime, nested_dict, progress_bar
-from ofdb import SpectrumOfdbClient
-from test import *
+
+from .. import settings
+from .base import BaseAvailability, XLSExportMixin
+from ..globals import RCD_BOOK_PARAM, RCD_COLUMNS
+from ..lib import ProcessError, calc_time, get_datetime, get_execution_duration, get_termination_duration, immutable_dict, join_datetime, nested_dict, progress_bar
+from ..utils.filereader import RCFileReader, SpectrumFileReader, SurvalentFileReader
+from ..utils.ofdb import SpectrumOfdbClient
+from ..test import *
 
 
 FilePaths: TypeAlias = List[str]

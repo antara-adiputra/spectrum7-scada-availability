@@ -4,8 +4,9 @@ from functools import partial
 from multiprocessing import managers, Manager
 from typing import Any, Dict, List, Callable, Generator, Literal, TypeAlias, Union
 
-import settings
 from nicegui import background_tasks, ui
+
+from .. import settings
 
 
 CalcOutputGen: TypeAlias = Generator[float, dict, dict]		# (percentage, state, result)

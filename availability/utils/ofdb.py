@@ -4,11 +4,13 @@ from functools import partial
 from types import MappingProxyType
 from typing import Any, Dict, List, Callable, Literal, Optional, Tuple, TypeAlias, Union
 
-import config, cryptography.fernet, settings
+import cryptography.fernet
 import pandas as pd
 import sqlalchemy as sa
-from global_parameters import SOE_COLUMNS, SOE_COLUMNS_DTYPE
-from lib import ProcessError, calc_time, immutable_dict, load_cpoint, validate_cpoint
+
+from .. import config, settings
+from ..globals import SOE_COLUMNS, SOE_COLUMNS_DTYPE
+from ..lib import ProcessError, calc_time, immutable_dict, load_cpoint, validate_cpoint
 
 
 DtypeMapping: TypeAlias = MappingProxyType[str, Dict[str, Any]]
@@ -34,7 +36,7 @@ class SpectrumOfdbClient:
 	_conf_path = '.config'
 	column_dtype: DtypeMapping = immutable_dict(SOE_COLUMNS_DTYPE)
 	column_list: List[str] = SOE_COLUMNS
-	cpoint_file: str = 'cpoint.xlsx'
+	cpoint_file: str = 'availability/src/cpoint.xlsx'
 	tzone: datetime.timedelta = datetime.timedelta(hours=8)	# Timezone for Asia/Makassar
 	exception_prefix: str = 'LoadFileError'
 	keep_duplicate: str = 'last'

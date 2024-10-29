@@ -7,14 +7,15 @@ from typing import Any, Dict, List, Callable, Literal, Optional, Tuple, TypeAlia
 
 import numpy as np
 import pandas as pd
-import config, settings
 from xlsxwriter.utility import xl_col_to_name
-from core import BaseAvailability, XLSExportMixin
-from filereader import AVRSFileReader, SpectrumFileReader
-from global_parameters import RTU_BOOK_PARAM
-from lib import ProcessError, calc_time, immutable_dict, join_datetime, load_cpoint, nested_dict, progress_bar, timedelta_split
-from ofdb import SpectrumOfdbClient
-from test import *
+
+from .base import BaseAvailability, XLSExportMixin
+from .. import config, settings
+from ..globals import RTU_BOOK_PARAM
+from ..lib import ProcessError, calc_time, immutable_dict, join_datetime, load_cpoint, nested_dict, progress_bar, timedelta_split
+from ..utils.filereader import AVRSFileReader, SpectrumFileReader
+from ..utils.ofdb import SpectrumOfdbClient
+from ..test import *
 
 
 CalcResult : TypeAlias = Dict[str, Dict[str, Any]]
@@ -517,7 +518,7 @@ class _AVRSBaseCalculation(BaseAvailability):
 		**
 	"""
 	name: str = 'Availability Remote Station'
-	cpoint_file: str = 'cpoint*.xlsx'
+	cpoint_file: str = 'availability/src/cpoint*.xlsx'
 	rtudown_all: pd.DataFrame
 	cpoint_ifs: pd.DataFrame
 	availability: pd.DataFrame
