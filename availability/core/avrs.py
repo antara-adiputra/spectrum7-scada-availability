@@ -538,14 +538,20 @@ class _AVRSBaseCalculation(BaseAvailability):
 		"""Re-initiate parameter"""
 		self._calculated = False
 		self.availability = None
-		cpoint = getattr(self, 'point_description', None)
+		self.update_rtu_table()
 
+	def update_rtu_table(self) -> None:
+		cpoint = getattr(self, 'point_description', None)
 		if isinstance(cpoint, pd.DataFrame):
-			self.cpoint_ifs = cpoint[(cpoint['B1']=='IFS') & (cpoint['B2']=='RTU_P1')]
+			subset = ['B1', 'B2', 'B3']
 		else:
+			subset = ['B1 text', 'B2 text', 'B3 text']
 			cpoint = load_cpoint(self.cpoint_file)
-			# Remove duplicates to prevent duplication in merge process
-			self.cpoint_ifs = cpoint[(cpoint['B1']=='IFS') & (cpoint['B2']=='RTU_P1')].drop_duplicates(subset=['B1 text', 'B2 text', 'B3 text'], keep='last')
+
+		# Always drop duplicates to ensure uniqueness of rtu table
+		# The parameter keep="last" will make rtu table only keep the newest data based on cpoint_file's order
+		# Note: Extended cpoint file (named with *_ext at the end of filename) will always loaded after main cpoint file
+		self.cpoint_ifs = cpoint[(cpoint['B1']=='IFS') & (cpoint['B2']=='RTU_P1')].drop_duplicates(subset=subset, keep='last')
 
 	@calc_time
 	def _calculate(self, **kwargs) -> CalcResult:
@@ -597,8 +603,19 @@ class _AVRSBaseCalculation(BaseAvailability):
 			Cleaned data
 		"""
 		prepared = df.copy()
+		# Update on 02-01-2025
+		# 	- Re-match Long Name with point description
+		# Re-match Long Name column based on cpoint_file description of RTU-Long Name relation to provide consistency across each update
+		columns = set(prepared.columns)
+		# Temporary delete Long Name column, then merge with cpoint_file description
+		columns.remove('Long Name')
+		prepared = prepared[list(columns)].merge(right=self.rtu_table, how='left', on=['RTU']).fillna('')	# Left blank "" to undefined Long Name
+		assert len(prepared['RTU'].unique()) >= len(prepared['Long Name'].unique()), 'Inconsistent/duplicated [RTU - Long Name] detected'
+
+		# Re-format Duration column to Timedelta type
 		duracol_type = prepared['Duration'].dtype
 		duracell_type = type(prepared.loc[prepared.index[0], 'Duration'])
+
 		# Must be determined, can cause error on groupby process
 		if duracol_type=='object' or duracell_type==datetime.time:
 			prepared['Duration'] = prepared['Duration'].map(lambda time: pd.Timedelta(time.hour*3600 + time.minute*60 + time.second + time.microsecond/10**6, unit='s'))
@@ -737,7 +754,7 @@ class _AVRSBaseCalculation(BaseAvailability):
 		]
 
 		df_pre = df.copy()
-		rtu_table = self.cpoint_ifs[['B3', 'B3 text']].rename(columns={'B3': 'RTU', 'B3 text': 'Long Name'})
+		# rtu_table = self.cpoint_ifs[['B3', 'B3 text']].rename(columns={'B3': 'RTU', 'B3 text': 'Long Name'})
 
 		down_count = df_pre[groupby_columns].groupby(columns, as_index=False).count().rename(columns={'Duration': 'Downtime Occurences'})
 		down_agg = df_pre[groupby_columns].groupby(columns).agg(['sum', 'mean', 'max']).reset_index()
@@ -754,7 +771,7 @@ class _AVRSBaseCalculation(BaseAvailability):
 		down_other = df.loc[filter_other_down, groupby_columns].groupby(columns, as_index=False).sum().rename(columns={'Duration': 'Other Downtime'})
 
 		# Merge table and fill NaN Downtime Occurences to 0
-		df_groupby = rtu_table.merge(right=down_count, how='outer', on=columns).fillna(0)
+		df_groupby = self.rtu_table.merge(right=down_count, how='outer', on=columns).fillna(0)
 		# Merge existing table with aggregated table and fill NaT with timedelta(0 second)
 		for dfgroup in [down_agg, down_uncls, down_rtu, down_link, down_other]:
 			df_groupby = df_groupby.merge(right=dfgroup, how='left', on=columns).fillna(datetime.timedelta(seconds=0))
@@ -909,6 +926,13 @@ class _AVRSBaseCalculation(BaseAvailability):
 	@property
 	def process_duration(self):
 		return getattr(self, '_process_duration', None)
+
+	@property
+	def rtu_table(self) -> pd.DataFrame:
+		if isinstance(self.cpoint_ifs, pd.DataFrame):
+			return self.cpoint_ifs[['B3', 'B3 text']].rename(columns={'B3': 'RTU', 'B3 text': 'Long Name'})
+		else:
+			return
 
 
 class AVRS(_AVRSBaseCalculation, _Export):

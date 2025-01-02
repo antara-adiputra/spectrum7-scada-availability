@@ -554,24 +554,45 @@ class AVRSFileReader(_FileReader):
 		Args:
 			df : Dataframe
 		"""
-		df_columns = df.columns.to_list()
+		columns = set(df.columns)
 		new_df = df.loc[(df[self.time_series_column]>=self.date_range[0]) & (df[self.time_series_column]<=self.date_range[1]), self.column_list].copy()
 
+		# Update on 02-01-2025
+		# 	- Re-calculate Duration
+		#	- Re-calculate Fix Duration
+		# 
 		# Define columns for user validation
-		new_df['Acknowledged Down Time'] = ['' if adt is pd.NaT else adt for adt in df['Acknowledged Down Time']] if 'Acknowledged Down Time' in df_columns else ''
-		new_df['Fix Duration'] = df['Fix Duration'] if 'Fix Duration' in df_columns else new_df['Duration']
+		# Re-calculate Duration
+		new_df['Duration'] = new_df['Up Time'] - new_df['Down Time']
+
+		# Specify Acknowledged Down Time as datetime type explicitly to enable datetime operation
+		# new_df['Acknowledged Down Time'] = ['' if adt is pd.NaT else adt for adt in df['Acknowledged Down Time']] if 'Acknowledged Down Time' in columns else ''
+		if 'Acknowledged Down Time' in columns:
+			new_df['Acknowledged Down Time'] = pd.to_datetime(df['Acknowledged Down Time'])
+		else:
+			# Set column to NaT first, before apply substraction
+			new_df['Acknowledged Down Time'] = pd.NaT
+		# Re-calculate Fix Duration
+		# new_df['Fix Duration'] = df['Fix Duration'] if 'Fix Duration' in columns else new_df['Duration']
+		new_df['Fix Duration'] = new_df['Up Time'] - new_df['Acknowledged Down Time']
+		filter_fd_nat = pd.isna(new_df['Fix Duration'])
+		new_df.loc[filter_fd_nat, 'Fix Duration'] = new_df[filter_fd_nat]['Duration']
+
+		# Fill NaT as blank "" value for further operation
+		filter_adt_nat = pd.isna(new_df['Acknowledged Down Time'])
+		new_df.loc[filter_adt_nat, 'Acknowledged Down Time'] = '#'	# Unable fill NaT value with empty "" value, so we use "#" 
 		# Define marked columns
 		for mcol in self.column_mark:
 			# Set value for additional columns, default is empty string ''
 			if mcol=='Marked Link Failure':
-				if mcol in df_columns:
+				if mcol in columns:
 					new_df[mcol] = df[mcol]
-				elif 'Marked Comm. Failure' in df_columns:
+				elif 'Marked Comm. Failure' in columns:
 					new_df[mcol] = df['Marked Comm. Failure']
 				else:
 					new_df[mcol] = ''
 			else:
-				new_df[mcol] = df[mcol] if mcol in df_columns else ''
+				new_df[mcol] = df[mcol] if mcol in columns else ''
 
 		new_df = new_df.fillna('').sort_values([self.time_series_column], ascending=[True]).reset_index(drop=True)
 		return new_df
