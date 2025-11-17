@@ -1,6 +1,8 @@
 # This is site settings which can only be updated offline before program is running
 # For more information, visit https://nicegui.io/documentation/section_configuration_deployment
 
+import platform
+from pathlib import Path
 from typing import Any, Dict, List, Callable, Iterable, Literal, Optional, Tuple, TypeAlias, Union
 
 
@@ -29,11 +31,13 @@ OPTIONS
 	--show-welcome-message		whether to show the welcome message (default: True)
 """
 
-
+BASE_DIR = Path(__file__).parent.parent.resolve()
+APP_DIR = Path(__file__).parent.resolve()
+CONFIG_DIR = BASE_DIR / 'availability/src'
 HOST: str = '0.0.0.0'
 PORT: int = 8001
 
-APP_TITLE: str = 'Aplikasi Perhitungan Availability'
+APP_TITLE: str = 'Aplikasi Availability SCADA'
 VIEWPORT: str = 'width=device-width, initial-scale=1'
 FAVICON: Optional[str] = None
 
@@ -48,6 +52,9 @@ MAX_PROPAGATION_TIME: float = 0.05	 # default 0.01
 MAX_CPU_USAGE: int = 8
 RECONNECT_TIMEOUT: float = 3.0
 
+
+PY_VERSION = platform.python_version()
+PY_NODE = platform.node()
 HEAD_HTML_SOURCES: List[str] = [
 	'head.html'
 ]

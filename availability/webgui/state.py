@@ -1,23 +1,111 @@
-import datetime
+import datetime, functools
+from dataclasses import InitVar, asdict, dataclass, field, fields
 from io import BytesIO
-from typing import Any, Dict, List, Text, Callable, Optional, Tuple, Union
+
+from nicegui.binding import bindable_dataclass
+
+from .types import *
+from ..core.base import BaseClass, ProgressData, State
+from ..lib import rsetattr
 
 
-class State:
-	"""Abstract class of State"""
+@bindable_dataclass
+class BaseState(State):
+	pass
 
-	def __init__(self) -> None:
-		pass
 
-	def _attr_from_dict(self, **kwargs) -> None:
-		for key, val in kwargs.items():
-			if hasattr(self, key): setattr(self, key, val)
+@bindable_dataclass
+class InterlockState(BaseState):
+	enable_reset: bool = False
+	enable_calculate: bool = False
+	enable_change_input: bool = True
+	enable_change_master: bool = False
+	enable_check_server: bool = False
+	enable_download: bool = False
+	enable_upload_file: bool = True
+	enable_view_file_list: bool = False
+	result_visible: bool = False
+	setup_visible: bool = True
 
-	def reset(self) -> None:
-		pass
+	def set_input_source(self, name: str):
+		self.enable_change_master = bool(name=='SOE')
+		self.enable_upload_file = bool(name in ('SOE', 'RCD', 'RTU'))
+		self.enable_check_server = bool(name=='OFDB')
+		self.set_uploaded(False)
 
-	def update(self, **kwargs) -> None:
-		self._attr_from_dict(**kwargs)
+	def set_uploaded(self, value: Optional[bool]):
+		self.enable_upload_file = not value
+		if not value:
+			self.set_loaded(False)
+
+	def set_loading(self, value: bool):
+		self.enable_change_input = not value
+		self.enable_change_master = not value
+		self.enable_reset = not value
+
+	def set_loaded(self, value: bool):
+		self.enable_reset = value
+		self.enable_calculate = value
+		self.enable_view_file_list = value
+		self.enable_change_input = not value
+		if value:
+			# Disable change master only if data loaded
+			self.enable_change_master = False
+		else:
+			# Disable calculate if data not loaded
+			self.set_calculated(False)
+
+	def set_calculated(self, value: bool):
+		self.enable_download = value
+
+
+@dataclass
+class _Wrapper:
+	# __wrapped__: ClassVar[BaseClass] = None
+	_obj: InitVar[BaseClass]
+
+	def __post_init__(self, _obj: BaseClass, **kwargs):
+		self.wrap(_obj)
+
+	def wrap(self, obj: BaseClass):
+		if obj is None:
+			return
+
+		self.__wrapped__ = obj
+		obj.bind_to(self)
+
+
+@dataclass
+class AvStateWrapper(_Wrapper, State):
+	progress: ProgressData = field(init=False, default_factory=ProgressData)
+	date_range: Tuple[Optional[datetime.datetime], Optional[datetime.datetime]] = (None, None)
+	loading_file: bool = False
+	loaded: Optional[bool] = None
+	analyzing: bool = False
+	analyzed: Optional[bool] = None
+	calculating: bool = False
+	calculated: Optional[bool] = None
+	exporting: bool = False
+
+	def reset(self):
+		super().reset()
+		self.progress.init()
+
+
+def toggle_attr(name: str, *value):
+	val0 = value[0] if len(value)>0 else True
+	val1 = value[1] if len(value)>1 else None
+	def wrapper(func):
+		@functools.wraps(func)
+		async def wrapped(self, *args, **kwargs):
+			rsetattr(self, name, val0)
+			result = await func(self, *args, **kwargs)
+			rsetattr(self, name, val1)
+			return result
+		return wrapped
+	return wrapper
+
+
 
 
 class MenuState(State):

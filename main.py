@@ -2,10 +2,10 @@
 
 import argparse
 
-from nicegui import binding
+from nicegui import ui, binding
 
 from availability import config, settings
-from availability.webgui.main import ui
+from availability import webgui
 
 
 def local_file(path: str) -> str:

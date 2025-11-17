@@ -1,21 +1,26 @@
-import asyncio, datetime, os
+import asyncio, datetime, functools, inspect, os
+from dataclasses import InitVar, dataclass, field, fields, is_dataclass
+from functools import partial
 from io import BytesIO
-from typing import Any, Dict, List, Callable, Literal, Optional, Tuple, TypeAlias, Union
 
 import cryptography.fernet
 import pandas as pd
 from nicegui import events, ui
+from nicegui.binding import bindable_dataclass
 from nicegui.elements.mixins.value_element import ValueElement
 
-from .state import CalculationState, FileInputState, OfdbInputState
+from .event import EventChainsWithArgs, EventChainsWithoutArgs
+from .state import AvStateWrapper, BaseState, CalculationState, FileInputState, InterlockState, OfdbInputState, toggle_attr
+from .types import *
 from .. import config
-from ..core.avrs import AVRSFromOFDB, AVRSFromFile, AVRSCollective
-from ..core.rcd import RCDFromOFDB, RCDFromFile, RCDFromFile2, RCDCollective
+from ..core.rtu import RTUConfig, AvRTUResult
+from ..globals import MONTH_OPTIONS
+from ..lib import consume, rgetattr, try_strftime
 from ..utils.worker import run_cpu_bound
 
 
-FileCalcObjects: TypeAlias = Union[AVRSFromFile, AVRSCollective, RCDFromFile, RCDFromFile2, RCDCollective]
-OfdbCalcObjects: TypeAlias = Union[AVRSFromOFDB, RCDFromOFDB]
+FileCalcObjects: TypeAlias = Union[Any, Any]
+OfdbCalcObjects: TypeAlias = Union[Any]
 CalcObjects: TypeAlias = Union[FileCalcObjects, OfdbCalcObjects]
 
 
@@ -67,7 +72,8 @@ class ObjectDebugger(ui.expansion):
 	def __init__(
 		self,
 		text: str = '',
-		object: Optional[Any] = None,
+		object: object = None,
+		target: Optional[str] = None,
 		*,
 		caption: Optional[str] = None,
 		icon: Optional[str] = None,
@@ -75,11 +81,16 @@ class ObjectDebugger(ui.expansion):
 		value: bool = False,
 		on_value_change: Optional[Callable[..., Any]] = None,
 		**contexts
-	) -> None:
+	):
 		title = text if text else repr(object)
 		super().__init__(text=title, caption=caption, icon=icon, group=group, value=value, on_value_change=on_value_change)
 		self.__used__ = set([attr for attr in dir(ui.expansion) if not (attr.startswith('_') and attr.endswith('_'))])
-		self._object = object
+
+		if not (object is None or target is None):
+			self._callable_obj = functools.partial(rgetattr, object, target)
+		else:
+			self._callable_obj = None
+
 		self.props(add='dense')
 		self.classes('w-full')
 		if 'included' not in contexts: self.included = list()
@@ -89,12 +100,31 @@ class ObjectDebugger(ui.expansion):
 			if not key.startswith('_') and key not in self.__used__: setattr(self, key, contexts[key])
 
 	def render(self) -> ui.expansion:
+		def _render_table(dtclass):
+			for f in fields(dtclass):
+				ui.label(f.name).classes('border')
+				ui.label('').classes('border').bind_text_from(dtclass, f.name, lambda x: repr(x) if callable(x) else str(x))
+
 		with self:
+			if self._callable_obj is None:
+				return self
+
 			with ui.grid(columns='auto auto').classes('w-full gap-0'):
-				for attr in dir(self._object):
-					if not attr.startswith('__') or (attr in self.included and attr not in self.excluded):
-						ui.label(attr).classes('border')
-						ui.label('').classes('border').bind_text_from(self._object, attr, lambda x: repr(x) if callable(x) else str(x))
+				obj = self._callable_obj()
+				if is_dataclass(obj):
+					# for f in fields(obj):
+					# 	ui.label(f.name).classes('border')
+					# 	ui.label('').classes('border').bind_text_from(obj, f.name, lambda x: repr(x) if callable(x) else str(x))
+					_render_table(obj)
+				# elif isinstance(obj, MirrorableBaseClass):
+				# 	mirror = obj.create_mirror()
+				# 	_render_table(mirror)
+
+
+				# for attr in dir(self._callable_obj()):
+				# 	if not attr.startswith('__') or (attr in self.included and attr not in self.excluded):
+				# 		ui.label(attr).classes('border')
+				# 		ui.label('').classes('border').bind_text_from(self._callable_obj(), attr, lambda x: repr(x) if callable(x) else str(x))
 		return self
 
 	def refresh(self) -> None:
@@ -1156,3 +1186,851 @@ class AVRSSettingMenu(BaseSettingMenu):
 				.classes(' '.join(kwargs.get('comp_classes', [])))\
 				.style(self.parse_style_from_dict(**kwargs.get('comp_style', {})))
 		return item
+
+
+####################################################################################################
+# NEW DEVELOPED CODE
+####################################################################################################
+
+
+ui_item = ui.item.default_style('padding: 2px 8px;')
+ui_section = ui.item_section.default_classes('align-stretch')
+ui_select = ui.select.default_props('dense outlined square stack-label options-dense')
+ui_input = ui.input.default_props('dense outlined square stack-label')
+ui_menu_label = ui.item_label.default_classes('text-md')
+
+def get_css_class(*style, **kwstyle) -> str:
+	cls = list(style)
+	if kwstyle:
+		cls.extend([v for k, v in kwstyle.items() if k.startswith('css_')])
+	return ' '.join(cls)
+
+def get_component_props(*props, **kwprops) -> str:
+	prp = list(props)
+	if kwprops:
+		prp.extend([v for k, v in kwprops.items() if k.startswith('prop_')])
+	return ' '.join(prp)
+
+
+class LoadingSpinner(ui.dialog):
+
+	def __init__(
+		self,
+		text: str = '',
+		*,
+		value: bool = False,
+		spinner: SpinnerType = 'default',
+		size: str = '10em',
+		color: str = 'primary',
+		thickness: int = 5,
+		**kwargs
+	):
+		super().__init__(value=value)
+		self.text = text
+		self.props('persistent backdrop-filters="opacity(90%)"')
+		with self:
+			with UIColumn(align_items='center'):
+				if spinner is not None: ui.spinner(type=spinner, size=size, color=color, thickness=thickness)
+				self.message = ui.label(text=text).classes('text-2xl text-white')\
+					.bind_text_from(self)
+
+
+class UIRow(ui.row):
+
+	def __init__(
+		self,
+		*,
+		wrap: bool = False,
+		align_items: FlexAlignOpt = 'center',
+		overflow: OverflowOpt = 'auto',
+		gap: int = 1,
+		**kwargs
+	):
+		super().__init__(wrap=wrap, align_items=align_items)
+		base_class = {
+			'css_gap': f'gap-x-{gap}',
+			'css_overflow': f'overflow-{overflow}',
+		}
+		base_class.update(kwargs)
+		self.classes(get_css_class(**base_class))
+
+
+class UIColumn(ui.column):
+
+	def __init__(
+		self,
+		*,
+		wrap: bool = False,
+		align_items: FlexAlignOpt = 'stretch',
+		**kwargs
+	):
+		super().__init__(wrap=wrap, align_items=align_items)
+		base_class = {
+			'css_width': 'w-full',
+			'css_padding': 'py-2 px-4',
+			'css_gap': 'gap-2'
+		}
+		base_class.update(kwargs)
+		self.classes(get_css_class(**base_class))
+
+
+class NavButton(ui.button):
+
+	def __init__(
+		self,
+		text: str = '',
+		*,
+		on_click: Optional[Callable[..., Any]] = None,
+		color: ColorTemplate = 'primary',
+		icon: Optional[str] = None,
+		style: QButtonStyle = 'flat'
+	):
+		super().__init__(text, on_click=on_click, color=color, icon=icon)
+		props = get_component_props('dense', 'no-caps', 'size=md', style)
+		classes = get_css_class('px-2')
+
+		self.props(props)
+		self.classes(classes)
+
+
+class NavDropdownButton(ui.dropdown_button):
+
+	def __init__(
+		self,
+		text: str = '',
+		*,
+		value: bool = False,
+		on_value_change: Optional[Callable[..., Any]] = None,
+		on_click: Optional[Callable[..., Any]] = None,
+		color: ColorTemplate = 'primary',
+		icon: Optional[str] = None,
+		auto_close: bool = True,
+		split: bool = False,
+		style: QButtonStyle = 'flat',
+		**kwargs
+	) -> None:
+		super().__init__(text, value=value, on_value_change=on_value_change, on_click=on_click, color=color, icon=icon, auto_close=auto_close, split=split)
+		props = get_component_props(
+			style,
+			'dense',
+			'no-caps,',
+			'no-icon-animation',
+			'dropdown-icon=more_vert',
+			'size=md',
+			'menu-anchor="bottom start"',
+			'menu-self="top left"',
+		)
+		base_class = {
+			'css_padding': 'px-2',
+		}
+		base_class.update(kwargs)
+
+		self.props(props)
+		self.classes(get_css_class(**base_class))
+
+
+@bindable_dataclass
+class _DialogPromptState(BaseState):
+	message: Union[str, Callable]
+	title: str = ''
+	choices: Union[List[str], Dict[str, str]] = field(default_factory=['yes', 'no'])
+
+
+class DialogPrompt(ui.dialog):
+
+	def __init__(self, message: str = '', choices: Union[List[str], Dict[str, str]] = {'yes': 'Ya', 'no': 'Tidak'}, *, value: bool = False):
+		super().__init__(value=value)
+		self.state = _DialogPromptState(message=message, choices=choices)
+
+		with self, ui.card(align_items='center').classes('p-2'):
+			with UIColumn(css_padding='p-1', css_gap='gap-1'):
+				self.title()
+				self.message()
+				self.prompts()
+
+	@ui.refreshable_method
+	def title(self):
+		if self.state.title:
+			ui.label(self.state.title).classes('text-lg text-bold text-center')
+			ui.separator()
+
+	@ui.refreshable_method
+	def message(self):
+		if isinstance(self.state.message, str):
+			ui.label(self.state.message).classes('mb-4')
+		elif callable(self.state.message):
+			self.state.message()
+
+	@ui.refreshable_method
+	def prompts(self):
+		with UIRow():
+			ui.space()
+			if isinstance(self.state.choices, list):
+				for ch in self.state.choices:
+					fn_click = partial(self.submit, ch)
+					Button(ch.title(), on_click=fn_click)\
+						.props('dense no-caps')\
+						.classes('px-2')
+			elif isinstance(self.state.choices, dict):
+				for val, text in self.state.choices.items():
+					fn_click = partial(self.submit, val)
+					Button(text, on_click=fn_click)\
+						.props('dense no-caps')\
+						.classes('px-2')
+
+	def set(self, **params):
+		self.state.set(**params)
+		self.title.refresh()
+		self.message.refresh()
+		self.prompts.refresh()
+
+
+WBookFiles: TypeAlias = Dict[str, BytesIO]
+
+@dataclass(frozen=True)
+class UploadedFilesInfo:
+	files: WBookFiles = field(default_factory=dict)
+	filenames: List[str] = field(init=False, default_factory=list)
+	filesizes: List[int] = field(init=False, default_factory=list)
+	count: int = field(init=False, default=0)
+	total_size: int = field(init=False, default=0)
+
+	def __post_init__(self):
+		attrs = dict(
+			filenames=list(self.files.keys()),
+			filesizes=list(map(lambda x: len(x.getvalue()), self.files.values())),
+			count=len(self.files),
+			total_size = sum(map(lambda x: len(x.getvalue()), self.files.values())),
+		)
+		for key, val in attrs.items():
+			object.__setattr__(self, key, val)
+
+
+@bindable_dataclass
+class FilePickerState(BaseState):
+	files: WBookFiles = field(default_factory=dict)
+	filenames: List[str] = field(init=False, default_factory=list)
+	filesizes: List[int] = field(init=False, default_factory=list)
+	count: int = field(init=False, default=0)
+	fileinfo: UploadedFilesInfo = field(init=False, default=None)
+	queue: set[str] = field(default_factory=set)
+	queue_count: int = 0
+
+	def _recalculate(self):
+		self.filenames = list(self.files.keys())
+		self.filesizes = list(map(lambda x: len(x.getvalue()), self.files.values()))
+		self.count = len(self.files)
+
+	def _recalculate_queue(self):
+		self.queue_count = len(self.queue)
+
+	def update_files(self, files: WBookFiles):
+		self.files.update(files)
+		self.fileinfo = UploadedFilesInfo(files)
+		self._recalculate()
+
+	def add_queues(self, filenames: Union[str, Sequence[str]]):
+		if isinstance(filenames, str):
+			self.queue.add(filenames)
+		else:
+			self.queue.update(set(filenames))
+		self._recalculate_queue()
+
+	def del_queues(self, filenames: Union[str, Sequence[str]]):
+		if isinstance(filenames, str):
+			self.queue.discard(filenames)
+		else:
+			consume(map(lambda x: self.queue.discard(x), filenames))
+		self._recalculate_queue()
+
+	def clear_files(self):
+		self.files.clear()
+		self.fileinfo = None
+
+	def clear_queue(self):
+		self.queue.clear()
+
+	def clear(self):
+		self.clear_files()
+		self.clear_queue()
+
+
+class FilePickerv2(ui.dialog):
+	"""
+	"""
+	_fileupload: ui.upload = None
+	_event_callbacks: Dict[str, Callable[..., Any]]
+	upload_props: ClassVar[str] = 'bordered hide-upload-btn accept=".xlsx,.xls"'
+	upload_classes: ClassVar[str] = ''
+	button_props: ClassVar[str] = 'dense round outline size=sm'
+	button_classes: ClassVar[str] = ''
+
+	def __init__(
+		self,
+		*,
+		value: bool = False,
+		on_uploaded: Union[Callable[..., Any], None] = None,
+		on_close: Union[Callable[..., Any], Awaitable, None] = None
+	):
+		"""
+
+		Params:
+			value : initial value
+			on_uploaded : callable handler chained after file successfuly uploaded
+			on_close : callable handler chained after dialog closed
+		"""
+		super().__init__(value=value)
+		self._event_callbacks = {
+			'on_uploaded': on_uploaded,
+			'on_close': on_close,
+		}
+		self.state = FilePickerState()
+
+	async def _handle_showed(self, e: events.ValueChangeEventArguments) -> None:
+		# self.reset()
+		pass
+
+	async def _handle_hidden(self, e: events.ValueChangeEventArguments) -> None:
+		self.state.clear_queue()
+		func = self._event_callbacks['on_close']
+
+		if inspect.iscoroutinefunction(func):
+			await func()
+		elif inspect.isfunction(func):
+			func()
+		else:
+			pass
+
+	async def _handle_commit_upload(self, e: events.ClickEventArguments) -> None:
+		self.notification = ui.notification(message='Mengunggah file...', spinner=True, timeout=None)
+		await self._fileupload.run_method('upload')
+
+	async def _handle_uploaded_multiple(self, e: events.MultiUploadEventArguments) -> None:
+		async def read_buffer(buffers: List[BytesIO]):
+			results = list()
+			for buf in buffers:
+				with buf:
+					results.append(BytesIO(buf.read()))
+			return results
+
+		iobuffers = await read_buffer(e.contents)
+		uploaded = dict(zip(e.names, iobuffers))
+
+		self.state.update_files(uploaded)
+		self.trigger_events('uploaded')
+		ui.notify(f'{len(e.names)} file berhasil diunggah.', type='positive')
+		self.notification.dismiss()
+		# Wait for 2s to be automatically closed
+		await asyncio.sleep(2)
+		self.close()
+
+	async def _handle_queue_added(self, e: events.GenericEventArguments) -> None:
+		files = list(map(lambda file: file['__key'], e.args))
+		self.state.add_queues(files)
+
+	async def _handle_queue_removed(self, e: events.GenericEventArguments) -> None:
+		files = list(map(lambda file: file['__key'], e.args))
+		self.state.del_queues(files)
+
+	async def _handle_queue_reset(self, e: events.GenericEventArguments) -> None:
+		self._fileupload.reset()
+		self.state.clear_queue()
+
+	def render(self) -> Self:
+		with self, ui.card().classes('p-0 gap-y-0'):
+			self._fileupload = ui.upload(
+				label='Upload File Excel',
+				multiple=True,
+				max_files=config.MAX_FILES,
+				max_file_size=config.MAX_FILE_SIZE,
+				max_total_size=config.MAX_TOTAL_SIZE,
+				on_multi_upload=self._handle_uploaded_multiple
+			)\
+				.props(self.upload_props)\
+				.classes(self.upload_classes)\
+				.on('added', self._handle_queue_added)\
+				.on('removed', self._handle_queue_removed)
+
+			with ui.row().classes('w-full gap-x-2 p-2'):
+				ui.space()
+				btn_refresh = Button(icon='restart_alt', on_click=self._handle_queue_reset)\
+					.props(self.button_props)\
+					.classes(self.button_classes)\
+					.tooltip('Reset file')
+				btn_upload = Button(icon='check_circle_outline', on_click=self._handle_commit_upload)\
+					.bind_enabled_from(self.state, 'queue_count')\
+					.props(self.button_props)\
+					.classes(self.button_classes)\
+					.tooltip('Unggah file')
+
+		self.on('show', self._handle_showed)\
+			.on('hide', self._handle_hidden)
+
+		return self
+
+	def reset(self, *args, **kwargs) -> None:
+		self.state.clear()
+		self.trigger_events('uploaded')
+
+	def trigger_events(self, event: str) -> None:
+		e = self._event_callbacks.get('on_' + event)
+		args = events.ValueChangeEventArguments(client=self.client, sender=self, value=self.state.fileinfo)
+		if callable(e):
+			e(args)
+
+	def on_uploaded(self, fn: Callable) -> Self:
+		self._event_callbacks['on_uploaded'] = fn
+		return self
+
+
+@bindable_dataclass
+class PanelState(BaseState):
+	is_active: bool = False
+	input_source: Literal['SOE', 'OFDB', 'RCD', 'RTU'] = ''
+	input_category: Literal['File', 'Database'] = ''
+	master: Literal['spectrum', 'survalent'] = 'spectrum'
+	is_from_file: bool = False
+	is_from_ofdb: bool = False
+	date_period: Literal['all', 'monthly', 'specific'] = 'all'
+	date_year: int = field(default=datetime.date.today().year)
+	date_month: int = -1
+	start_date: datetime.date = None
+	end_date: datetime.date = None
+	uploaded: Optional[bool] = None
+	uploaded_fileinfo: UploadedFilesInfo = field(init=False, default=None)
+	interlock: InterlockState = field(init=False, default_factory=InterlockState)
+	result_visible: bool = False
+	setup_visible: bool = True
+	progress_visible: bool = False
+
+	def set_input_source(self, value: str):
+		print(datetime.datetime.now(), value)
+		self.input_source = value
+		self.categorize_input(value)
+		self.interlock.set_input_source(value)
+
+	def set_master(self, value: str):
+		self.master = value
+
+	def set_uploaded(self, value: bool):
+		self.uploaded = value
+		self.interlock.set_uploaded(value)
+
+	def set_date_year(self, value: int):
+		self.date_year = value
+		if self.date_month in range(1, 13):
+			self.start_date = datetime.date(year=value, month=self.date_month, day=1)
+			self.end_date = datetime.date(year=value, month=self.date_month+1, day=1) - datetime.timedelta(days=1)
+
+	def set_date_month(self, value: int):
+		self.date_month = value
+		if value in range(1, 13):
+			self.start_date = datetime.date(year=self.date_year, month=value, day=1)
+			self.end_date = datetime.date(year=self.date_year, month=value+1, day=1) - datetime.timedelta(days=1)
+
+	def set_start_date(self, value: datetime.date):
+		self.start_date = value
+		if isinstance(self.end_date, datetime.date):
+			if value.year==self.end_date.year:
+				self.date_year = value.year
+
+			if value.month==self.end_date.month:
+				self.date_month = value.month
+			else:
+				self.date_month = -1
+
+	def set_end_date(self, value: datetime.date):
+		self.end_date = value
+		if isinstance(self.start_date, datetime.date):
+			if value.year==self.start_date.year:
+				self.date_year = value.year
+
+			if value.month==self.start_date.month:
+				self.date_month = value.month
+			else:
+				self.date_month = -1
+
+	def toggle_visibility(self, name: str):
+		attr = name + '_visible'
+		if hasattr(self, attr):
+			setattr(self, attr, not getattr(self, attr))
+
+	def toggle_master(self):
+		self.master = 'survalent' if self.master=='spectrum' else 'spectrum'
+
+	def categorize_input(self, input: str):
+		if input in ('SOE', 'RCD', 'RTU'):
+			self.input_category = 'File'
+		elif input=='OFDB':
+			self.input_category = 'Database'
+		else:
+			self.input_category = ''
+
+		self.is_from_file = bool(self.input_category=='File')
+		self.is_from_ofdb = bool(self.input_category=='Database')
+
+	def refresh_state(self, *args):
+		print(datetime.datetime.now(), 'state & interlock refreshed')
+		self.interlock.set_input_source(self.input_source)
+		self.interlock.set_uploaded(self.uploaded)
+
+	def restart_av(self, *args):
+		self.uploaded = False
+		self.interlock.set_input_source(self.input_source)
+
+	def try_strftime(self, value: Any, format: str = '%Y-%m-%d') -> Optional[str]:
+		return try_strftime(value=value, format=format)
+
+
+class AVTabPanel(ui.tab_panel):
+	av: Union[AvRCObject, AvRSObject] = None
+	_refreshable: List[ui.refreshable]
+	select_input: ui.select = None
+	select_master: ui.radio = None
+	select_period: ui.radio = None
+	button_reset: ui.button = None
+	button_fileupload: ui.button = None
+	button_fileinfo: ui.button = None
+	button_checkdb: ui.button = None
+	button_calculate: ui.button = None
+
+	def __init__(
+		self,
+		name: str,
+		options: Dict[str, str] = dict(),
+	):
+		super().__init__(name=name)
+		self._refreshable = list()
+		self.name = name
+		self.state = PanelState()
+		self.av = None
+		self.av_state = AvStateWrapper(None)
+
+		with self:
+			self.filepicker = FilePickerv2(
+				on_uploaded=self.event_file_uploaded,
+				on_close=self.event_filepicker_closed
+			).render()
+			self.dialog_prompt = DialogPrompt()
+			with UIColumn(css_gap='gap-1', css_padding='px-0'):
+				self.group_label(text='Setup', name='setup')
+				self.parameter_setup(options=options)
+
+			self.section_result()
+			self.button_calculate = Button('Hitung', on_click=self.do_calculation)\
+				.bind_enabled_from(self.state.interlock, 'enable_calculate')\
+				.classes('w-full')
+
+	def _init_availability(self) -> Optional[Union[AvRCObject, AvRSObject]]:
+		raise ValueError('Must be overidden.')
+
+	def set_active(self, value: bool):
+		self.state.is_active = value
+
+	def update_refreshable(self, *args):
+		consume(map(lambda comp: comp.refresh(), self._refreshable))
+
+	def group_label(self, text: str, name: str, can_toggle: bool = True) -> ui.element:
+		with UIRow(overflow='hidden', gap=2).classes('py-1') as glabel:
+			ui.label(text).classes('font-bold whitespace-nowrap')
+			if can_toggle:
+				ui.button(icon='visibility_off', color='grey', on_click=lambda: self.state.toggle_visibility(name))\
+					.bind_icon_from(self.state, f'{name}_visible', lambda vis: 'visibility_off' if vis else 'visibility')\
+					.props('dense flat rounded')\
+					.tooltip(f'Tampilkan / sembunyikan {text.lower()}')
+			ui.separator().classes('w-fill')
+		return glabel
+
+	def section_result(self):
+		self._refreshable.append(self.calculation_result)
+		with UIColumn(css_gap='gap-1', css_padding='px-0'):
+			self.group_label(text='Hasil Perhitungan', name='result')
+			with UIColumn(css_padding='p-0').bind_visibility_from(self.state, 'result_visible'):
+				with UIRow():
+					Button('Lihat', icon='read_more')\
+						.bind_enabled_from(self.state.interlock, 'enable_download')\
+						.props('outline dense size=sm')
+					Button('Download', icon='file_download')\
+						.bind_enabled_from(self.state.interlock, 'enable_download')\
+						.props('outline dense size=sm')
+				self.calculation_result()
+
+	def parameter_setup(self, options: Dict[str, str] = dict()):
+		event_chain1 = EventChainsWithArgs(chains=(
+			self.event_input_source_changed,
+			self.wrap_state,
+		))
+		event_chain2 = EventChainsWithArgs(chains=(
+			self.event_master_changed,
+			self.wrap_state,
+		))
+		event_chain3 = EventChainsWithoutArgs(chains=[
+			self.event_restart_av,
+			self.wrap_state,
+			self.update_refreshable,
+		])
+		with ui.list()\
+			.bind_visibility_from(self.state, 'setup_visible')\
+			.classes('w-full'):
+			with ui_item():
+				with ui_section():
+					ui_menu_label('Data Input')
+				with ui_section():
+					self.select_input = ui_select(options=options, on_change=event_chain1)\
+						.bind_value_from(self.state, 'input_source')\
+						.bind_enabled_from(self.state.interlock, 'enable_change_input')\
+						.classes('w-full')
+			with ui_item():
+				with ui_section():
+					ui_menu_label('Master')
+				with ui_section():
+					with UIRow(overflow='visible').classes('w-full'):
+						self.select_master = ui.radio(options=dict(spectrum='Spectrum', survalent='Survalent'), on_change=event_chain2)\
+							.bind_value_from(self.state, 'master')\
+							.bind_enabled_from(self.state.interlock, 'enable_change_master')\
+							.props('dense inline')\
+							.classes('text-sm')
+			with ui_item():
+				with ui_section():
+					ui_menu_label('Range Waktu')
+				with ui_section().classes('gap-y-3'):
+					with UIRow(overflow='visible').classes('w-full'):
+						self.select_period = ui.radio(options=dict(all='Semua', monthly='Bulanan', specific='Spesifik'))\
+							.bind_value(self.state, 'date_period')\
+							.bind_enabled_from(self.state, 'input_source')\
+							.props('dense inline')\
+							.classes('text-sm')
+			with ui_item().bind_visibility_from(self.state, 'date_period', backward=lambda val: val in ('monthly', 'specific')):
+				with ui_section():
+					ui_menu_label('')
+				with ui_section().classes('gap-y-3'):
+						with UIRow(overflow='visible')\
+							.bind_visibility_from(self.state, 'date_period', value='monthly')\
+							.classes('w-full'):
+							ui.select(options=[self.state.date_year - x for x in range(5)], on_change=self.event_date_year_changed)\
+								.bind_value_from(self.state, 'date_year')
+							ui.select(options={-1: '--------', **MONTH_OPTIONS}, on_change=self.event_date_month_changed)\
+								.bind_value_from(self.state, 'date_month')\
+								.classes('w-full')
+						ui_input('Dari', on_change=self.event_start_date_changed)\
+							.bind_value_from(self.state, 'start_date', backward=self.state.try_strftime)\
+							.bind_visibility_from(self.state, 'date_period', value='specific')\
+							.props('type="date"')
+						ui_input('Sampai', on_change=self.event_end_date_changed)\
+							.bind_value_from(self.state, 'end_date', backward=self.state.try_strftime)\
+							.bind_visibility_from(self.state, 'date_period', value='specific')\
+							.props('type="date"')
+			with ui_item():
+				with ui_section():
+					ui_menu_label('').bind_text_from(self.state, 'input_category')
+				with ui_section():
+					with UIRow(overflow='visible')\
+						.bind_visibility_from(self.state, 'is_from_file')\
+						.classes('w-full'):
+						self.button_reset = Button('Reset', color='info', on_click=event_chain3)\
+							.bind_visibility_from(self.state, 'uploaded', value=True)\
+							.bind_enabled_from(self.state.interlock, 'enable_reset')\
+							.props('dense')\
+							.classes('w-24 px-2')
+						self.button_fileupload = Button('Pilih File', on_click=self.filepicker.open)\
+							.bind_visibility_from(self.state, 'uploaded', lambda b: not b)\
+							.bind_enabled_from(self.state.interlock, 'enable_upload_file')\
+							.props('dense')\
+							.classes('w-24 px-2')
+						self.button_fileinfo = Button('', on_click=self.show_fileinfo, icon='attach_file', color='teal')\
+							.bind_enabled_from(self.state.interlock, 'enable_view_file_list')\
+							.props('dense flat')\
+							.classes('px-0')
+						ui.icon(name='check_circle_outline', size='sm', color='positive')\
+							.bind_visibility_from(self.av_state, 'loaded', value=True)\
+							.tooltip('Validasi OK')
+						ui.icon(name='error_outline', size='sm', color='negative')\
+							.bind_visibility_from(self.av_state, 'loaded', value=False)\
+							.tooltip('Validasi NOK')
+						ui.spinner()\
+							.bind_visibility_from(self.av_state, 'loading_file')
+					with UIRow(overflow='visible')\
+						.bind_visibility_from(self.state, 'is_from_ofdb')\
+						.classes('w-full'):
+						self.button_checkdb = Button('Cek Koneksi')\
+							.bind_enabled_from(self.state, 'is_from_ofdb')\
+							.props('dense')\
+							.classes('px-2')
+
+	def wrap_state(self, *args):
+		print(datetime.datetime.now(), 'state', self.name, 'wrapped')
+		av = self._init_availability()
+		self.av = av
+		self.av_state.wrap(av)
+
+	def fileinfo_content(self):
+		props1 = ['dense', 'separator']
+		if self.state.uploaded_fileinfo.count:
+			props1.append('bordered')
+
+		with ui.element('div').classes('w-full mb-4'):
+			with ui.list()\
+				.props(get_component_props(*props1))\
+				.classes('w-full max-h-36 pr-0 overflow-y-auto'):
+				for i in range(self.state.uploaded_fileinfo.count):
+					with ui.item().props('clickable'):
+						with ui.item_section():
+							ui.item_label(f'{i+1}. {self.state.uploaded_fileinfo.filenames[i]}').props('lines=1')
+						with ui.item_section().props('side'):
+							ui.item_label(f'{self.state.uploaded_fileinfo.filesizes[i]/10**6:.2f}MB')
+			# Summary statement
+			ui.html(f'Total : <strong>{self.state.uploaded_fileinfo.count}</strong> file ({self.state.uploaded_fileinfo.total_size/10**6:.1f}MB)').classes('mt-2')
+
+	@staticmethod
+	def render_result_table(
+		params: List[Tuple[str, str]],
+		date_start: Optional[datetime.datetime] = None,
+		date_end: Optional[datetime.datetime] = None
+	):
+		def try_strftime(value: datetime.datetime, default: str = 'dd-mm-yyyy') -> str:
+			try:
+				return value.strftime('%d-%m-%Y')
+			except Exception:
+				return default
+
+		datestr_start = try_strftime(date_start)
+		datestr_end = try_strftime(date_end)
+		with UIRow():
+			ui.icon('date_range', size='sm', color='teal').classes('mr-2')
+			ui.label(datestr_start).classes('underline text-slate-400')
+			ui.label('s/d').classes('mx-1')
+			ui.label(datestr_end).classes('underline text-slate-400')
+		with UIRow(align_items='start'):
+			rows = len(params)//2 + len(params)%2
+			for x in range(2):
+				# Split into 2 section columns
+				with ui.list()\
+					.props('dense')\
+					.classes('w-full'):
+					for param in params[rows*x:rows*(x+1)]:
+						with ui.item():
+							with ui_section():
+								ui_menu_label(param[0])
+							with ui_section()\
+								.props('side')\
+								.classes('w-1/3 border border-solid')\
+								.style('padding-left: 0;'):
+								ui_menu_label(param[1]).classes('px-2')
+
+	def get_result_kwargs(self) -> Dict[str, Any]:
+		return dict(params=[])
+
+	@ui.refreshable_method
+	def calculation_result(self):
+		self.render_result_table(**self.get_result_kwargs())
+
+	def event_input_source_changed(self, e: events.ValueChangeEventArguments):
+		self.state.set_input_source(e.value)
+
+	def event_master_changed(self, e: events.ValueChangeEventArguments):
+		self.state.set_master(e.value)
+
+	def event_date_year_changed(self, e: events.ValueChangeEventArguments):
+		self.state.set_date_year(e.value)
+
+	def event_date_month_changed(self, e: events.ValueChangeEventArguments):
+		self.state.set_date_month(e.value)
+
+	def event_start_date_changed(self, e: events.ValueChangeEventArguments):
+		# NOTE : Value received here is string
+		try:
+			self.state.set_start_date(datetime.date.fromisoformat(e.value))
+		except (TypeError, ValueError):
+			self.state.set_start_date(None)
+
+	def event_end_date_changed(self, e: events.ValueChangeEventArguments):
+		# NOTE : Value received here is string
+		try:
+			self.state.set_end_date(datetime.date.fromisoformat(e.value))
+		except (TypeError, ValueError):
+			self.state.set_end_date(None)
+
+	def event_file_uploaded(self, e: events.ValueChangeEventArguments):
+		fileinfo: UploadedFilesInfo = e.value
+		self.state.uploaded_fileinfo = fileinfo
+		self.state.set_uploaded(bool(fileinfo.count))
+		if not self.av is None:
+			self.av.filereader.set_file(fileinfo.files)
+
+	async def event_filepicker_closed(self):
+		if self.state.uploaded and self.av_state.loaded is None:
+			await self.do_validate_file()
+
+	async def show_fileinfo(self):
+		content = self.fileinfo_content
+		self.dialog_prompt.set(
+			title='File Input',
+			message=content,
+			choices={'ok': 'OK'}
+		)
+		result = await self.dialog_prompt
+
+	def event_restart_av(self, *args):
+		self.state.restart_av(*args)
+		self.av_state.reset()
+
+	@toggle_attr('state.progress_visible', True, False)
+	async def do_validate_file(self):
+		self.state.interlock.set_loading(True)
+		await self.av.async_load()
+		self.state.interlock.set_loading(False)
+		self.state.interlock.set_loaded(self.av_state.loaded)
+
+	@toggle_attr('state.progress_visible', True, False)
+	async def do_calculation(self):
+		await self.av.async_calculate()
+		self.calculation_result.refresh()
+		self.state.interlock.set_calculated(self.av.calculated)
+		await asyncio.sleep(1)
+		self.state.result_visible = True
+
+
+class RCDTabPanel(AVTabPanel):
+	av: AvRCObject
+
+	def _init_availability(self) -> Optional[AvRCObject]:
+		classes = dict(
+			SOE=None,
+			OFDB=None,
+			RCD=None,
+		)
+		cls = classes.get(self.state.input_source)
+		instance = None if cls is None else cls(server=self.state.master)
+		return instance
+
+	def get_result_kwargs(self):
+		return dict(
+			params=[
+				('RC Total', rgetattr(self, 'av.stats.total_count', 0)),
+				('RC Total (valid)', rgetattr(self, 'av.stats.total_valid', 0)),
+				('Repetisi RC', rgetattr(self, 'av.stats.total_reps', 0)),
+				('RC Sukses', rgetattr(self, 'av.stats.total_success', 0)),
+				('RC Gagal', rgetattr(self, 'av.stats.total_failed', 0)),
+				('Rasio Sukses', f'{rgetattr(self, "av.stats.success_ratio", 0)*100:.2f}%'),
+				('Sukses Close', rgetattr(self, 'av.stats.total_success_close', 0)),
+				('Gagal Close', rgetattr(self, 'av.stats.total_failed_close', 0)),
+				('Rasio Sukses Close', f'{rgetattr(self, "av.stats.success_close_ratio", 0)*100:.2f}%'),
+				('Sukses Open', rgetattr(self, 'av.stats.total_success_open', 0)),
+				('Gagal Open', rgetattr(self, 'av.stats.total_failed_open', 0)),
+				('Rasio Sukses Open', f'{rgetattr(self, "av.stats.success_open_ratio", 0)*100:.2f}%'),
+			],
+			date_start=rgetattr(self, 'av.stats.date_min', None),
+			date_end=rgetattr(self, 'av.stats.date_max', None),
+		)
+	
+
+class RTUTabPanel(AVTabPanel):
+	av: AvRSObject
+
+	def _init_availability(self) -> Optional[AvRSObject]:
+		classes = dict(
+			# 
+		)
+		cls = classes.get(self.state.input_source)
+		instance = None if cls is None else cls(server=self.state.master)
+		return instance

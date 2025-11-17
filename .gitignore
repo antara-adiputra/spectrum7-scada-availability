@@ -170,3 +170,4 @@ config.json
 output/
 sample/
 *.bak
+*.tar.gz

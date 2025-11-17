@@ -1,13 +1,20 @@
-import os, datetime, functools, time, warnings
+import asyncio, datetime, functools, os, re, time, warnings
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from difflib import SequenceMatcher, get_close_matches
+from functools import partial
 from glob import glob
 from io import BytesIO
+from itertools import islice
 from types import MappingProxyType
-from typing import Any, Dict, List, Tuple, Union
 
 import pandas as pd
 from lxml import etree as et
 
+from .types import *
+
+
+LogLevel: TypeAlias = Literal['debug', 'info', 'warning', 'error']
 
 _WIDTH = os.get_terminal_size()[0]
 MAX_WIDTH = 160
@@ -24,6 +31,15 @@ class ProcessError(Exception):
 
 	def __str__(self) -> str:
 		return f'{self.name}: {self.msg} {" ".join(self.param)}'
+
+def logprint(message: str, /, level: LogLevel = 'debug', timestamp: bool = True):
+	msgs = list()
+	if timestamp:
+		msgs.append(str(datetime.datetime.now())[:-3])
+	
+	msgs.append(level.upper())
+	msgs.append(message)
+	print(*msgs, sep='  ')
 
 # decorator to calculate duration
 # taken by any function.
@@ -43,27 +59,27 @@ def calc_time(func):
 	return inner1
 
 # See https://stackoverflow.com/questions/31174295/getattr-and-setattr-on-nested-objects
-def rsetattr(obj, attr: str, val):
-	pre, _, post = attr.rpartition('.')
-	return setattr(rgetattr(obj, pre) if pre else obj, post, val)
+def rsetattr(obj, attr: str, value: Any, sep: str = '.'):
+	pre, _, post = attr.rpartition(sep)
+	return setattr(rgetattr(obj, pre) if pre else obj, post, value)
 
 # using wonder's beautiful simplification: https://stackoverflow.com/questions/31174295/getattr-and-setattr-on-nested-objects/31174427?noredirect=1#comment86638618_31174427
-def rgetattr(obj, attr: str, *args):
+def rgetattr(obj, attr: str, *args, sep: str = '.'):
 	def _getattr(obj, attr):
 		return getattr(obj, attr, *args)
-	return functools.reduce(_getattr, [obj] + attr.split('.'))
+	return functools.reduce(_getattr, [obj] + attr.split(sep))
 
 def instance_factory(cls, *initargs, **initkwargs) -> object:
 	return cls(*initargs, **initkwargs)
 
-def get_datetime(series: pd.Series) -> tuple[datetime.datetime, datetime.datetime]:
-	"""Return set of RTU timestamp and system timestamp."""
-	return join_datetime(series['Time stamp'], series['Milliseconds']), join_datetime(series['System time stamp'], series['System milliseconds'])
-
-def get_execution_duration(s0: pd.Series, s1: pd.Series) -> float:
-	"""Calculate timedelta between RTU & system timestamp between 2 events."""
-	delta_time = join_datetime(*s1.loc[['Time stamp', 'Milliseconds']].to_list()) - join_datetime(*s0.loc[['Time stamp', 'Milliseconds']].to_list())
-	return round(delta_time.total_seconds(), 3)
+def consume(iterator: Iterable, n: int | None = None) -> None:
+	"Advance the iterator n-steps ahead. If n is None, consume entirely."
+	# Use functions that consume iterators at C speed.
+	# For more information, https://docs.python.org/3/library/itertools.html#itertools-recipes
+	if n is None:
+		deque(iterator, maxlen=0)
+	else:
+		next(islice(iterator, n, n), None)
 
 def get_ifs_name(list1: list, list2: list) -> dict:
 	"""Get IFS name pair based on name similarity in list1 & list2."""
@@ -96,62 +112,108 @@ def get_table(ws_element: et._Element, namespace: dict):
 			if len(columns)==len(cell_data): data.append(tuple(cell_data))
 	return columns, data
 
+def get_rtu_timestamp(s: pd.Series) -> datetime.datetime:
+	"""Combine RTU timestamp and milliseconds from given series."""
+	return pd.to_datetime(s['timestamp']) + pd.to_timedelta(s['ms'], unit='ms')
+
+def get_system_timestamp(s: pd.Series) -> datetime.datetime:
+	"""Combine system timestamp and milliseconds from given series."""
+	return pd.to_datetime(s['system_timestamp']) + pd.to_timedelta(s['system_ms'], unit='ms')
+
+def get_datetime(s: pd.Series) -> Tuple[datetime.datetime, datetime.datetime]:
+	"""Return set of RTU timestamp and system timestamp."""
+	return get_rtu_timestamp(s), get_system_timestamp(s)
+
+def get_execution_duration(s0: pd.Series, s1: pd.Series) -> float:
+	"""Calculate timedelta of RTU timestamp between 2 events."""
+	delta_time = get_rtu_timestamp(s1) - get_rtu_timestamp(s0)
+	return round(delta_time.total_seconds(), 3)
+
 def get_termination_duration(s0: pd.Series, s1: pd.Series):
 	"""Calculate timedelta of system timestamp between 2 events."""
-	delta_time = join_datetime(*s1.loc[['System time stamp', 'System milliseconds']].to_list()) - join_datetime(*s0.loc[['System time stamp', 'System milliseconds']].to_list())
+	# delta_time = join_datetime(*s1.loc[['system_timestamp', 'system_ms']].to_list()) - join_datetime(*s0.loc[['system_timestamp', 'system_ms']].to_list())
+	delta_time = get_system_timestamp(s1) - get_system_timestamp(s0)
 	return round(delta_time.total_seconds(), 3)
 
 def immutable_dict(input: dict) -> MappingProxyType:
 	"""Create non-editable dict."""
+	new = dict()
 	for key, item in input.items():
 		if type(item)==dict:
-			input[key] = immutable_dict(item)
-	return MappingProxyType(input)
+			new[key] = immutable_dict(item)
+		else:
+			new[key] = item
+	return MappingProxyType(new)
+
+def tryparse(type_: Type, value: Any, if_error: Any = None, **kwparse) -> Any:
+	"""Try parsing an input as instance of type then return the result or default value if error occured."""
+
+	try:
+		output = type_(value, **kwparse)
+	except Exception:
+		output = if_error
+	finally:
+		return output
+	
+def try_strftime(value: Any, format: str, if_error: Any = None, **kwparse) -> Any:
+	"""Try serialize datetime value or return default value if occured."""
+	try:
+		if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+			output = value.strftime(format)
+		else:
+			output = value
+	except Exception:
+		output = if_error
+	finally:
+		return output
+
+def try_remove(list_: List[str], key: str, /):
+	try:
+		list_.remove(key)
+	except ValueError:
+		pass
 
 def join_datetime(dt: pd.Series, ms: pd.Series) -> datetime.datetime:
-	"""Combine datetime timestamp and milliseconds."""
+	"""Combine two series of datetime timestamp and milliseconds."""
 	return pd.to_datetime(dt) + pd.to_timedelta(ms, unit='ms')
 
 def load_cpoint(path: str):
 	"""
 	"""
 	filenames: List[str] = list()
-	errors: List = list()
 	valid_df: List[pd.DataFrame] = list()
-
 	for f in path.split(','):
 		if '*' in f:
 			g = glob(f.strip())
 			if len(g)>0:
 				filenames += g
 			else:
-				errors.append(ProcessError('LoadCPoint', f'File yang menyerupai "{f}" tidak ditemukan.'))
-				print(f'Warning: File yang menyerupai "{f}" tidak ditemukan.')
+				logprint(f'File like "{f}" is not found', level='warning')
 		elif f.strip():
 			filenames.append(f.strip())
 
 	# Load point description
-	txt_prefix = '\nMemuat data "Point Name Description"...'.ljust(CONSOLE_WIDTH-5)
 	for file in filenames:
 		try:
 			# Open first sheet
 			result = pd.read_excel(file, sheet_name=0).fillna('')
 			if isinstance(result, pd.DataFrame):
-				# Remove duplicates to prevent duplication in merge process
 				valid_df.append(validate_cpoint(result))
-				print(f'Memuat file {file.ljust(CONSOLE_WIDTH-18)} OK!')
-			else:
-				errors.append(ProcessError('LoadCPoint', 'Data tidak ditemukan.', f'file={file}'))
+
 		except FileNotFoundError:
-			raise FileNotFoundError(f'{txt_prefix} NOK!\nFile "{file}" tidak ditemukan.')
+			logprint(f'File "{file}" not found', level='warning')
 		except Exception:
-			raise ValueError(f'{txt_prefix} NOK!\nGagal membuka file "{file}".')
-		
+			logprint(f'Failed to open file "{file}"', level='warning')
+
 	if len(valid_df)==0:
-		raise ProcessError('LoadCPoint', f'Semua data tidak valid. (Error={len(errors)})')
+		logprint('No valid point description file was found')
 	else:
-		# Keep last will make any file with 
-		return pd.concat(valid_df).drop_duplicates(subset=['B1', 'B2', 'B3'], keep='last')
+		df = pd.concat(valid_df)
+		df.columns = list(map(to_snake_case, df.columns))
+		# Keep last will make any file with
+		return df.drop_duplicates(subset=['b1', 'b2', 'b3'], keep='last')\
+			.sort_values(['b1', 'b2', 'b3'])\
+			.reset_index(drop=True)
 
 def load_workbook(file: Union[str, BytesIO]) -> dict[str, pd.DataFrame]:
 	"""Load whole excel file as dict of worksheets.
@@ -225,6 +287,23 @@ def read_xml(filepath:str, *args, **kwargs):
 	else:
 		raise ValueError
 
+def toggle_attr(name: str, *value):
+	val0 = value[0] if len(value)>0 else True
+	val1 = value[1] if len(value)>1 else None
+	def wrapper(func):
+		@functools.wraps(func)
+		async def wrapped(self, *args, **kwargs):
+			rsetattr(self, name, val0)
+			result = await func(self, *args, **kwargs)
+			rsetattr(self, name, val1)
+			return result
+		return wrapped
+	return wrapper
+
+async def run_background(proc: ProcessPoolExecutor, fn: Callable, *fnargs, **fnkwargs):
+	loop = asyncio.get_running_loop() or asyncio.get_event_loop()
+	return await loop.run_in_executor(proc, partial(fn, *fnargs, **fnkwargs))
+
 def similarity_ratio(str1: str, str2: str):
 	return SequenceMatcher(None, str1, str2).ratio()
 
@@ -257,6 +336,14 @@ def timedelta_split(td: datetime.timedelta):
 	ss = sec % 60
 
 	return dd, hh, mm, ss
+
+def to_snake_case(text: str) -> str:
+	if ' ' in text:
+		# Normal text
+		return text.replace(' ', '_').lower()
+	else:
+		# Assumed as CamelCase
+		return re.sub(r'(?<!^)(?=[A-Z])', '_', text).lower()
 
 def truncate(text:str, max_length:int, on:str='left', debug:bool=False):
 	"""

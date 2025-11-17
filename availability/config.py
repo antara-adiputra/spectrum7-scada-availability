@@ -1,15 +1,25 @@
 # This is user configurable variable which can be updated on runtime 
 
 import json, pyodbc
+import pandas as pd
 from configparser import ConfigParser
 from dotenv import load_dotenv
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from glob import glob
+import yaml
+try:
+	from yaml import CLoader as Loader, CDumper as Dumper
+except ImportError:
+	from yaml import Loader, Dumper
+
+from . import settings
+from .lib import load_cpoint, logprint
+from .types import *
 
 
 __conf = ConfigParser(default_section='GENERAL')
 __conf.read('.config')
 __DEFAULT__: Dict[str, Any] = dict()
-__EXCLUDED__: List[str] = ['DB_DRIVERS', 'PARAMETER_OFDB', 'PARAMETER_RCD', 'PARAMETER_AVRS']
+__EXCLUDED__: List[str] = ['DB_DRIVERS', 'PARAMETER_OFDB', 'PARAMETER_RCD', 'PARAMETER_AVRS', 'POINT_LIBRARY']
 DARK_MODE: bool = False
 MAX_FILES: Optional[int] = None
 MAX_FILE_SIZE: Optional[int] = None
@@ -85,11 +95,34 @@ def get_config(*params: str) -> Dict[str, Any]:
 		config[param] = globals()[param.upper()]
 	return config
 
+def load_rtunames_config() -> Dict[str, Dict[str, str]]:
+	logprint('Loading RTU names config...', level='info')
+	config_paths = glob(str(settings.CONFIG_DIR / 'rtu*.yaml'))
+	return {path.split('/')[-1]: yaml.safe_load(open(path)) for path in config_paths}
+
+def dump_rtunames_config(data: Dict[str, str], filename: str):
+	if not filename.startswith('rtu'):
+		filename = 'rtu_' + filename
+
+	if '.yaml' not in filename:
+		filename += '.yaml'
+
+	yaml.safe_dump(data, open(settings.CONFIG_DIR / filename, 'w'))
+	logprint(f'RTU names config "{filename}" is saved', level='info')
+
+def load_point_library() -> pd.DataFrame:
+	logprint('Loading point library...', level='info')
+	file_paths = str(settings.CONFIG_DIR / 'cpoint*.xlsx')
+	return load_cpoint(file_paths)
+
 # Save default config first for fallback mode
 load_dotenv()
 store_default()
 load()
 
+
+RTU_NAMES_CONFIG = load_rtunames_config()
+POINT_LIBRARY = load_point_library()
 PARAMETER_OFDB = [
 	{
 		'config_name': 'ofdb_hostname',
