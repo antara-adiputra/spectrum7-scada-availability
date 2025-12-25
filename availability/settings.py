@@ -43,6 +43,7 @@ FAVICON: Optional[str] = None
 
 AUTO_SHOW: bool = True
 AUTO_RELOAD: bool = True
+DEBUG: bool = True
 
 ON_AIR: bool = False
 ENDPOINT_DOCUMENTATION: Literal['none', 'internal', 'page', 'all'] = 'none'
