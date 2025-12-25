@@ -52,12 +52,20 @@ class FieldMetadata(TypedDict):
 class Base:
 	"""Dummy class"""
 
-	# def dump(self, exclude: List[str] = list(), **kwargs) -> Dict[str, Any]:
-	# 	dumped = asdict(self)
-	# 	for key in exclude:
-	# 		del dumped[key]
 
-	# 	return dumped
+@dataclass(frozen=True)
+class SerializableException:
+	e: InitVar[Exception]
+	type_: str = field(init=False, default='')
+	message: str = field(init=False, default='')
+	extra: Dict[str, Any] = field(default_factory=dict)
+
+	def __post_init__(self, e: Exception):
+		frozen_dataclass_set(
+			self,
+			type_=e.__class__.__name__,
+			message='. '.join(e.args)
+		)
 
 
 @dataclass(frozen=True)
@@ -71,10 +79,7 @@ class ExceptionMessage(Exception):
 class ProgressData:
 	value: float = 0.0
 	message: str = ''
-	percentage: Optional[str] = field(default=None, init=False)
-
-	def __post_init__(self):
-		self._update_percentage
+	percentage: Optional[str] = field(init=False, default=None)
 
 	def init(self, value: float = 0.0, message: str = ''):
 		self.value = value
@@ -93,15 +98,9 @@ class ProgressData:
 			self.message = message
 
 
-@dataclass
-class Config:
-	"""Base class for avaiability calculation configuration."""
-	master: SCDMasterType = 'spectrum'
-
-
-@dataclass
 class State:
 	"""Abstract class of State"""
+
 	def set(self, **kwargs):
 		for key, val in kwargs.items():
 			if hasattr(self, key):
@@ -122,43 +121,37 @@ class State:
 
 
 @dataclass
-class CalculationState(State):
-	loading_file: bool = False
-	loaded: bool = False
-	analyzing: bool = False
-	analyzed: bool = False
-	calculating: bool = False
-	calculated: bool = False
-	exporting: bool = False
-	exported: bool = False
+class Config(State):
+	"""Base class for avaiability calculation configuration."""
+	master: SCDMasterType = 'spectrum'
 
 
 class BaseClass:
-	__binded_dataclass__: Optional[T] = None
+	__binded_state__: Optional[T] = None
 
 	def __init__(self, bind_to: Optional[T] = None, **kwargs):
-		self.__binded_dataclass__ = bind_to
+		self.__binded_state__ = bind_to
 
-	def __setattr_wrapper__(self, name: str, value):
-		if hasattr(self.__binded_dataclass__, name):
-			# print(self.__class__.__name__, '==>', self.__binded_dataclass__.__class__.__name__, f'({name}, {value})')
-			setattr(self.__binded_dataclass__, name, value)
+	def __setattr_binded__(self, name: str, value):
+		if hasattr(self.__binded_state__, name):
+			# print(self.__class__.__name__, '==>', self.__binded_state__.__class__.__name__, f'({name}, {value})')
+			setattr(self.__binded_state__, name, value)
 
 	def __setattr__(self, name: str, value):
 		super().__setattr__(name, value)
 		if self.binded:
-			self.__setattr_wrapper__(name, value)
+			self.__setattr_binded__(name, value)
 
 	def bind_to(self, obj: Any):
-		self.__binded_dataclass__ = obj
+		self.__binded_state__ = obj
 
-	def set_wrapper_attr(self, attr: str, value: Any):
+	def set_binded_attr(self, attr: str, value: Any):
 		if self.binded:
-			self.__setattr_wrapper__(attr, value)
+			self.__setattr_binded__(attr, value)
 
 	@property
 	def binded(self) -> bool:
-		return not self.__binded_dataclass__ is None
+		return not self.__binded_state__ is None
 
 
 class BaseWithProgress(BaseClass):
@@ -166,8 +159,6 @@ class BaseWithProgress(BaseClass):
 	def __init__(self, **kwargs):
 		super().__init__(**kwargs)
 		self.progress = ProgressData()
-		self.start_date: datetime.datetime = None
-		self.end_date: datetime.datetime = None
 		self.set_progress(value=0.0)
 
 	def set_progress(self, value: float, message: Optional[str] = None, show_percentage: bool = False):
@@ -182,33 +173,9 @@ class BaseWithProgress(BaseClass):
 				data['message'] = message
 
 		self.progress.update(**data)
-		prg = getattr(self.__binded_dataclass__, 'progress', False)
+		prg = getattr(self.__binded_state__, 'progress', False)
 		if self.binded and isinstance(prg, ProgressData):
 			prg.update(**self.progress.dump())
-
-	def set_date_range(self, start: Union[datetime.datetime, pd.Timestamp], stop: Union[datetime.datetime, pd.Timestamp]):
-		dt0 = None
-		dt1 = None
-		if isinstance(start, (datetime.datetime, pd.Timestamp)):
-			dt0 = start.to_pydatetime() if isinstance(start, pd.Timestamp) else start
-
-		if isinstance(stop, (datetime.datetime, pd.Timestamp)):
-			dt1 = stop.to_pydatetime() if isinstance(stop, pd.Timestamp) else stop
-
-		if dt0 is None or dt1 is None:
-			logprint(f'{self.__class__.__name__}.set_date_range expected args as datetime, datetime, got {type(start)}, {type(stop)}.', level='error')
-		else:
-			if dt0>dt1:
-				# Inverted
-				self.start_date = dt1
-				self.end_date = dt0
-			else:
-				self.start_date = dt0
-				self.end_date = dt1
-
-	@property
-	def date_range(self) -> Tuple[datetime.datetime, datetime.datetime]:
-		return (self.start_date, self.end_date)
 
 
 def model_fields(obj: Union['DataModel', Type['DataModel']], as_dict: bool = False) -> Union[List[Field], Dict[str, Field]]:
@@ -355,15 +322,6 @@ class DataModel(Base):
 			dumped[key] = value
 
 		return dumped
-		# if as_title:
-		# 	dumped = super().dump(**kwargs)
-		# 	field_mapping = model_mappings(self, as_dict=True)
-		# 	for key in dumped.keys():
-		# 		dumped[field_mapping[key]] = dumped.pop(key)
-
-		# 	return dumped
-		# else:
-		# 	return super().dump(**kwargs)
 
 
 T1 = TypeVar('T1', bound=DataModel)
@@ -438,4 +396,18 @@ class DataTable(Generic[T1]):
 	@property
 	def count(self) -> int:
 		return len(self._values)
+
+
+@dataclass
+class CalculationState(State):
+	progress: ProgressData = field(init=False, default_factory=ProgressData)
+	loading_file: bool = False
+	loaded: Union[bool, None] = None
+	analyzing: bool = False
+	analyzed: Union[bool, None] = None
+	calculating: bool = False
+	calculated: Union[bool, None] = None
+	exporting: bool = False
+	exported: Union[bool, None] = None
+	last_exported_file: str = None
 
