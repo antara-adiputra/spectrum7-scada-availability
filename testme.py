@@ -6,7 +6,6 @@ from availability.core.rcd import RCDConfig, RCDCore, RCDData, AvRCDResult, RCD
 from availability.core.rtu import RTUConfig, RTUCore, RTUDownData, AvRTUResult, RTU
 from availability.core.soe import SOE, SOEData, SOEModel, SurvalentSOEModel, SurvalentSPModel
 from availability.core.main import *
-from availability.webgui.state import AvStateWrapper
 from availability import config
 # from availability.utils.writer import *
 
@@ -37,93 +36,85 @@ sts_survalent = [
 	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/SOE_Survalent/EVENT_RS-2025_08.xlsx',
 	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/SOE_Survalent/2025_09_Status_Point_SUMMARY.xlsx',
 	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/10/2025_10_AV_RS_SUMMARY.xlsx',
+	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/2025_11_AV_RS_SUMMARY.xlsx',
 ]
 file_rcd = [
 	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/07/AV_RCD_KDI_2025_07.xlsx',
 	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/08/AV_RCD_KDI_2025_08.xlsx',
 	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/09/AV_RCD_KDI_2025_09.xlsx',
 	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/10/AV_RCD_KDI_2025_10.xlsx',
+	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/AV_RCD_KDI_2025_11.xlsx',
 ]
 file_rtu = [
 	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/07/AV_RS_KDI_2025_07.xlsx',
 	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/08/AV_RS_KDI_2025_08.xlsx',
 	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/09/AV_RS_KDI_2025_09.xlsx',
 	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/10/AV_RS_KDI_2025_10.xlsx',
+	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/AV_RS_KDI_2025_11.xlsx',
 ]
 
-
-cfg = None
-bases = None
-files = None
-start_date = None
-end_date = None
-fr = None
-df = None
-soe = None
-av = None
-df1 = None
-data = None
-result = None
-writer = None
-
-def test_avrcd(master: SCDMasterType):
-	global cfg, bases, files, start_date, end_date, fr, df, soe, av, df1, data, result
-	if master=='spectrum':
-		bases = (SOEModel,)
-		files = soe_spectrum
-		start_date = datetime.datetime(2025,3,1)
-		end_date = datetime.datetime(2025,3,31,23,59,59,999999)
-	else:
-		bases = (SurvalentSOEModel, SurvalentSPModel)
-		files = soe_survalent + sts_survalent
-		start_date = datetime.datetime(2025,8,1)
-		end_date = datetime.datetime(2025,9,30,23,59,59,999999)
-
-	cfg = RCDConfig(master=master)
-	fr = FileReader(*bases, files=files)
-	df = fr.load()
-	soe = SOEData(df, rc_element=cfg.elements)
-	av = RCDCore(soe, config=cfg)
-	df1 = av.fast_analyze(start_date=start_date, end_date=end_date)
-	data = RCDData(df1, config=cfg, start_date=start_date, end_date=end_date)
-	result = AvRCDResult(data=data)
-
-def test_avrtu(master: SCDMasterType):
-	global cfg, bases, files, start_date, end_date, fr, df, soe, av, df1, data, result
-	if master=='spectrum':
-		bases = (SOEModel,)
-		files = soe_spectrum
-		start_date = datetime.datetime(2025,3,1)
-		end_date = datetime.datetime(2025,3,31,23,59,59,999999)
-	else:
-		bases = (SurvalentSOEModel, SurvalentSPModel)
-		files = soe_survalent + sts_survalent
-		start_date = datetime.datetime(2025,8,1)
-		end_date = datetime.datetime(2025,9,30,23,59,59,999999)
-
-	cfg = RTUConfig(master=master)
-	fr = FileReader(*bases, files=files)
-	df = fr.load()
-	soe = SOEData(df)
-	av = RTUCore(soe, config=cfg)
-	df1 = av.fast_analyze(start_date=start_date, end_date=end_date)
-	data = RTUDownData(df1, config=cfg, start_date=start_date, end_date=end_date)
-	result = AvRTUResult(data=data)
-
-# rtu_names = config.RTU_NAMES_CONFIG['rtu_sultra.yaml']
-# conf = RTUConfig(master='survalent', rtu_names=rtu_names, known_rtus_only=True)
-# fr = SurvalentStatusFileReader(sts_survalent[-1])
-# df =  pd.read_excel(sts_survalent[-1])
-# obj = SurvalentSPModel.from_dataframe(df)
-# df = obj.to_dataframe()
-# soe = SOEData(df)
-# av = RTUCore(soe, config=conf)
-# df1 = av.fast_analyze(start_date=datetime.datetime(2025,9,1), end_date=datetime.datetime(2025,9,30))
-# result = RTUDownData(df1, config=conf, start_date=datetime.datetime(2025,9,1), end_date=datetime.datetime(2025,9,30,23,59,59,999999))
-# stats = AvRTUStatistics(data=result)
-
 rcdcfg = RCDConfig(master='survalent')
-rtucfg = RTUConfig(master='survalent', rtu_names=config.RTU_NAMES_CONFIG['rtu_sultra.yaml'], known_rtus_only=True)
+rtucfg = RTUConfig(master='survalent', rtu_file_name='rtu_sultra.yaml', known_rtus_only=True)
+
+
+# reader = FileReader(SurvalentSOEModel, SurvalentSPModel, files=soe_survalent + sts_survalent + ['/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/2025_11_AV_RS_SUMMARY.xlsx', '/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/2025_11_Event_Log_Summary.xlsx'])
+# print()
+# t1 = time.perf_counter()
+# f1 = reader.load()
+# t2 = time.perf_counter()
+# print()
+# print('Old code :', t2-t1, 's')
+
+
+# reader = FileReader(SurvalentSOEModel, SurvalentSPModel, files=['/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/2025_11_AV_RS_SUMMARY.xlsx', '/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/2025_11_Event_Log_Summary.xlsx'])
+# f1 = reader.load()
+# soe = SOE(data=f1, config=rcdcfg, sources=reader.sources)
+# print(soe.data)
+# rcd = RCDCore(soe.data, rcdcfg)
+# print()
+# t1 = time.perf_counter()
+# r1 = rcd.fast_analyze(start_date=datetime.datetime(2025,11,1), end_date=datetime.datetime(2025,11,30,23,59,59,999999))
+# t2 = time.perf_counter()
+# print()
+# r2 = rcd.fast_analyze2(start_date=datetime.datetime(2025,11,1), end_date=datetime.datetime(2025,11,30,23,59,59,999999))
+# t3 = time.perf_counter()
+# print('Old code :', t2-t1, 's')
+# print('New code :', t3-t2, 's')
+
+
+# reader = FileReader(SurvalentSOEModel, SurvalentSPModel)
+# f1 = reader.load(soe_survalent)
+# soe = SOE(data=f1, config=rtucfg, sources=reader.sources)
+# print(soe.data)
+# rtu = RTUCore(soe.data, rtucfg)
+# print()
+# t1 = time.perf_counter()
+# r1 = rtu.fast_analyze(start_date=datetime.datetime(2025,11,1), end_date=datetime.datetime(2025,11,30,23,59,59,999999))
+# t2 = time.perf_counter()
+# print()
+# r2 = rtu.fast_analyze2(start_date=datetime.datetime(2025,11,1), end_date=datetime.datetime(2025,11,30,23,59,59,999999))
+# t3 = time.perf_counter()
+# print('Old code :', t2-t1, 's')
+# print('New code :', t3-t2, 's')
+
+
+# rcd = RCD(rcdcfg)
+# dfsoe = rcd.read_soe_file('/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/2025_11_AV_RS_SUMMARY.xlsx, /media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/2025_11_Event_Log_Summary.xlsx')
+# soe = SOE(data=dfsoe, config=rcdcfg, sources=rcd.reader.sources)
+# dfrcd = rcd.analyze_soe(soe.data)
+# dfrcd = rcd.read_file(file_rcd)
+# result = rcd.calculate(start_date=datetime.datetime(2025,7,1), end_date=datetime.datetime(2025,10,31,23,59,59,999999))
+# rcd.write_file()
+
+
+# rtu = RTU(rtucfg)
+# dfsoe = rtu.read_soe_file('/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/2025_11_AV_RS_SUMMARY.xlsx')
+# soe = SOE(data=dfsoe, config=rtucfg, sources=rtu.reader.sources)
+# dfrtu = rtu.analyze_soe(soe.data)
+# # dfrtu = rtu.read_file(file_rtu)
+# result = rtu.calculate(start_date=datetime.datetime(2025,11,1), end_date=datetime.datetime(2025,11,30,23,59,59,999999))
+# rtu.write_file()
+
 # rtu = RTU(rtucfg)
 # data = rtu.read_file('/home/pyproject/spectrum7-scada-availability/output/AV_RS_Survalent_Output_20251001-20251031_rev1.xlsx')
 # result = rtu.calculate(start_date=datetime.datetime(2025,10,1), end_date=datetime.datetime(2025,10,31,23,59,59,999999))
@@ -138,19 +129,6 @@ rtucfg = RTUConfig(master='survalent', rtu_names=config.RTU_NAMES_CONFIG['rtu_su
 # rcd = RCD(cfg)
 # data = rcd.read_file('/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/*/AV_RCD_KDI_2025_*.xlsx')
 # result = rcd.calculate(start_date=datetime.datetime(2025,7,1), end_date=datetime.datetime(2025,9,30,23,59,59,999999))
-
-# fr0 = RCFileReader(file_rcd)
-# df0 = fr0.load()
-# df0.to_excel('test_load_rcd.xlsx', index=False)
-
-# fr1 = RSFileReader(file_rtu)
-# df1 = fr1.load()
-# df1.to_excel('test_load_rtu.xlsx', index=False)
-
-# df = SpectrumFileReader(files).load()
-# rc1 = SOEtoRCD()
-# rc1.soe_all = df
-# rc2 = _SOEAnalyzeTool(df)
 
 # def _compare_df(df1: pd.DataFrame, df2: pd.DataFrame):
 # 	print(df1.shape, df2.shape)
