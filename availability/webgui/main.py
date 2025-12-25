@@ -2,16 +2,16 @@ import asyncio, datetime, os, time
 from dataclasses import dataclass, field
 from functools import partial
 
-from nicegui import app, events, ui
+from nicegui import app, binding, events, ui
 from nicegui.binding import bindable_dataclass
 
 from . import components
-from .components import Button, DialogPrompt, FilePickerv2, MenuSubtitle, MenuTitle, NavButton, NavDropdownButton, ObjectDebugger, AVTabPanel, RCDTabPanel, RTUTabPanel, UIColumn, UIRow, ui_input, ui_item, ui_menu_label, ui_section, ui_select, get_component_props
+from .components import Button, DialogPrompt, GUIAvailability, MenuSubtitle, MenuTitle, NavButton, NavDropdownButton, ObjectDebugger, RCDTabPanel, RTUTabPanel, UIColumn, UIRow, dialog_title_section
 from .event import EventChainsWithArgs, EventChainsWithoutArgs
-from .state import AvStateWrapper, BaseState, InterlockState, MenuState, State, toggle_attr
+from .state import BindableProgress, BaseState, InterlockState, MenuState, State, toggle_attr
 from .types import *
 from .. import config, settings, version
-from ..core.rtu import *
+from ..core import soe, rcd, rtu
 from ..lib import consume, instance_factory, rgetattr
 
 
@@ -154,160 +154,22 @@ Read our documentation [here](/docs) or check our source code [here](https://git
 """
 
 
-class Menu:
-	_menus: dict = MAIN_MENU
-
-	def __init__(self) -> None:
-		self._active: List = list()
-		self._event_callbacks: Dict[str, Callable] = dict()
-		self._ischanged: bool = False
-		self.menus = self._init_menus()
-		self.state = MenuState()
-
-	def _init_menus(self):
-		_dict = dict()
-		for menu in self._menus:
-			id1 = menu['id']
-			_dict[id1] = menu.copy()
-			_subdict = dict()
-			for submenu in menu['submenu']:
-				id2 = submenu['id']
-				_subdict[id2] = submenu.copy()
-			_dict[id1]['submenu'] = _subdict
-		return _dict
-
-	def update(self):
-		with ui.list().classes('w-full overflow-y-auto') as menu:
-			for item in self._menus:
-				item_id = item['id']
-				with ui.item().classes('p-0'):
-					with ui.expansion(text=item['label'], on_value_change=self._handle_menu_expansion)\
-						.props('group=menu expand-icon-class="p-0"')\
-						.classes('sidebar-menu w-full font-bold text-teal-500') as expand_item:
-						expand_item.identifier = item_id
-						with ui.element('div'):
-							for subitem in item['submenu']:
-								subitem_id = subitem['id']
-								Button(subitem['label'], identifier=f'{item_id}__{subitem_id}', on_click=self._handle_submenu_click)\
-									.props(f'flat no-wrap no-caps text-color=teal-4 {"outline" if (item_id, subitem_id)==self.active else ""} align=left')\
-									.classes('w-full')
-		return menu
-
-	def update_state(self):
-		menu_id, submenu_id = self.active
-		sel_menu = self.menus[menu_id]
-		sel_submenu = sel_menu['submenu'][submenu_id]
-		self.state.update(
-			title=sel_menu['label'],
-			subtitle=sel_submenu['label'],
-			description=sel_submenu['description'],
-			component=sel_submenu['component'],
-			comp_kwargs=sel_submenu['component_kwargs']
-		)
-
-	def on_change(self, fn: Callable) -> None:
-		self._event_callbacks['on_change'] = fn
-
-	def trigger_events(self, event: str):
-		cb = self._event_callbacks.get('on_' + event)
-		args = events.ValueChangeEventArguments(client=None, sender=self, value=self.active)
-		if callable(cb):
-			if asyncio.iscoroutinefunction(cb):
-				loop = asyncio.get_running_loop()
-				loop.create_task(cb(args))
-			else:
-				cb(args)
-
-	def _handle_menu_expansion(self, e: events.ValueChangeEventArguments):
-		pass
-
-	def _handle_submenu_click(self, e: events.ClickEventArguments):
-		id = getattr(e.sender, 'identifier', '')
-		if id:
-			if id.split('__')==self._active:
-				self._ischanged = False
-			else:
-				self._active = id.split('__')
-				self.update_state()
-				self._ischanged = True
-				self.trigger_events('change')
-
-	@property
-	def active(self):
-		return tuple(self._active)
-
-	@property
-	def is_changed(self):
-		return self._ischanged
-
-
-class WebGUIv2(ui.card):
-	components: Dict[str, Dict[str, ui.element]]
-	base_classes: str = 'w-full md:max-w-[64rem] h-[90vh] min-h-[32rem] mx-0 md:mx-auto mt-3 p-0 text-sm md:text-base rounded-2xl'
-
-	def __init__(self, cache: Any = None, accordion_menu: bool = True, default_menu: str = 'avrcd') -> None:
-		super().__init__()
-		self.classes(self.base_classes)
-
-		self.menu = Menu()
-		self.state = State()
-		self.cache = app.storage.client if cache is None else cache
-		self.accordion_menu = accordion_menu
-		# Initialize display
-		self.main()
-
-	def main(self, **kwargs):
-		with self:
-			with ui.row(wrap=False).classes('w-full h-full p-0 gap-1'):
-				with ui.column().classes('w-56 md:w-96 h-full p-2 md:p-4 border-r-2') as sidemenu:
-					ui.label('APLIKASI PERHITUNGAN KINERJA FASOP').classes('w-full text-2xl md:text-3xl font-extrabold text-teal-700')
-					ui.separator().classes('m-0')
-					# MENU
-					self.menu.update()
-				with ui.column().classes('w-full h-full p-2 md:p-4'):
-					with ui.element('div').classes('w-full gap-0') as div_title:
-						MenuTitle('<Title>').bind_text_from(self.menu.state, 'title')
-						MenuSubtitle('<Subtitle>').bind_text_from(self.menu.state, 'subtitle')
-						ui.separator().classes('my-2').bind_visibility_from(self.menu.state, 'title')
-					with ui.element('div').classes('w-full') as div_description:
-						ui.label('<Content description>').bind_text_from(self.menu.state, 'description')
-					# CONTENT
-					self.panel_content = ui.element('div').classes('overflow-y-auto').style('width: 100%; height: 100%;')
-					# self.create_process_display()
-		with ui.dialog() as debug, ui.card().classes('w-1/2 md:w-full p-0 gap-y-0'):
-			with ui.element('div').classes('w-full border overflow-y-auto'):
-				debug_menu_state = ObjectDebugger('menu.state', self.menu.state).render()
-				debug_config = ObjectDebugger('config', config).render()
-				# self.create_debug_table('stepper.filepicker', self.components['stepper']['file'].filepicker)
-				# self.create_debug_table('stepper.state', self.components['stepper']['file'].state)
-			with ui.row(align_items='center').classes('w-full p-2 gap-1'):
-				ui.space()
-				Button(icon='close', on_click=debug.close).props('dense size=sm')
-		Button(icon='open_in_full', on_click=debug.open).props('dense size=xs').classes('absolute top-1.5 right-1.5')
-		self.menu.on_change(self._handle_menu_change)
-
-	async def _handle_menu_change(self, e: events.ValueChangeEventArguments) -> None:
-		comp = getattr(components, self.menu.state.component, None)
-		kwargs = self.menu.state.comp_kwargs.copy()
-		self.panel_content.clear()
-
-		if 'instance' in kwargs:
-			kwargs['instance'] = kwargs['instance']()
-
-		with self.panel_content.add_slot('default') as slot:
-			if comp is None:
-				pass
-			else:
-				c = comp(**kwargs).render()
-				# print(c.__used__)
-
-
-
-
 ####################################################################################################
 # NEW DEVELOPED CODE
 ####################################################################################################
 
+soe_survalent = [
+	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/SOE_Survalent/EVENT_RC-2025_08.XLSX',
+	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/SOE_Survalent/2025_09_Event_Log_Summary.xlsx',
+	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/10/2025_10_Event_RC_Summary.xlsx',
+	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/2025_11_Event_Log_Summary.xlsx'
+]
+sts_survalent = [
+	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/SOE_Survalent/EVENT_RS-2025_08.xlsx',
+	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/SOE_Survalent/2025_09_Status_Point_SUMMARY.xlsx',
+	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/10/2025_10_AV_RS_SUMMARY.xlsx',
+	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/2025_11_AV_RS_SUMMARY.xlsx'
+]
 
 @bindable_dataclass
 class GUIState(BaseState):
@@ -325,8 +187,9 @@ class GUIState(BaseState):
 
 class WebGUIv3(ui.card):
 	_refreshable: List[ui.refreshable]
-	panel_rcd: AVTabPanel = None
-	panel_rtu: AVTabPanel = None
+	panel_rcd: GUIAvailability = None
+	panel_rtu: GUIAvailability = None
+	logger: ui.log = None
 	statusbar_text: ui.label = None
 	statusbar_progress: ui.linear_progress = None
 
@@ -337,7 +200,7 @@ class WebGUIv3(ui.card):
 
 		self.menu = None
 		self.state = GUIState()
-		self.av_state = AvStateWrapper(None)
+		self.dialog_log = self.dialog_logger()
 		self.dialog_prompt = DialogPrompt()
 		self.cache = app.storage.client
 
@@ -359,7 +222,7 @@ class WebGUIv3(ui.card):
 		return dialog
 
 	def navbar(self):
-		with UIRow(overflow='scroll', gap=0).classes('w-full px-4') as navbar:
+		with UIRow(overflow='scroll', gap=0).classes('w-full px-0') as navbar:
 			with NavDropdownButton('')\
 				.props(add='dropdown-icon=power_settings_new size=md', remove='dropdown-icon=more_vert'):
 				ui.item('Restart', on_click=self.prompt_restart).props('dense')
@@ -399,8 +262,8 @@ class WebGUIv3(ui.card):
 			.bind_value_from(self.state, 'active_menu')\
 			.props('animated=false')\
 			.classes('w-full'):
-			self.panel_rcd = RCDTabPanel(name='RCD', options={'': '--------', 'SOE': 'File SOE', 'RCD': 'File AVRCD', 'OFDB': 'Offline Database'})
-			self.panel_rtu = RTUTabPanel(name='RTU', options={'': '--------', 'SOE': 'File SOE', 'RTU': 'File AVRS', 'OFDB': 'Offline Database'})
+			self.panel_rcd = RCDTabPanel(name='RCD', logger=self.logger, options={'': '--------', 'soe': 'File SOE', 'rcd': 'File AVRCD', 'ofdb': 'Offline Database'})
+			self.panel_rtu = RTUTabPanel(name='RTU', logger=self.logger, options={'': '--------', 'soe': 'File SOE', 'rtu': 'File AVRS', 'ofdb': 'Offline Database'})
 
 		tabs.on_value_change(
 			EventChainsWithArgs(chains=[
@@ -413,40 +276,71 @@ class WebGUIv3(ui.card):
 		with ui.dialog() as debug, ui.card().classes('w-1/2 md:w-full p-0 gap-y-0'):
 			with ui.element('div').classes('w-full border overflow-y-auto'):
 				debug_state = ObjectDebugger('menu.state', self, 'state').render()
-				file_state = ObjectDebugger('av.state', self, 'av_state')
-				file_state.render()
+				# file_state = ObjectDebugger('av.state', self, 'core_state')
+				# file_state.render()
+				# rcd_state = ObjectDebugger('rcd.state', self.panel_rcd.av, 'state').render()
+				# rtu_state = ObjectDebugger('rtu.state', self.panel_rtu.av, 'state').render()
+				with UIRow():
+					ui.label('Active links')
+					ui.label('').bind_text_from(binding, 'active_links', lambda x: len(x))
 			with UIRow().classes('w-full'):
 				ui.space()
-				Button(icon='refresh', on_click=file_state.refresh).props('dense size=sm')
+				# Button(icon='refresh', on_click=file_state.refresh).props('dense size=sm')
 				Button(icon='close', on_click=debug.close).props('dense size=sm')
 		return debug
 
 	def statusbar(self):
-		with UIRow(overflow='auto', gap=1).classes('w-full min-h-[2rem] px-4 pb-2') as statbar:
+		with UIRow(overflow='auto', gap=1).classes('w-full min-h-[2rem] px-2 pb-2') as statbar:
+			Button('', icon='notes', on_click=self.dialog_log.open)\
+				.props('flat dense size=sm')\
+				.tooltip('Buka log')
 			self.statusbar_text = ui.label('Progress')\
-				.bind_text_from(self.state, 'progress_message')\
-				.classes('w-3/4 text-sm text-italic text-gray-400')
+				.classes('w-3/4 text-sm text-italic text-gray-400 truncate')
 			ui.separator().props('vertical size=1px')
 			self.statusbar_progress = ui.linear_progress(value=0, show_value=False, color='cyan')\
-				.bind_visibility_from(self.state, 'progress_visible')\
-				.bind_value_from(self.state, 'progress_value')\
 				.props('animation-speed=500')\
 				.classes('w-1/4 h-6')
+
+	def dialog_logger(self) -> ui.dialog:
+		with ui.dialog() as dialog, ui.card(align_items='stretch').classes('min-w-3xl pt-0 pb-2 px-0 gap-y-1'):
+			dialog_title_section(title='Log', icon='notes')
+			with UIRow().classes('p-2'):
+				self.logger = ui.log(max_lines=32).classes('w-full h-96 border-solid rounded-sm')
+			ui.separator()
+			with UIRow(gap=2).classes('px-4'):
+				Button('', icon='restore', color='blue-grey', on_click=self.logger.clear)\
+					.props('dense outline')\
+					.tooltip('Reset log')
+				ui.separator().props('vertical size=1px')
+				Button('', icon='file_download', color='blue-grey', on_click=self.event_download_log)\
+					.props('dense outline')\
+					.tooltip('Export log')
+				Button('', icon='content_copy', color='blue-grey', on_click=self.event_copy_logtext)\
+					.props('dense outline')\
+					.tooltip('Salin clipboard')
+				ui.space()
+				Button('Tutup', on_click=dialog.close)\
+					.props('dense')\
+					.classes('w-16')
+
+		return dialog
 
 	def update_ui(self, *args):
 		panel = self.get_active_panel()
 		if panel is None:
 			return
 
+		# self.progress_state.stop_tracking()
+		# self.progress_state.start_tracking(panel.av.state.progress, ['value', 'message'])
 		self.statusbar_text\
-			.bind_text_from(panel.av_state.progress, 'message')
+			.bind_text_from(panel.av.state.progress, 'message')
 		self.statusbar_progress\
-			.bind_value_from(panel.av_state.progress, 'value')\
-			.bind_visibility_from(panel.state, 'progress_visible')
+			.bind_value_from(panel.av.state.progress, 'value')\
+			.bind_visibility(panel.state, 'progress_visible')
 
-	def get_active_panel(self) -> Optional[AVTabPanel]:
+	def get_active_panel(self) -> Optional[GUIAvailability]:
 		self.panel_rcd.set_active(self.state.active_menu=='RCD')
-		self.panel_rtu.set_active(self.state.active_menu=='RTU')
+		# self.panel_rtu.set_active(self.state.active_menu=='RTU')
 		if self.state.active_menu=='RCD':
 			return self.panel_rcd
 		elif self.state.active_menu=='RTU':
@@ -460,10 +354,6 @@ class WebGUIv3(ui.card):
 	def update_refreshable(self, *args):
 		consume(map(lambda comp: comp.refresh(), self._refreshable))
 
-	def wrap_state(self, *args):
-		print(datetime.datetime.now(), 'state wrapped')
-		self.av_state.wrap(self.state.av)
-
 	def main(self):
 		with self:
 			with UIColumn(align_items='center'):
@@ -472,12 +362,14 @@ class WebGUIv3(ui.card):
 			self.navbar()
 			ui.separator()
 			self.content()
+			# Button('Active Links', on_click=lambda: print(self.panel_rcd.av.object.state.last_exported_file))
 			ui.separator()
 			self.statusbar()
 
 		debug = self.debug_view()
 		Button(icon='open_in_full', on_click=debug.open).props('dense size=xs').classes('absolute top-1.5 right-1.5')
 		self.update_ui()
+		self.logger.push(logprint('Aplikasi running..', level='info', cli=False), classes='text-blue')
 
 	async def prompt_restart(self, e: events.ClickEventArguments) -> None:
 		self.dialog_prompt.set(
@@ -509,7 +401,31 @@ class WebGUIv3(ui.card):
 	def reset(self):
 		self.state.reset()
 		self.panel_rcd.state.reset()
-		self.panel_rtu.state.reset()
+		# self.panel_rtu.state.reset()
+
+	async def event_test_read(self):
+		self.state.progress_visible = True
+		avcfg = rcd.RCDConfig()
+		av = rcd.RCD(avcfg)
+		self.progress_state.start_tracking(av.state.progress, ['value', 'message'])
+		dfsoe = await av.async_read_soe_file('/media/shared-ntfs/1-scada-makassar/AVAILABILITY/2025/HISWebUI_spectrum_DATA-MESSAGES_202503*.xlsx')
+		_soe = soe.SOE(data=dfsoe, config=avcfg, sources=av.reader.sources)
+		dfrcd = await av.async_analyze_soe(_soe.data)
+		result = av.calculate(start_date=datetime.datetime(2025,3,1), end_date=datetime.datetime(2025,3,31,23,59,59,999999))
+
+	async def event_stop_read(self):
+		self.state.progress_visible = False
+		self.progress_state.stop_tracking()
+
+	def event_download_log(self):
+		logtext = '\n'.join([label.text for label in self.logger.descendants()])
+		ui.download.content(logtext, f'Availability_SCADA_Log_Export_{datetime.datetime.timestamp(datetime.datetime.now()):.0f}.log')
+		ui.notify('Log telah disalin ke clipboard', type='info')
+
+	def event_copy_logtext(self):
+		texts = [label.text for label in self.logger.descendants()]
+		ui.clipboard.write('\n'.join(texts))
+		ui.notify('Log telah disalin ke clipboard', type='positive')
 
 
 @ui.page(path='/', title=settings.APP_TITLE)

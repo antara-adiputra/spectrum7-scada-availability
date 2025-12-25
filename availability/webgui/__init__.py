@@ -1,1 +1,1 @@
-from .main import WebGUIv2, WebGUIv3
+from .main import WebGUIv3

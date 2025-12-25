@@ -9,8 +9,3 @@ ColorTemplate: TypeAlias = Literal['primary', 'secondary', 'accent', 'dark', 'po
 
 SpinnerType: TypeAlias = Literal['audio', 'bar', 'balls', 'box', 'clock', 'comment', 'cube', 'dots', 'facebook', 'gears', 'grid', 'hearts', 'hourglass', 'infinity', 'ios', 'orbit', 'oval', 'pie', 'puff', 'radio', 'rings', 'tail']
 QButtonStyle: TypeAlias = Literal['outline', 'flat', 'unelevated', 'rounded', 'push', 'square', 'glossy', 'round', 'fab']
-
-AvRCClass: TypeAlias = Union[Any]
-AvRCObject: TypeAlias = Union[Any]
-AvRSClass: TypeAlias = Union[Any]
-AvRSObject: TypeAlias = Union[Any]
