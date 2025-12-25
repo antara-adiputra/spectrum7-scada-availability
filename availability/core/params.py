@@ -17,3 +17,9 @@ SOE_STATUS_DICT = dict(
 	disappear='Disappeared',
 	disapear='Disappeared',
 )
+
+# This based on nicegui ui.log reference for log style & customization
+INFOLOG_KWARGS = {'classes': 'text-wrap'}	# {'classes': 'text-cyan-700'}
+ERRORLOG_KWARGS = {'classes': 'text-red-600 text-wrap'}
+WARNINGLOG_KWARGS = {'classes': 'text-amber-500 text-wrap'}
+SUCCESSLOG_KWARGS = {'classes': 'text-green-600 text-wrap'}
