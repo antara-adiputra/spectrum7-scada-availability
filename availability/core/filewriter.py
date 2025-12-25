@@ -39,17 +39,6 @@ class FileProperties(TypedDict):
 	comments: str
 
 
-@dataclass(kw_only=True, eq=False)
-class FileInfoDict:
-	title: str
-	subject: str = field(default='Availability')
-	author: str = field(default='SCADA')
-	manager: str = field(default='Fasop')
-	company: str = field(default='PLN UP2B Sistem Makassar')
-	category: str = field(default='Excel Automation')
-	comments: str = field(default=None)
-
-
 class SheetWrapper(Generic[TDM]):
 	header_format: ClassVar[XlsxFormat] = XlsxFormat(
 		num_format='@',
@@ -193,9 +182,13 @@ class SheetWrapper(Generic[TDM]):
 			if dtcol.get('width'):
 				width = dtcol['width']
 			else:
-				autowidth = reduce(max, map(cell_autofit_width, self.data[field].astype('string').fillna('')))	# Value as pixel number
-				headerlen = cell_autofit_width(dtcol['header'])
-				width = (headerlen if headerlen>autowidth else autowidth)//6
+				try:
+					# reduce function can trigger error if data is empty
+					autowidth = reduce(max, map(cell_autofit_width, self.data[field].astype('string').fillna('')))	# Value as pixel number
+					headerlen = cell_autofit_width(dtcol['header'])
+					width = (headerlen if headerlen>autowidth else autowidth)//6
+				except Exception:
+					width = None
 
 			ws.set_column(ix, ix, width=width)
 
