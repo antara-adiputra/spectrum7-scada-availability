@@ -1,4 +1,5 @@
-import asyncio, datetime, functools, os, re, time, warnings
+import asyncio, calendar, datetime, functools, os, re, time, warnings
+import inspect
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from difflib import SequenceMatcher, get_close_matches
@@ -12,6 +13,7 @@ import pandas as pd
 from lxml import etree as et
 
 from .types import *
+from . import settings
 
 
 LogLevel: TypeAlias = Literal['debug', 'info', 'warning', 'error']
@@ -32,14 +34,24 @@ class ProcessError(Exception):
 	def __str__(self) -> str:
 		return f'{self.name}: {self.msg} {" ".join(self.param)}'
 
-def logprint(message: str, /, level: LogLevel = 'debug', timestamp: bool = True):
+def logprint(message: str, /, level: LogLevel = 'debug', timestamp: bool = True, cli: bool = True, ext_func: Optional[Callable] = None, **ext_kwargs):
 	msgs = list()
 	if timestamp:
 		msgs.append(str(datetime.datetime.now())[:-3])
-	
+
 	msgs.append(level.upper())
 	msgs.append(message)
-	print(*msgs, sep='  ')
+	if cli:
+		if level=='debug':
+			if getattr(settings, 'DEBUG', False):
+				print(*msgs, sep='  ')
+		else:
+			print(*msgs, sep='  ')
+
+	if callable(ext_func):
+		ext_func('  '.join(msgs), **ext_kwargs)
+
+	return '  '.join(msgs)
 
 # decorator to calculate duration
 # taken by any function.
@@ -68,6 +80,21 @@ def rgetattr(obj, attr: str, *args, sep: str = '.'):
 	def _getattr(obj, attr):
 		return getattr(obj, attr, *args)
 	return functools.reduce(_getattr, [obj] + attr.split(sep))
+
+def add_months(date: Union[datetime.date, datetime.datetime], n: int) -> Union[datetime.date, datetime.datetime]:
+	def calc():
+		mm = date.month - 1 + n
+		year = date.year + mm // 12
+		month = mm % 12 + 1
+		day = min(date.day, calendar.monthrange(year, month)[1])
+		return year, month, day
+
+	if isinstance(date, datetime.datetime):
+		return datetime.datetime(*calc(), date.hour, date.minute, date.second, date.microsecond)
+	elif isinstance(date, datetime.date):
+		return datetime.date(*calc())
+	else:
+		raise ValueError('Invalid input type of ' + type(date))
 
 def instance_factory(cls, *initargs, **initkwargs) -> object:
 	return cls(*initargs, **initkwargs)
@@ -292,12 +319,21 @@ def toggle_attr(name: str, *value):
 	val1 = value[1] if len(value)>1 else None
 	def wrapper(func):
 		@functools.wraps(func)
-		async def wrapped(self, *args, **kwargs):
+		def wrapped(self, *args, **kwargs):
+			rsetattr(self, name, val0)
+			result = func(self, *args, **kwargs)
+			rsetattr(self, name, val1)
+			return result
+
+		@functools.wraps(func)
+		async def async_wrapped(self, *args, **kwargs):
 			rsetattr(self, name, val0)
 			result = await func(self, *args, **kwargs)
 			rsetattr(self, name, val1)
 			return result
-		return wrapped
+
+		return async_wrapped if inspect.iscoroutinefunction(func) else wrapped
+
 	return wrapper
 
 async def run_background(proc: ProcessPoolExecutor, fn: Callable, *fnargs, **fnkwargs):
