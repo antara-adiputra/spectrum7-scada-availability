@@ -1,18 +1,17 @@
-import datetime, re
+import datetime, re, time
 from dataclasses import asdict, dataclass, field
-from functools import cached_property
+from queue import Queue
 
 import numpy as np
 import pandas as pd
 
-from .base import Base, Config, DataModel, DataTable, FieldMetadata, frozen_dataclass_set, model_fieldnames, model_mappings, repr_dataclass
+from .base import Base, Config, DataModel, FieldMetadata, frozen_dataclass_set, model_fieldnames, model_mappings, repr_dataclass
 from .excel import *
-from .filereader import FileReader
-from .filewriter import FileProperties, FileWriter, SheetInfo, SheetSOE, SheetWrapper, xl_col_to_name, xl_hyperlink_to_range
-from .main import AvailabilityCore, AvailabilityData, AvailabilityResult
+from .filewriter import SheetInfo, SheetSOE, SheetWrapper, xl_col_to_name, xl_hyperlink_to_range
+from .main import Availability, AvailabilityCore, AvailabilityData, AvailabilityResult, QueueMessage
 from .soe import SOEData
 from . import params
-from ..lib import calc_time, get_datetime, get_execution_duration, get_termination_duration, get_rtu_timestamp, get_system_timestamp, join_datetime, logprint, try_remove
+from ..lib import get_datetime, get_execution_duration, get_termination_duration, get_rtu_timestamp, get_system_timestamp, join_datetime, logprint, toggle_attr, try_remove
 from ..test import *
 from ..types import *
 from .. import settings
@@ -737,16 +736,14 @@ class AvRCDResult(AvailabilityResult):
 
 class RCDCore(AvailabilityCore):
 	topic = 'event RCD'
-	subject = 'Keberhasilan Remote Control'
+	subject = 'keberhasilan RCD'
 	model_class = RCEventModel
+	config: RCDConfig
 
-	def __init__(self, data: Optional[SOEData] = None, config: Optional[RCDConfig] = None, **kwargs):
-		super().__init__(data, **kwargs)
+	def __init__(self, config: Optional[RCDConfig] = None, data: Optional[SOEData] = None, **kwargs):
+		cfg = config if isinstance(config, RCDConfig) else RCDConfig()
+		super().__init__(config=cfg, data=data, **kwargs)
 		self.sts_quality = TSDQuality()
-		if isinstance(config, RCDConfig):
-			self.config = config
-		else:
-			self.config = RCDConfig()
 
 	def _get_failed_annotation(self, row_order: pd.Series, row_status: pd.Series):
 		"""Find status from SOE data of specific bay.
@@ -1075,7 +1072,7 @@ class RCDCore(AvailabilityCore):
 		orders = df.loc[df['tag'].isin(params.ORDER_TAG)]
 		return super().get_data_count(orders)
 
-	def main_func(self, df: pd.DataFrame, key: Tuple[str, str, str], **kwargs) -> DataTable:
+	def analyze_for_key(self, df: pd.DataFrame, key: Tuple[str, str, str], **kwargs) -> List[Dict[str, Any]]:
 		b1, b2, b3 = key
 		df_bay = df[
 			(df['b1']==b1) &
@@ -1089,6 +1086,7 @@ class RCDCore(AvailabilityCore):
 		# Store RC repetition
 		buffer1: Dict[KeyPair, List[int]] = dict()
 		buffer2: Dict[KeyPair, List[int]] = dict()
+		queue: Queue = kwargs.get('queue')
 
 		# No RCD for this bay, skip check
 		if len(order_indexes)==0:
@@ -1145,6 +1143,10 @@ class RCDCore(AvailabilityCore):
 				txrx=0,
 				navigation=(idx_order, ix_result)
 			)
+
+			if queue is not None:
+				qmsg = QueueMessage(message=f'Memeriksa RC {data.status} {data.element} bay {data.b1}/{data.b2}/{data.b3} pada {data.order_time}')
+				queue.put(qmsg)
 
 			# Check IFS before RC
 			pre_rc_rtu_st, pre_rc_rtu_name = self._check_rtu_status(row_order)
@@ -1425,20 +1427,7 @@ class RCDCore(AvailabilityCore):
 						if len(buf1val)>1:
 							set_mark_repetition(buf1key)
 
-		return DataTable(rcd_datas)
-
-	def _update_hisdata(self, data: RCEventModel) -> None:
-		"""Update His. Messages with additional information from analyze process.
-
-		Args:
-			data : analyze results
-		"""
-		for cell, val in data.his_update.items():
-			row, col = cell
-			if isinstance(val, (list, tuple)):
-				self.data.CSW.loc[row, col] = '\n'.join([s for s in val if s])
-			else:
-				self.data.CSW.loc[row, col] = val
+		return list(map(lambda x: x.dump(), rcd_datas))
 
 	def post_analyze(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
 		df_post = df.sort_values(['order_time'], ascending=[True]).reset_index(drop=True)
@@ -1692,36 +1681,28 @@ class SheetOperator(SheetWrapper, model_class=RCOperatorModel):
 		return pd.DataFrame(data=[row], columns=model_fieldnames(self.model_class)).fillna('')
 
 
-class RCD:
+class RCD(Availability):
+	config: RCDConfig
+	result: AvRCDResult
 
-	def __init__(self, config: RCDConfig):
-		self.core = RCDCore(config=config)
-		self.config = config
-		self.reader: FileReader = FileReader(RCEventModel)
-		self.sources: str = None
-		self.data: RCDData = None
-		self.result: AvRCDResult = None
+	def init_core(self) -> RCDCore:
+		return RCDCore(self.config)
 
-	def _get_rcd_data(self, df: pd.DataFrame, start_date: Optional[datetime.datetime] = None, end_date: Optional[datetime.datetime] = None) -> RCDData:
+	def get_result(self, df: pd.DataFrame, start_date: Optional[DateSpec] = None, end_date: Optional[DateSpec] = None) -> AvRCDResult:
 		if isinstance(start_date, datetime.datetime) and isinstance(end_date, datetime.datetime):
 			pass
+		elif isinstance(start_date, datetime.date) and isinstance(end_date, datetime.date):
+			start_date = datetime.datetime.combine(start_date, datetime.time())
+			end_date = datetime.datetime.combine(end_date, datetime.time(23, 59, 59, 999999))
 		else:
 			columns = ['order_time', 'feedback_time']
-			# Get date min and max from dataframe 
-			start_date = df[columns].min(axis=1).min(axis=0)
-			end_date = df[columns].max(axis=1).max(axis=0)
+			# Get date min and max from dataframe
+			start_date = df[columns].min(axis=1).min(axis=0).to_pydatetime()
+			end_date = df[columns].max(axis=1).max(axis=0).to_pydatetime()
 
-		return RCDData(df, start_date=start_date, end_date=end_date, config=self.config)
-
-	def read_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
-		self.reader.set_file(files=files)
-		rc_event = self.reader.load(sheet_name=sheet, **kwargs)
-		return self.post_read_file(rc_event, **kwargs)
-
-	async def async_read_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
-		self.reader.set_file(files=files)
-		rc_event = await self.reader.async_load(sheet_name=sheet, **kwargs)
-		return self.post_read_file(rc_event, **kwargs)
+		df_filter = df[(df['order_time']>=start_date) & (df['order_time']<=end_date)]
+		rcd_data = RCDData(df_filter, start_date=start_date, end_date=end_date, config=self.config)
+		return AvRCDResult(data=rcd_data)
 
 	def post_read_file(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
 		columns = df.columns.tolist()
@@ -1737,11 +1718,7 @@ class RCD:
 			.fillna('')\
 			.reset_index(drop=True)
 		self.data = df_rc
-		self.sources = self.reader.sources
-		return df_rc
-
-	def read_database(self, **kwargs):
-		pass
+		return super().post_read_file(df_rc, **kwargs)
 
 	def get_xlsheet(self, **infokwargs) -> Dict[str, SheetWrapper]:
 		sheets: List[SheetWrapper] = list()
@@ -1783,6 +1760,7 @@ class RCD:
 				'source': self.sources or '<undefined>',
 				'output': f'{filename}.xlsx',
 				'date_range': (self.result.date_min, self.result.date_max),
+				'execution_time': f'{self.duration:.3f}',
 				'node': settings.PY_NODE,
 				'processed_date': datetime.datetime.now(),
 				'user': 'fasop',
@@ -1798,54 +1776,7 @@ class RCD:
 		return {sheet.sheet_name: sheet for sheet in sheets}
 
 	def get_properties(self) -> Dict[str, str]:
-		# Define file properties
-		return FileProperties(
-			title='Keberhasilan Remote Control SCADA',
-			subject='Availability',
-			author='SCADA',
-			manager='Fasop',
-			company='PLN UP2B Sistem Makassar',
-			category='Excel Automation',
-			comments=f'Dibuat otomatis menggunakan Python{settings.PY_VERSION} dan XlsxWriter'
-		)
-
-	def write_file(self, filename: Optional[str] = None, as_iobuffer: bool = False, **kwargs):
-		prefix = 'AV_RCD' + '_' + self.config.master.title()
-		# Create filename automatically if not defined
-		if not filename:
-			start_date = self.result.date_min.strftime("%Y%m%d")
-			stop_date = self.result.date_max.strftime("%Y%m%d")
-			date_specs = '{start_date}-{stop_date}'.format(start_date=start_date, stop_date=stop_date)
-			filename = '_'.join((prefix, 'Output', date_specs))
-
-		writer = FileWriter(
-			filename_prefix=prefix,
-			sheets=self.get_xlsheet(filename=filename),
-			properties=self.get_properties(),
-		)
-		self.writer = writer
-		return writer.to_excel(filename=filename, as_iobuffer=as_iobuffer)
-
-	def analyze_soe(self, soe: SOEData, **kwargs):
-		self.core.set_data(soe)
-		df_rc = self.core.fast_analyze(start_date=soe.date_min, end_date=soe.date_max, **kwargs)
-		self.data = df_rc
-		self.sources = soe.sources
-		return df_rc
-
-	async def async_analyze_soe(self, soe: SOEData, **kwargs):
-		self.core.set_data(soe)
-		df_rc = await self.core.async_analyze(start_date=soe.date_min, end_date=soe.date_max, **kwargs)
-		self.data = df_rc
-		self.sources = soe.sources
-		return df_rc
-
-	def calculate(self, start_date: Optional[datetime.datetime] = None, end_date: Optional[datetime.datetime] = None, **kwargs):
-		rcd_data = self._get_rcd_data(self.data, start_date=start_date, end_date=end_date)
-		result = AvRCDResult(data=rcd_data)
-		self.result = result
-		return result
-
+		return super().get_properties(title='Keberhasilan Remote Control SCADA')
 
 
 def summary_template(**kwargs):
