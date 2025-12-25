@@ -1,16 +1,15 @@
-import datetime, os, re
+import datetime, os, re, time
 from dataclasses import dataclass, field
-from functools import cached_property
+from queue import Queue
 
 import pandas as pd
 
-from .base import Base, Config, DataModel, DataTable, FieldMetadata, frozen_dataclass_set, model_fieldnames, repr_dataclass
+from .base import Base, Config, DataModel, FieldMetadata, frozen_dataclass_set, model_fieldnames, repr_dataclass
 from .excel import *
-from .filereader import FileReader
-from .filewriter import FileInfoDict, FileProperties, FileWriter, SheetInfo, SheetSOE, SheetWrapper, xl_hyperlink_to_range
-from .main import AvailabilityCore, AvailabilityData, AvailabilityResult
+from .filewriter import SheetInfo, SheetSOE, SheetWrapper, xl_hyperlink_to_range
+from .main import Availability, AvailabilityCore, AvailabilityData, AvailabilityResult, QueueMessage
 from .soe import SOEData
-from ..lib import join_datetime, logprint, try_remove
+from ..lib import join_datetime, logprint, toggle_attr, try_remove
 from ..test import *
 from ..types import *
 from .. import config, settings
@@ -301,10 +300,7 @@ RTUAvailabilityModel = type('RTUAvailabilityModel', (RTUAvailability, DataModel)
 @dataclass
 class _DowntimeCategory:
 	name: str
-	hour: Union[int, float]
-
-	def __post_init__(self):
-		self.hour = datetime.timedelta(hours=self.hour)
+	threshold: datetime.timedelta
 
 
 class DowntimeRules:
@@ -322,14 +318,14 @@ class DowntimeRules:
 		if all(map(lambda r: isinstance(r, _DowntimeCategory), value)):
 			self._value = value
 		elif all(map(lambda r: isinstance(r, (tuple, list)), value)):
-			self._value = list(map(lambda cat: _DowntimeCategory(*cat), value))
+			self._value = list(map(lambda cat: _DowntimeCategory(name=cat[0], threshold=datetime.timedelta(hours=cat[1])), value))
 		else:
 			self._value = list()
 
 		self.sort(desc=True)
 
 	def sort(self, desc: bool = False):
-		self._value = sorted(self._value, key=lambda rule: rule.hour, reverse=desc)
+		self._value = sorted(self._value, key=lambda rule: rule.threshold, reverse=desc)
 
 	def categorize(self, value: Union[datetime.timedelta, int, float]) -> Optional[_DowntimeCategory]:
 		"""Get up/down category from rules."""
@@ -342,7 +338,7 @@ class DowntimeRules:
 			return result
 
 		for rule in self._value:
-			if val>=rule.hour:
+			if val>=rule.threshold:
 				result = rule
 				break
 
@@ -367,13 +363,21 @@ class RTUConfig(Config):
 		other_failure_mark : string used to mark event as other failure
 	"""
 	rules: DowntimeRules = field(default_factory=default_downtime_rules)
-	rtu_names: Dict[str, str] = field(default_factory=dict)
+	rtu_file_name: str = ''
 	# Whether only list known RTUs included in Availability
 	known_rtus_only: bool = False
 	maintenance_mark: str = '**maintenance**'
 	link_failure_mark: str = '**link**'
 	rtu_failure_mark: str = '**rtu**'
 	other_failure_mark: str = '**other**'
+
+	@property
+	def rtu_names(self) -> Dict[str, str]:
+		rtus = config.RTU_NAMES_CONFIG.get(self.rtu_file_name, dict())
+		if not rtus and self.known_rtus_only:
+			self.known_rtus_only = False
+
+		return rtus
 
 
 @dataclass(frozen=True)
@@ -515,10 +519,10 @@ class DowntimeStatistics:
 	""""""
 	data: pd.DataFrame
 	total_count: int = field(init=False, default=None)
-	total_downtime: datetime.timedelta = field(init=False, default=None)
-	downtime_min: datetime.timedelta = field(init=False, default=None)
-	downtime_max: datetime.timedelta = field(init=False, default=None)
-	downtime_avg: datetime.timedelta = field(init=False, default=None)
+	total_downtime: datetime.timedelta = field(init=False, default_factory=datetime.timedelta)
+	downtime_min: datetime.timedelta = field(init=False, default_factory=datetime.timedelta)
+	downtime_max: datetime.timedelta = field(init=False, default_factory=datetime.timedelta)
+	downtime_avg: datetime.timedelta = field(init=False, default_factory=datetime.timedelta)
 	longest_downtime: RTUDownTimeModel = field(init=False, default=None)
 
 	def __repr__(self):
@@ -530,14 +534,6 @@ class DowntimeStatistics:
 	def _get_longest_downtime(self, df: pd.DataFrame) -> Optional[RTUDownTimeModel]:
 		if df.shape[0]:
 			return RTUDownTimeModel.from_series(df.loc[df['duration'].idxmax()])
-			# return RTUDownTime(
-			# 	down_time=row['down_time'],
-			# 	up_time=row['up_time'],
-			# 	rtu=row['rtu'],
-			# 	long_name=row['long_name'],
-			# 	duration=row['duration'],
-			# 	annotations=row['annotations']
-			# )
 		else:
 			return None
 
@@ -561,11 +557,14 @@ class AvRTUResult(AvailabilityResult, DowntimeStatistics):
 	"""
 	"""
 	data: RTUDownData
+	rtu_count: int = field(init=False, default=0)
 	maintenance: DowntimeStatistics = field(init=False, default=None)
 	link: DowntimeStatistics = field(init=False, default=None)
 	rtu: DowntimeStatistics = field(init=False, default=None)
 	other: DowntimeStatistics = field(init=False, default=None)
 	uncategorized: DowntimeStatistics = field(init=False, default=None)
+	max_occurences: RTUAvailabilityModel = field(init=False, default=None)
+	max_total_dt: RTUAvailabilityModel = field(init=False, default=None)
 
 	def __post_init__(self):
 		super().__post_init__()
@@ -578,29 +577,42 @@ class AvRTUResult(AvailabilityResult, DowntimeStatistics):
 			filter_rtu = data['marked_rtu_failure']=='*'
 			filter_other = data['marked_other_failure']=='*'
 			attrs.update(
+				rtu_count=self.data.availability.shape[0],
 				maintenance=DowntimeStatistics(data=data[filter_maintenance]),
 				link=DowntimeStatistics(data=data[filter_link]),
 				rtu=DowntimeStatistics(data=data[filter_rtu]),
 				other=DowntimeStatistics(data=data[filter_other]),
 				uncategorized=DowntimeStatistics(data=data[~((filter_maintenance) | (filter_link) | (filter_rtu) | (filter_other))]),
+				max_occurences=self._rtu_with_most_occurences(),
+				max_total_dt=self._rtu_with_longest_downtime(),
 			)
 
 		frozen_dataclass_set(self, **attrs)
 
+	def _rtu_with_most_occurences(self) -> Optional[RTUAvailabilityModel]:
+		if self.data.availability.shape[0]:
+			return RTUAvailabilityModel.from_series(self.data.availability.loc[self.data.availability['downtime_occurences'].idxmax()])
+		else:
+			return
+
+	def _rtu_with_longest_downtime(self) -> Optional[RTUAvailabilityModel]:
+		if self.data.availability.shape[0]:
+			return RTUAvailabilityModel.from_series(self.data.availability.loc[self.data.availability['total_downtime'].idxmax()])
+		else:
+			return
+
 
 class RTUCore(AvailabilityCore):
 	topic = 'event downtime'
-	subject = 'Availability Remote Station'
+	subject = 'availability RTU'
 	model_class = RTUDownTimeModel
+	config: RTUConfig
 
-	def __init__(self, data: Optional[SOEData] = None, config: Optional[RTUConfig] = None, **kwargs):
-		super().__init__(data, **kwargs)
-		if isinstance(config, RTUConfig):
-			self.config = config
-		else:
-			self.config = RTUConfig()
+	def __init__(self, config: Optional[RTUConfig] = None, data: Optional[SOEData] = None, **kwargs):
+		cfg = config if isinstance(config, RTUConfig) else RTUConfig()
+		super().__init__(config=cfg, data=data, **kwargs)
 
-	def _get_category_note(self, downtime: datetime.timedelta) -> Optional[str]:
+	def _get_category_note(self, downtime: Union[datetime.timedelta, int, float]) -> Optional[str]:
 		"""Annotate downtime duration category from defined rules.
 
 		Args:
@@ -613,7 +625,7 @@ class RTUCore(AvailabilityCore):
 		if category is None:
 			return category
 		else:
-			return f'Downtime > {category.hour} jam ({category.name})'
+			return f'Downtime > {category.threshold.total_seconds()//3600} jam ({category.name})'
 
 	def select_data(self) -> pd.DataFrame:
 		return self.data.RTU
@@ -629,9 +641,9 @@ class RTUCore(AvailabilityCore):
 	def get_data_count(self, df: pd.DataFrame) -> int:
 		status_down = ('Down',)
 		event_down = df[df['status'].isin(status_down)]
-		return event_down.shape[0]
+		return super().get_data_count(event_down)
 
-	def main_func(self, df: pd.DataFrame, key: str, **kwargs) -> DataTable:
+	def analyze_for_key(self, df: pd.DataFrame, key: str, **kwargs) -> List[Dict[str, Any]]:
 		df_rtu = df[df['b3']==key]
 		# Get index of columns
 		i_sys_tstamp = df.columns.get_loc('system_timestamp')
@@ -642,8 +654,18 @@ class RTUCore(AvailabilityCore):
 
 		index0 = df.index.min()
 		t0 = join_datetime(*self.data.his.iloc[0, [i_sys_tstamp, i_sys_msec]])
-		rtu_datas: DataTable = DataTable()
+		rtu_datas: List[Dict[str, Any]] = list()
 		notes: List[str] = list()
+
+		# Look for queue for inter-process communication
+		queue: Queue = kwargs.get('queue')
+		if queue is not None:
+			n = self.get_data_count(df_rtu)
+			qmsg = QueueMessage(
+				message=f'Menganalisa {n} kali downtime RTU {key}.',
+				count=n
+			)
+			queue.put(qmsg)
 
 		for x in range(df_rtu.shape[0]):
 			t1 = join_datetime(*df_rtu.iloc[x, [i_sys_tstamp, i_sys_msec]])
@@ -677,74 +699,67 @@ class RTUCore(AvailabilityCore):
 					notes += txt.split('\n')
 
 			if status=='Up':
-				# Calculate downtime duration in second and append to analyzed_rows
-				downtime = t1 - t0
-				category = self._get_category_note(downtime)
-
-				if category: notes.append(category)
-
-				data.down_time = t0
-				data.up_time = t1
-				data.duration = downtime
-				data.ack_downtime = t0	# Default to system down time
-				data.fix_duration = downtime
-				data.annotations = '\n'.join(notes)
-				data.navigation = (index0, df_rtu.iloc[x].name)
-
-				rtu_datas.add(data)
-				# Reset anno
-				notes.clear()
+				t_up = t1
+				nav1 = df_rtu.iloc[x].name
+				if x==0:
+					# This is first event of RTU
+					# Calculate downtime duration in second and append to analyzed_rows
+					t_down = t0
+					nav0 = index0
+				else:
+					# At least 1 event before current
+					# Make sure if previous event is status of down, or will marked as invalid
+					if df_rtu.iloc[x-1, i_status]=='Down':
+						# VALID
+						t_down = join_datetime(*df_rtu.iloc[x-1, [i_sys_tstamp, i_sys_msec]])
+						nav0 = df_rtu.iloc[x-1].name
+					else:
+						# INVALID
+						t_down = t1
+						nav0 = nav1
+						notes.append('Event status down tidak ditemukan.')
 			elif status=='Down':
+				t_down = t1
+				nav0 = df_rtu.iloc[x].name
 				if x==df_rtu.shape[0]-1:
 					# RTU down until max time range
-					t_max = join_datetime(*self.data.his.iloc[self.data.his.shape[0]-1, [i_sys_tstamp, i_sys_msec]])
-					downtime = t_max - t1
-					category = self._get_category_note(downtime)
-
-					if category: notes.append(category)
-
-					data.down_time = t1
-					data.up_time = t_max
-					data.duration = downtime
-					data.fix_duration = downtime
-					data.annotations = '\n'.join(notes)
-					data.navigation = (df_rtu.iloc[x].name, df.index.max())
-
-					rtu_datas.add(data)
-					# Reset anno
-					notes.clear()
+					t_up = join_datetime(*self.data.his.iloc[self.data.his.shape[0]-1, [i_sys_tstamp, i_sys_msec]])
+					nav1 = df.index.max()
 				else:
-					index0 = df_rtu.iloc[x].name
-					t0 = t1
+					# At least 1 event after current
+					# Make sure if next event is status of up, or will marked as invalid
+					if df_rtu.iloc[x+1, i_status]=='Up':
+						# VALID
+						continue
+					else:
+						# INVALID
+						t_up = t1
+						nav1 = nav0
+						notes.append('Event status up tidak ditemukan.')
+			else:
+				# Unknown / unexpected status
+				continue
+					
+			downtime = t_up - t_down
+			category = self._get_category_note(downtime)
+			if category: notes.append(category)
+
+			data.down_time = t_down
+			data.up_time = t_up
+			data.duration = downtime
+			data.ack_downtime = t_down	# Default to system down time
+			data.fix_duration = downtime
+			data.annotations = '\n'.join(notes)
+			data.navigation = (nav0, nav1)
+
+			rtu_datas.append(data.dump())
+			# Reset anno
+			notes.clear()
 
 		return rtu_datas
 
-	def fast_analyze(
-		self,
-		start_date: Optional[datetime.datetime] = None,
-		end_date: Optional[datetime.datetime] = None,
-		force: bool = False,
-		nprocessor: int = os.cpu_count(),
-		limit_per_cpu: Union[int, None] = 1,
-		**kwargs
-	) -> pd.DataFrame:
-		# Override default value for limit_per_cpu
-		return super().fast_analyze(start_date, end_date, force, nprocessor, limit_per_cpu, **kwargs)
-
-	async def async_analyze(
-		self,
-		start_date: Optional[datetime.datetime] = None,
-		end_date: Optional[datetime.datetime] = None,
-		force: bool = False,
-		nprocessor: int = os.cpu_count(),
-		limit_per_cpu: Union[int, None] = 1,
-		**kwargs
-	) -> pd.DataFrame:
-		# Override default value for limit_per_cpu
-		return await super().async_analyze(start_date, end_date, force, nprocessor, limit_per_cpu, **kwargs)
-
 	def post_analyze(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
-		df_post = df.sort_values(['down_time'], ascending=[True]).reset_index(drop=True)
+		df_post = df.sort_values(['down_time', 'up_time'], ascending=[True, True]).reset_index(drop=True)
 		return super().post_analyze(df_post, **kwargs)
 
 
@@ -849,39 +864,28 @@ class SheetAvailability(SheetWrapper, model_class=RTUAvailabilityModel):
 		return pd.DataFrame(data=[row], columns=model_fieldnames(self.model_class)).fillna('')
 
 
-class RTU:
+class RTU(Availability):
+	config: RTUConfig
+	result: AvRTUResult
 
-	def __init__(self, config: RTUConfig):
-		self.core = RTUCore(config=config)
-		self.config = config
-		self.reader: FileReader = FileReader(RTUDownTimeModel)
-		self.sources: str = None
-		self.data: pd.DataFrame = None
-		self.result: AvRTUResult = None
+	def init_core(self) -> RTUCore:
+		return RTUCore(self.config)
 
-	def __repr__(self):
-		return repr_dataclass(self)
-
-	def _get_rtu_down_data(self, df: pd.DataFrame, start_date: Optional[datetime.datetime] = None, end_date: Optional[datetime.datetime] = None) -> RTUDownData:
+	def get_result(self, df: pd.DataFrame, start_date: Optional[DateSpec] = None, end_date: Optional[DateSpec] = None) -> AvRTUResult:
 		if isinstance(start_date, datetime.datetime) and isinstance(end_date, datetime.datetime):
 			pass
+		elif isinstance(start_date, datetime.date) and isinstance(end_date, datetime.date):
+			start_date = datetime.datetime.combine(start_date, datetime.time())
+			end_date = datetime.datetime.combine(end_date, datetime.time(23, 59, 59, 999999))
 		else:
 			columns = ['down_time', 'up_time']
 			# Get date min and max from dataframe 
-			start_date = df[columns].min(axis=1).min(axis=0)
-			end_date = df[columns].max(axis=1).max(axis=0)
+			start_date = df[columns].min(axis=1).min(axis=0).to_pydatetime()
+			end_date = df[columns].max(axis=1).max(axis=0).to_pydatetime()
 
-		return RTUDownData(df, start_date=start_date, end_date=end_date, config=self.config)
-
-	def read_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
-		self.reader.set_file(files)
-		downtime = self.reader.load(sheet_name=sheet, **kwargs)
-		return self.post_read_file(downtime, **kwargs)
-
-	async def async_read_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
-		self.reader.set_file(files)
-		downtime = await self.reader.async_load(sheet_name=sheet, **kwargs)
-		return self.post_read_file(downtime, **kwargs)
+		df_filter = df[(df['down_time']>=start_date) & (df['up_time']<=end_date)]
+		rtu_data = RTUDownData(df_filter, start_date=start_date, end_date=end_date, config=self.config)
+		return AvRTUResult(data=rtu_data)
 
 	def post_read_file(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
 		columns = df.columns.tolist()
@@ -894,11 +898,7 @@ class RTU:
 			.fillna('')\
 			.reset_index(drop=True)
 		self.data = df_rtu
-		self.sources = self.reader.sources
-		return df_rtu
-
-	def read_database(self, **kwargs):
-		pass
+		return super().post_read_file(df, **kwargs)
 
 	def get_xlsheet(self, **infokwargs) -> Dict[str, SheetWrapper]:
 		sheets: List[SheetWrapper] = list()
@@ -924,6 +924,7 @@ class RTU:
 				'source': self.sources or '<undefined>',
 				'output': f'{filename}.xlsx',
 				'date_range': (self.result.date_min, self.result.date_max),
+				'execution_time': f'{self.duration:.3f}',
 				'node': settings.PY_NODE,
 				'processed_date': datetime.datetime.now(),
 				'user': 'fasop',
@@ -937,53 +938,7 @@ class RTU:
 		return {sheet.sheet_name: sheet for sheet in sheets}
 
 	def get_properties(self) -> Dict[str, str]:
-		# Define file properties
-		return FileProperties(
-			title='Availability Remote Station & Link',
-			subject='Availability',
-			author='SCADA',
-			manager='Fasop',
-			company='PLN UP2B Sistem Makassar',
-			category='Excel Automation',
-			comments=f'Dibuat otomatis menggunakan Python{settings.PY_VERSION} dan XlsxWriter'
-		)
-
-	def write_file(self, filename: Optional[str] = None, as_iobuffer: bool = False, **kwargs):
-		prefix = 'AV_RS' + '_' + self.config.master.title()
-		# Create filename automatically if not defined
-		if not filename:
-			start_date = self.result.date_min.strftime("%Y%m%d")
-			stop_date = self.result.date_max.strftime("%Y%m%d")
-			date_specs = '{start_date}-{stop_date}'.format(start_date=start_date, stop_date=stop_date)
-			filename = '_'.join((prefix, 'Output', date_specs))
-
-		writer = FileWriter(
-			filename_prefix=prefix,
-			sheets=self.get_xlsheet(filename=filename),
-			properties=self.get_properties(),
-		)
-		return writer.to_excel(filename=filename, as_iobuffer=as_iobuffer)
-
-	def analyze_soe(self, soe: SOEData, **kwargs):
-		self.core.set_data(soe)
-		downtime = self.core.fast_analyze(start_date=soe.date_min, end_date=soe.date_max, **kwargs)
-		self.data = downtime
-		self.sources = soe.sources
-		return downtime
-
-	async def async_analyze_soe(self, soe: SOEData, **kwargs):
-		self.core.set_data(soe)
-		downtime = await self.core.async_analyze(start_date=soe.date_min, end_date=soe.date_max, **kwargs)
-		self.data = downtime
-		self.sources = soe.sources
-		return downtime
-
-	def calculate(self, start_date: Optional[datetime.datetime] = None, end_date: Optional[datetime.datetime] = None, **kwargs):
-		rtu_data = self._get_rtu_down_data(self.data, start_date=start_date, end_date=end_date)
-		result = AvRTUResult(data=rtu_data)
-		self.result = result
-		return result
-
+		return super().get_properties(title='Availability Remote Station & Link')
 
 
 # def av_analyze_file(**params):
