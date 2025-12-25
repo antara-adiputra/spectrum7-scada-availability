@@ -1,10 +1,10 @@
-import datetime, os, re
+import asyncio, datetime, os, re
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 
 import pandas as pd
 
-from .base import Config, DataModel, DataTable, FieldMetadata, frozen_dataclass_set, model_dtypes, model_mappings, repr_dataclass
+from .base import BaseClass, Config, DataModel, DataTable, FieldMetadata, frozen_dataclass_set, model_dtypes, model_mappings, repr_dataclass
 from .excel import *
 from .filereader import FileReader
 from . import params
@@ -478,7 +478,7 @@ class SurvalentSOEModel(DataModel):
 		df_failed = df[df['tag']=='NE']
 		timeseries = join_datetime(df['timestamp'], df['ms'])
 
-		logprint(f'Scanning status of failed RC...', level='info')
+		logprint(f'Scanning status of failed RC...')
 		for ix in df_failed.index:
 			s = df.loc[ix]
 			t_fback = join_datetime(s['timestamp'], s['ms'])
@@ -503,7 +503,7 @@ class SurvalentSOEModel(DataModel):
 		fback_comment = 'Kemungkinan feedback RC'
 		df_order = df[df['tag'].isin(params.ORDER_TAG)]
 
-		logprint(f'Scanning possible RC feedback...', level='info')
+		logprint(f'Scanning possible RC feedback...')
 		for ix in df_order.index:
 			t_order, _ = get_datetime(df.loc[ix])
 			b1, b2, b3, elm, sta = df.loc[ix, ['b1', 'b2', 'b3', 'element', 'status']]
@@ -1024,47 +1024,52 @@ class SOEData:
 		)
 
 
-class SOE:
+class SOE(BaseClass):
 	"""Read SOE file from multiple master (Spectrum, Survalent)."""
 
-	def __init__(self, config: Optional[Config] = None):
+	def __init__(self, data: Optional[pd.DataFrame] = None, config: Optional[Config] = None, **kwargs):
 		self.config = config
+		if isinstance(data, pd.DataFrame):
+			sources = kwargs.get('sources') or 'pandas DataFrame object'
+			self.data = self.validate_data(data, sources=sources)
+		else:
+			self.data = None
 
-	def read_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
+	async def _read(self, *models: Type[DataModel], files: FileInput, sheet: str, **kwargs) -> SOEData:
+		reader = FileReader(*models, files=files, **kwargs)
+		soe = await reader.async_load(sheet_name=sheet, **kwargs)
+		result = self.validate_data(soe, sources=reader.sources)
+		self.data = result
+		return result
+
+	def validate_data(self, data: pd.DataFrame, **kwargs) -> SOEData:
+		"""Classify/group SOE data."""
+		sources = kwargs.get('sources')
+		if self.config is None:
+			return SOEData(data=data, sources=sources)
+		else:
+			return SOEData(data=data, rc_element=getattr(self.config, 'elements', None), sources=sources)
+
+	def read_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs) -> SOEData:
 		"""Read SOE files. If config defined, can automatically choose filereader model handler.
 		Default is Spectrum SOE model.
 		"""
-		if self.config is None or self.config.master=='spectrum':
-			reader = FileReader(SOEModel, files=files, **kwargs)
-			soe = reader.load(sheet_name=sheet, **kwargs)
-			return self.post_read(soe, sources=reader.sources)
-		else:
-			return self.read_survalent(files=files, sheet=sheet)
+		return asyncio.run(self.async_read_file(files=files, sheet=sheet, **kwargs))
 
-	async def async_read_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
+	async def async_read_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs) -> SOEData:
 		"""Read SOE files asynchronously. If config defined, can automatically choose filereader model handler.
 		Default is Spectrum SOE model.
 		"""
 		if self.config is None or self.config.master=='spectrum':
-			reader = FileReader(SOEModel, files=files, **kwargs)
-			soe = await reader.async_load(sheet_name=sheet, **kwargs)
-			return self.post_read(soe, sources=reader.sources)
+			return await self._read(SOEModel, files=files, sheet=sheet, **kwargs)
 		else:
 			return await self.async_read_survalent(files=files, sheet=sheet)
 
-	def post_read(self, df: pd.DataFrame, sources: str) -> SOEData:
-		"""Classify/group SOE data."""
-		return SOEData(data=df, sources=sources) if self.config is None else SOEData(data=df, rc_element=getattr(self.config, 'elements', None), sources=sources)
-
-	def read_survalent(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
+	def read_survalent(self, files: FileInput, sheet: Optional[str] = None, **kwargs) -> SOEData:
 		"""Read Survalent SOE / Status point files."""
-		reader = FileReader(SurvalentSOEModel, SurvalentSPModel, files=files, **kwargs)
-		soe = reader.load(sheet_name=sheet, **kwargs)
-		return self.post_read(soe, sources=reader.sources)
+		return asyncio.run(self.async_read_survalent(files=files, sheet=sheet, **kwargs))
 
-	async def async_read_survalent(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
+	async def async_read_survalent(self, files: FileInput, sheet: Optional[str] = None, **kwargs) -> SOEData:
 		"""Asynchronously read Survalent SOE / Status point files."""
-		reader = FileReader(SurvalentSOEModel, SurvalentSPModel, files=files, **kwargs)
-		soe = await reader.async_load(sheet_name=sheet, **kwargs)
-		return self.post_read(soe)
+		return await self._read(SurvalentSOEModel, SurvalentSPModel, files=files, sheet=sheet, **kwargs)
 
