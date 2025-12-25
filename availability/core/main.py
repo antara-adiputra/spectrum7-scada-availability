@@ -1,17 +1,28 @@
-import asyncio, datetime, os
+import asyncio, datetime, os, time
+import multiprocessing as mp
+import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import partial
+from queue import Queue
 
 import numpy as np
 import pandas as pd
 
-from .base import BaseWithProgress, CalculationState, Config, DataModel, DataTable, frozen_dataclass_set
+from .base import BaseWithProgress, CalculationState, Config, DataModel, DataTable, SerializableException, frozen_dataclass_set
 from .filereader import FileReader
+from .filewriter import FileProperties, FileWriter, SheetWrapper
 from .soe import SOEData, SOEModel, SurvalentSOEModel, SurvalentSPModel
 from . import params
-from ..lib import progress_bar, toggle_attr
+from ..lib import logprint, progress_bar, toggle_attr
 from ..types import *
+from .. import settings
+
+
+@dataclass(frozen=True)
+class QueueMessage:
+	message: str = ''
+	count: int = 1
 
 
 @dataclass(frozen=True)
@@ -46,35 +57,28 @@ class AvailabilityCore(BaseWithProgress):
 	topic: ClassVar[str] = ''
 	subject: ClassVar[str] = ''
 	model_class: Type[DataModel] = None
-	result: DataTable = None
 
-	def __init__(self, data: Optional[SOEData] = None, **kwargs):
+	def __init__(self, config: Config, data: Optional[SOEData] = None, **kwargs):
 		super().__init__(**kwargs)
 		self._oridata: SOEData = None
+		self.config = config
 		self.reset()
 		self.set_data(data)
 
-	def _set_analyzed(self, value: bool):
-		self._analyzed = value
-		self.set_wrapper_attr('analyzed', value)
-
 	def reset(self):
-		self._analyzed: bool = False
+		self._duration: float = 0.0
+		self.analyzed: Union[bool, None] = None
+		self.analyzing: bool = False
 		self.key_items: List[AvKeys] = list()
 		self.data_count: int = 0
-		self.result = None
 		if isinstance(self._oridata, SOEData):
 			self.data = self._oridata.copy()
-			if isinstance(self._oridata, pd.DataFrame):
-				self.set_date_range(self._oridata.data['timestamp'].min(), self._oridata.data['timestamp'].max())
 
 	def set_data(self, data: SOEData):
 		"""Set data source to analyze."""
 		if isinstance(data, SOEData):
 			self._oridata = data.copy()
 			self.data = data
-			if isinstance(data.data, pd.DataFrame):
-				self.set_date_range(data.data['timestamp'].min(), data.data['timestamp'].max())
 		else:
 			self._oridata = None
 			self.data = None
@@ -97,11 +101,13 @@ class AvailabilityCore(BaseWithProgress):
 		""""""
 		start_date = kwargs.get('start_date')
 		end_date = kwargs.get('end_date')
-		self.set_date_range(start_date, end_date)
+		if not (isinstance(start_date, datetime.datetime) and isinstance(end_date, datetime.datetime)):
+			raise ValueError(f'Invalid date parameter type of start_date ({type(start_date)}) or end_date ({type(end_date)})')
+		# self.set_date_range(start_date, end_date)
 
 		df_pre = df[
-			(df['timestamp']>=self.start_date) &
-			(df['timestamp']<=self.end_date)
+			(df['timestamp']>=start_date) &
+			(df['timestamp']<=end_date)
 		]
 		self.key_items = self.get_key_items(df_pre)
 		self.data_count = self.get_data_count(df_pre)
@@ -109,22 +115,27 @@ class AvailabilityCore(BaseWithProgress):
 
 	def post_analyze(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
 		""""""
-		self._analyzed = True
+		self.analyzed = True
 		return df
 
-	def main_func(self, df: pd.DataFrame, key: AvKeys, **kwargs) -> DataTable:
+	def analyze_for_key(self, df: pd.DataFrame, key: AvKeys, **kwargs) -> List[Dict[str, Any]]:
 		""""""
 		pass
 
 	def _get_chunksize(self, cpu: int, limit: Union[int, None]) -> int:
 		if limit is None or limit<1:
 			# Dynamic limit
-			return len(self.key_items)//cpu + 1
+			count = len(self.key_items)
+			size = count // cpu
+			if count%cpu>0 or size==0:
+				size += 1
 		else:
 			# Defined
-			return limit
+			size = limit
+		
+		return size
 
-	def _run_on_each_process(self, df: pd.DataFrame, keys: List[AvKeys], **kwargs) -> Dict[str, Any]:
+	def _analyze_keys(self, df: pd.DataFrame, keys: List[AvKeys], queue: Optional[Queue] = None, **kwargs) -> List[Dict[str, Any]]:
 		"""Analyze function executed on each process concurrently.
 
 		Args:
@@ -133,16 +144,20 @@ class AvailabilityCore(BaseWithProgress):
 		Result:
 			Serialized type of dataclass
 		"""
-		result: DataTable = None
+		result: List[Dict[str, Any]] = list()
 		for key in keys:
-			curr_result = self.main_func(df, key, **kwargs)
-			if result is None:
-				result = curr_result
-			else:
-				result.merge(curr_result, inplace=True)
+			try:
+				data = self.analyze_for_key(df, key, queue=queue, **kwargs)
+			except Exception as err:
+				data = [SerializableException(err, extra={'key': key})]
+			finally:
+				result.extend(data)
+
+			# if queue is not None:
+			# 	queue.put(key)
 
 		# IMPORTANT NOTE: Data passed thorugh inter-processes must be serializable
-		return result.dump()
+		return result
 
 	def _run_concurrently(
 		self,
@@ -150,8 +165,9 @@ class AvailabilityCore(BaseWithProgress):
 		keys: List[AvKeys],
 		nprocessor: int,
 		limit_per_cpu: Union[int, None],
+		queue: Optional[Queue] = None,
 		**kwargs
-	) -> DataTable:
+	) -> List[Dict[str, Any]]:
 		"""Run analyze with multiple Processes.
 
 		Args:
@@ -160,15 +176,12 @@ class AvailabilityCore(BaseWithProgress):
 		Result:
 			DataTable
 		"""
-		result: DataTable = None
+		result: List[Dict[str, Any]] = list()
 		progress_msg = kwargs.get('progress_message', '')
 		callback = kwargs.get('callback')
 
 		if callable(callback):
-			cb = callback
-		else:
-			cb = progress_bar
-
+			callback(value=0.0, message=progress_msg, show_percentage=True)
 		# ProcessPoolExecutor create new instance on different processes, so modifying instance in each process will not change instance in main process.
 		# Value returned must be "serializable".
 		chunksize = self._get_chunksize(cpu=nprocessor, limit=limit_per_cpu)
@@ -177,20 +190,20 @@ class AvailabilityCore(BaseWithProgress):
 
 			for i in range(0, len(keys), chunksize):
 				key_segment = keys[i:(i+chunksize)]
-				future = ppe.submit(self._run_on_each_process, df, key_segment)
+				future = ppe.submit(self._analyze_keys, df, key_segment, queue)
 				futures.append(future)
 
 			for x, future in enumerate(as_completed(futures)):
 				result_dict = future.result()
-				result_ = self.model_class.validate(result_dict)
-				if result is None:
-					result = result_
-				else:
-					result.merge(result_, inplace=True)
+				result.extend(result_dict)
 
-				self.set_progress(value=result.count/self.data_count, message=progress_msg, show_percentage=True)
 				# Call callback function
-				cb(value=(x+1)/len(futures), name='analyze')
+				progress_bar(value=(x+1)/len(futures), name='analyze')
+				if callable(callback):
+					callback(value=result.count/self.data_count, message=progress_msg, show_percentage=True)
+
+		if callable(callback):
+			callback(value=1.0, message=f'Analisa {self.data_count} {self.topic} selesai.')
 
 		return result
 
@@ -199,7 +212,7 @@ class AvailabilityCore(BaseWithProgress):
 		df: pd.DataFrame,
 		keys: List[AvKeys],
 		**kwargs
-	) -> DataTable:
+	) -> List[Dict[str, Any]]:
 		"""Run analyze on Single Process.
 
 		Args:
@@ -208,37 +221,31 @@ class AvailabilityCore(BaseWithProgress):
 		Result:
 			Serialized type of dataclass
 		"""
-		result: DataTable = None
+		result: List[Dict[str, Any]] = list()
 		progress_msg = kwargs.get('progress_message', '')
 		callback = kwargs.get('callback')
 
 		if callable(callback):
-			cb = callback
-		else:
-			cb = progress_bar
+			callback(value=0.0, message=progress_msg, show_percentage=True)
 
 		for x, key in enumerate(keys):
-			curr_result = self.main_func(df, key, **kwargs)
-			if result is None:
-				result = curr_result
-			else:
-				result.merge(curr_result, inplace=True)
+			try:
+				data = self.analyze_for_key(df, key, **kwargs)
+			except Exception as err:
+				data = [SerializableException(err, extra={'key': key})]
+			finally:
+				result.extend(data)
 
-			self.set_progress(value=result.count/self.data_count, message=progress_msg, show_percentage=True)
+			# self.set_progress(value=result.count/self.data_count, message=progress_msg, show_percentage=True)
 			# Call callback function
-			cb(value=(x+1)/len(keys), name='analyze')
+			progress_bar(value=(x+1)/len(keys), name='analyze')
+			if callable(callback):
+				callback(value=result.count/self.data_count, message=progress_msg, show_percentage=True)
+
+		if callable(callback):
+			callback(value=1.0, message=f'Analisa {self.data_count} {self.topic} selesai.')
 
 		return result
-
-	def _convert_to_dataframe(self, output: DataTable, **kwargs) -> pd.DataFrame:
-		self.result = output
-		if isinstance(output, DataTable):
-			# Create new DataFrame from list
-			return output.to_dataframe()\
-				.reset_index(drop=True)
-		else:
-			logprint(f'Expected "DataTable" type got {type(output)}.', level='error')
-			return None
 
 	def analyze(
 		self,
@@ -263,8 +270,6 @@ class AvailabilityCore(BaseWithProgress):
 			**kwargs
 		)
 		progress_msg = f'\nMenganalisa {self.data_count} {self.topic}...'
-		self.set_progress(value=0.0, message=progress_msg, show_percentage=True)
-		print('\n' + progress_msg)
 
 		# Execute given function
 		result = self._run_synchronously(
@@ -273,57 +278,23 @@ class AvailabilityCore(BaseWithProgress):
 			progress_message=progress_msg,
 			**kwargs
 		)
-		self.set_progress(value=1.0, message=f'Analisa {self.data_count} {self.topic} selesai.')
-		df_result = self._convert_to_dataframe(result)
+		df_result = pd.DataFrame(result).reset_index(drop=True)
 		return self.post_analyze(df_result, **kwargs)
 
 	def fast_analyze(
 		self,
 		start_date: Optional[datetime.datetime] = None,
 		end_date: Optional[datetime.datetime] = None,
-		force: bool = False,
-		nprocessor: int = os.cpu_count(),
 		limit_per_cpu: Union[int, None] = None,
 		**kwargs
 	) -> pd.DataFrame:
-		"""Optimized analyze function using multiple Processes.
+		return asyncio.run(self.async_analyze(start_date=start_date, end_date=end_date, limit_per_cpu=limit_per_cpu, **kwargs))
 
-		Result:
-			Dataframe
-		"""
-		# Pre-analyze initialization
-		if force:
-			self.reset()
-
-		df = self.pre_analyze(
-			self.select_data(),
-			start_date=start_date,
-			end_date=end_date,
-			**kwargs
-		)
-		progress_msg = f'\nMenganalisa {self.data_count} {self.topic}...'
-		self.set_progress(value=0.0, message=progress_msg, show_percentage=True)
-		print('\n' + progress_msg)
-
-		# Execute given function
-		result = self._run_concurrently(
-			df=df,
-			keys=self.key_items,
-			nprocessor=nprocessor,
-			limit_per_cpu=limit_per_cpu,
-			progress_message=progress_msg,
-			**kwargs
-		)
-		self.set_progress(value=1.0, message=f'Analisa {self.data_count} {self.topic} selesai.')
-		df_result = self._convert_to_dataframe(result)
-		return self.post_analyze(df_result, **kwargs)
-
+	@toggle_attr('analyzing', True, False)
 	async def async_analyze(
 		self,
 		start_date: Optional[datetime.datetime] = None,
 		end_date: Optional[datetime.datetime] = None,
-		force: bool = False,
-		nprocessor: int = os.cpu_count(),
 		limit_per_cpu: Union[int, None] = None,
 		**kwargs
 	) -> pd.DataFrame:
@@ -332,118 +303,260 @@ class AvailabilityCore(BaseWithProgress):
 		Result:
 			Dataframe
 		"""
-		async def run_background(proc: ProcessPoolExecutor, fn: Callable, *fnargs, **fnkwargs):
-			loop = asyncio.get_running_loop() or asyncio.get_event_loop()
-			return await loop.run_in_executor(proc, partial(fn, *fnargs, **fnkwargs))
-
-		def done(ftr: asyncio.Future):
-			nonlocal result
-			result_dict = ftr.result()
-			result_ = self.model_class.validate(result_dict)
-			if result is None:
-				result = result_
-			else:
-				result.merge(result_, inplace=True)
-
-			self.set_progress(value=result.count/self.data_count, message=progress_msg, show_percentage=True)
-
-		# Pre-analyze initialization
-		if force:
-			self.reset()
-
-		result: DataTable = None
+		log_callback = kwargs.pop('log_callback', None)
+		time_start = time.perf_counter()
 		df = self.pre_analyze(
 			self.select_data(),
 			start_date=start_date,
 			end_date=end_date,
 			**kwargs
 		)
-		progress_msg = f'\nMenganalisa {self.data_count} {self.topic}...'
-		self.set_progress(value=0.0, message=progress_msg, show_percentage=True)
+		loop = asyncio.get_event_loop()
+		# Get the number of workers
+		n = min(settings.MAX_CPU_USAGE, os.cpu_count())
+		chunksize = self._get_chunksize(cpu=n, limit=limit_per_cpu)
+		# self.analyzing = True
+		logprint(f'Analyzing {self.data_count} event(s)...', level='info')
+		logprint(f'Mulai menganalisa {self.data_count} {self.topic}...', level='info', cli=False, ext_func=log_callback, **params.INFOLOG_KWARGS)
 
-		tasks: set = set()
-		chunksize = self._get_chunksize(cpu=nprocessor, limit=limit_per_cpu)
-		executor = ProcessPoolExecutor(nprocessor)
-		for i in range(0, len(self.key_items), chunksize):
-			key_segment = self.key_items[i:(i+chunksize)]
-			task = asyncio.create_task(
-				run_background(executor, self._run_on_each_process, df, key_segment, **kwargs)
-			)
-			task.add_done_callback(done)
-			tasks.add(task)
+		with mp.Manager() as manager:
+			queue = manager.Queue()
+			t1 = threading.Thread(target=self._consume_queue, args=(queue, log_callback))
+			t1.start()
 
-		await asyncio.gather(*tasks)
-		tasks.clear()
-		executor.shutdown()
+			with ProcessPoolExecutor(n) as exc:
+				tasks = list()
+				for i in range(0, len(self.key_items), chunksize):
+					key_segment = self.key_items[i:(i+chunksize)]
+					tasks.append(loop.run_in_executor(exc, partial(self._analyze_keys, **kwargs), df, key_segment, queue, **kwargs))
 
-		self.set_progress(value=1.0, message=f'Analisa {self.data_count} {self.topic} selesai.')
-		df_result = self._convert_to_dataframe(result)
+				# Return List[List[serialized data]]
+				results = await asyncio.gather(*tasks, return_exceptions=True)
+
+		datalist = [data for group in results for data in group]
+		df_result = pd.DataFrame(datalist).reset_index(drop=True)
+
+		delta_time = time.perf_counter() - time_start
+		self._duration = delta_time
+		# self.analyzing = False
+		logprint(f'Analyze completed in {delta_time:.3f}s.', level='info')
+		logprint(f'Analisa {self.data_count} {self.topic} selesai. ({delta_time:.2f}s)', level='info', cli=False, ext_func=log_callback, **params.INFOLOG_KWARGS)
 		return self.post_analyze(df_result, **kwargs)
 
+	def _consume_queue(self, queue: Queue, callback: Optional[Callable]):
+		processed = 0
+		message_template = f'Menganalisa {self.data_count} {self.topic}...'
+		logprint(f'Start consuming queue in {self.__class__.__name__}...')
+		self.set_progress(
+			value=0.0,
+			message=message_template,
+			show_percentage=True
+		)
+		while self.analyzing:
+			try:
+				if not queue.empty():
+					qmsg: QueueMessage = queue.get()
+					processed += qmsg.count
+					progress = processed/self.data_count
+					self.set_progress(
+						value=progress,
+						message=message_template,
+						show_percentage=True
+					)
+			except Exception:
+				break
+
+			# Important to define delay / sleep for better performance
+			time.sleep(0.001)
+
+		self.set_progress(
+			value=1.0,
+			message=f'Analisa {self.data_count} {self.topic} selesai. ({self.duration:.3f}s)'
+		)
+		logprint('Consuming queue completed. exit=0')
+
 	@property
-	def analyzed(self) -> bool:
-		return self._analyzed
+	def duration(self) -> float:
+		return self._duration
 
 
+class Availability:
 
-class AvailabilityNamespace:
-	config: Config
-	core: AvailabilityCore
-	# filewriter: BaseFileWriter
-	# statistics: Any
-	state: CalculationState
-	reports: Any
+	def __init__(self, config: Config, **kwargs):
+		self._duration: float = 0.0
+		self.config = config
+		self.core = self.init_core()
+		self.reader: FileReader = FileReader(self.core.model_class)
+		self.state: CalculationState = CalculationState()
+		self.sources: str = None
+		self.data: pd.DataFrame = None
+		self.result: AvailabilityResult = None
+		self._bind_state()
 
-	def __init__(self):
-		self.state = CalculationState()
-		self.soe: SOEData = None
+	def init_core(self) -> AvailabilityCore:
+		return AvailabilityCore(self.config)
 
-	def set_data(self, data: Union[SOEData, pd.DataFrame]):
+	def reset(self):
+		self._duration = 0.0
+		self.sources = None
+		self.data = None
+		self.result = None
+		self.core.reset()
+		self.reader.reset()
+		self.state.reset()
+
+	def _bind_state(self):
+		self.core.bind_to(self.state)
+		self.reader.bind_to(self.state)
+
+	def _get_filename_prefix(self) -> str:
+		return '_'.join(('Availability', self.__class__.__name__, self.config.master.title()))
+
+	async def _read_files(self, files: FileInput, sheet: str, **kwargs):
+		self.reader.set_file(files=files)
+		return await self.reader.async_load(sheet_name=sheet, **kwargs)
+
+	def read_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
+		return asyncio.run(self.async_read_file(files=files, sheet=sheet, **kwargs))
+
+	async def async_read_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
+		self.reader.change_data_models(self.core.model_class)
+		df = await self._read_files(files=files, sheet=sheet, **kwargs)
+		return self.post_read_file(df, **kwargs)
+
+	def read_soe_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
+		return asyncio.run(self.async_read_soe_file(files=files, sheet=sheet, **kwargs))
+
+	async def async_read_soe_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
+		if self.config.master=='spectrum':
+			self.reader.change_data_models(SOEModel)
+		elif self.config.master=='survalent':
+			self.reader.change_data_models(SurvalentSOEModel, SurvalentSPModel)
+		else:
+			raise ValueError(f'Invalid master selection "{self.config.master}"')
+
+		return await self._read_files(files=files, sheet=sheet, **kwargs)
+
+	def post_read_file(self, df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+		self.sources = self.reader.sources
+		return df
+
+	def read_database(self, **kwargs):
 		pass
 
-	def _init_filereader(self, *, files: FileInput, master: SCDMasterType) -> FileReader:
-		if master=='survalent':
-			return FileReader(SurvalentSOEModel, SurvalentSPModel, files=files)
-		elif master=='spectrum':
-			return FileReader(SOEModel, files=files)
+	def analyze_soe(self, soe: SOEData, **kwargs):
+		return asyncio.run(self.async_analyze_soe(soe=soe, **kwargs))
 
-	def read_spectrum(self, files: FileInput, **kwargs) -> pd.DataFrame:
-		reader = self._init_filereader(files=files, master='spectrum')
-		return reader.load()
-
-	def read_survalent(self, files: FileInput, **kwargs) -> pd.DataFrame:
-		reader = self._init_filereader(files=files, master='survalent')
-		return reader.load()
-
-	def read(self, engine: Union[FileReader], *args, **kwargs) -> pd.DataFrame:
+	def get_result(self, df: pd.DataFrame, start_date: Optional[DateSpec] = None, end_date: Optional[DateSpec] = None) -> AvailabilityData:
 		pass
 
-	def read_file(self, files: FileInput, **kwargs) -> pd.DataFrame:
-		pass
+	async def async_analyze_soe(self, soe: SOEData, **kwargs):
+		if not isinstance(soe, SOEData):
+			logprint(f'Invalid {type(soe)} type data passed to be analyzed in {self.__class__.__name__}', level='error')
+			return
 
-	def read_database(self, **kwargs) -> pd.DataFrame:
-		pass
-
-	@toggle_attr('state.analyzing', True, False)
-	def _do_analyze(self, *args, **kwargs):
-		return self.core.fast_analyze(*args, **kwargs)
-	
-	@toggle_attr('state.analyzing', True, False)
-	async def _do_async_analyze(self, *args, **kwargs):
-		return await self.core.async_analyze(*args, **kwargs)
+		self.core.set_data(soe)
+		df_av = await self.core.async_analyze(start_date=soe.date_min, end_date=soe.date_max, **kwargs)
+		self.data = df_av
+		self._duration = self.core.duration
+		self.sources = soe.sources
+		return df_av
 
 	@toggle_attr('state.calculating', True, False)
-	def calculate(
-		self,
-	):
-		self.state.analyzed = False
-		result = self._do_analyze()
-		self.state.analyzed = self.core.analyzed
+	def calculate(self, start_date: Optional[datetime.datetime] = None, end_date: Optional[datetime.datetime] = None, **kwargs) -> Optional[AvailabilityResult]:
+		log_callback = kwargs.pop('log_callback', None)
+		self.state.progress.update(value=0.0, message=f'Menghitung {self.core.subject}...')
+		time_start = time.perf_counter()
 
-	@toggle_attr('state.calculating', True, False)
-	async def async_calculate(
+		if isinstance(self.data, pd.DataFrame):
+			periods = '' if start_date is None else f' dalam periode {start_date.strftime("%d-%m-%y")} s/d {end_date.strftime("%d-%m-%y")}'
+			message = f'Menghitung {self.core.subject} dari {self.data.shape[0]} {self.core.topic}{periods}...'
+			logprint(message, level='info', cli=False, ext_func=log_callback, **params.INFOLOG_KWARGS)
+			result = self.get_result(self.data, start_date=start_date, end_date=end_date)
+		else:
+			result = None
+			logprint(f'Calculation can\'t be done due to invalid source data. {self.__class__.__name__}.data=None', level='warning')
+			logprint(f'Perhitungan {self.core.subject} tidak dapat dilakukan karena data invalid.', level='warning', cli=False, ext_func=log_callback, **params.WARNINGLOG_KWARGS)
+
+		delta_time = time.perf_counter() - time_start
+		if self.core.analyzed:
+			# Accumulate process duration
+			self._duration += delta_time
+			# Reset analyzed status
+			self.core.analyzed = False
+		else:
+			self._duration = delta_time
+
+		calculated = isinstance(result, AvailabilityResult)
+		self.result = result
+		self.state.calculated = calculated
+		if calculated:
+			message = f'Perhitungan {self.core.subject} selesai. ({self.duration:.2f}s)'
+			logprint(f'Calculation completed in {delta_time:.3f}s.', level='info')
+			logprint(message, level='info', cli=False, ext_func=log_callback, **params.SUCCESSLOG_KWARGS)
+		else:
+			message = f'Perhitungan {self.core.subject} error. ({self.duration:.2f}s)'
+			logprint(f'Calculation completed with error. ({delta_time:.3f}s)', level='info')
+			logprint(message, level='error', cli=False, ext_func=log_callback, **params.ERRORLOG_KWARGS)
+
+		self.state.progress.update(value=1.0, message=message)
+		return result
+
+	def get_properties(
 		self,
-	):
-		self.state.analyzed = False
-		result = await self._do_async_analyze()
-		self.state.analyzed = self.core.analyzed
+		title: Optional[str] = None,
+		subject: Optional[str] = None,
+		author: Optional[str] = None,
+		manager: Optional[str] = None,
+		company: Optional[str] = None,
+		category: Optional[str] = None,
+		comments: Optional[str] = None,
+	) -> FileProperties:
+		# Define file properties
+		return FileProperties(
+			title=title or 'Availability',
+			subject=subject or 'Availability',
+			author=author or 'SCADA',
+			manager=manager or 'Fasop',
+			company=company or 'PLN UP2B Sistem Makassar',
+			category=category or 'Excel Automation',
+			comments=comments or f'Dibuat otomatis menggunakan Python{settings.PY_VERSION} dan XlsxWriter'
+		)
+
+	def get_xlsheet(self, **infokwargs) -> Dict[str, SheetWrapper]:
+		return dict()
+
+	@toggle_attr('state.exporting', True, False)
+	def write_file(self, filename: Optional[str] = None, as_iobuffer: bool = False, **kwargs):
+		log_callback = kwargs.pop('log_callback', None)
+		self.state.progress.update(value=0.0, message=f'Memulai proses generate file...')
+		time_start = time.perf_counter()
+
+		prefix = self._get_filename_prefix()
+		# Create filename automatically if not defined
+		if not filename:
+			start_date = self.result.date_min.strftime("%Y%m%d")
+			stop_date = self.result.date_max.strftime("%Y%m%d")
+			date_specs = '{start_date}-{stop_date}'.format(start_date=start_date, stop_date=stop_date)
+			filename = '_'.join((prefix, 'Output', date_specs))
+
+		writer = FileWriter(
+			filename_prefix=prefix,
+			sheets=self.get_xlsheet(filename=filename),
+			properties=self.get_properties(),
+		)
+		self.writer = writer
+		result = writer.to_excel(filename=filename, as_iobuffer=as_iobuffer)
+		self.state.exported = isinstance(result, (str, BytesIO))
+		if isinstance(result, str):
+			self.state.last_exported_file = result
+
+		delta_time = time.perf_counter() - time_start
+		self.state.progress.update(value=1.0, message=f'Proses generate file selesai. ({delta_time:.2f}s)')
+		logprint(f'File availability {self.__class__.__name__} telah berhasil di-generate.', level='info', cli=False, ext_func=log_callback, **params.INFOLOG_KWARGS)
+		return result
+
+	@property
+	def duration(self) -> float:
+		return self._duration
+
