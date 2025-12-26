@@ -3,6 +3,7 @@
 from nicegui import ui, binding
 
 from availability import config, settings
+from availability import webgui		# must imported to initialize GUI
 
 
 binding.MAX_PROPAGATION_TIME = settings.MAX_PROPAGATION_TIME
