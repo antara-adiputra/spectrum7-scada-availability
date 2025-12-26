@@ -7,12 +7,12 @@ from nicegui.binding import bindable_dataclass
 
 from . import components
 from .components import Button, DialogPrompt, GUIAvailability, MenuSubtitle, MenuTitle, NavButton, NavDropdownButton, ObjectDebugger, RCDTabPanel, RTUTabPanel, UIColumn, UIRow, dialog_title_section
-from .event import EventChainsWithArgs, EventChainsWithoutArgs
-from .state import BindableProgress, BaseState, InterlockState, MenuState, State, toggle_attr
+from .event import EventChainsWithArgs, EventChainsWithoutArgs, consume
+from .state import BaseState, toggle_attr
 from .types import *
 from .. import config, settings, version
 from ..core import soe, rcd, rtu
-from ..lib import consume, instance_factory, rgetattr
+from ..lib import instance_factory, rgetattr
 
 
 CalcOutputGen: TypeAlias = Generator[float, dict, dict]		# (percentage, state, result)
@@ -371,10 +371,14 @@ class WebGUIv3(ui.card):
 		self.update_ui()
 		self.logger.push(logprint('Aplikasi running..', level='info', cli=False), classes='text-blue')
 
-	async def prompt_restart(self, e: events.ClickEventArguments) -> None:
+	def stop_services(self):
+		for panel in (self.panel_rcd, self.panel_rtu):
+			panel.av.state.stop_tracking()
+
+	async def prompt_restart(self) -> None:
 		self.dialog_prompt.set(
 			title='',
-			message='Restart application?',
+			message='Restart aplikasi?',
 			choices=['ya', 'tidak']
 		)
 		result = await self.dialog_prompt
@@ -384,17 +388,18 @@ class WebGUIv3(ui.card):
 			# Trigger changes on main.py and only affect if autoreload is True
 			os.utime('main.py')
 
-	async def prompt_shutdown(self, e: events.ClickEventArguments) -> None:
+	async def prompt_shutdown(self) -> None:
+		self.stop_services()
 		self.dialog_prompt.set(
 			title='',
-			message='Shutdown application?',
+			message='Matikan aplikasi?',
 			choices=['ya', 'tidak']
 		)
 		result = await self.dialog_prompt
 
 		if result=='ya':
 			self.clear()
-			with self: ui.label('Application stopped.').classes('w-full text-xl text-center')
+			with self: ui.label('Aplikasi terhenti.').classes('w-full text-xl text-center')
 			await asyncio.sleep(1)
 			app.shutdown()
 
@@ -430,8 +435,11 @@ class WebGUIv3(ui.card):
 
 @ui.page(path='/', title=settings.APP_TITLE)
 async def index():
+	async def shutdown():
+		webgui.stop_services()
+
 	webgui = WebGUIv3()
-	# ui.button('check')
+	app.on_shutdown(shutdown)
 
 @ui.page('/docs', title=f'(Docs) {settings.APP_TITLE}')
 def view_documentation():
