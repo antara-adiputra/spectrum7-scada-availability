@@ -1,175 +1,31 @@
-import asyncio, datetime, os, time
-from dataclasses import dataclass, field
+import asyncio, datetime, os
 from functools import partial
 
 from nicegui import app, binding, events, ui
 from nicegui.binding import bindable_dataclass
 
-from . import components
-from .components import Button, DialogPrompt, GUIAvailability, MenuSubtitle, MenuTitle, NavButton, NavDropdownButton, ObjectDebugger, RCDTabPanel, RTUTabPanel, UIColumn, UIRow, dialog_title_section
+from .components import Button, DialogPrompt, GUIAvailability, NavButton, NavDropdownButton, ObjectDebugger, RCDTabPanel, RTUTabPanel, UIColumn, UIRow, dialog_title_section
 from .event import EventChainsWithArgs, EventChainsWithoutArgs, consume
 from .state import BaseState, toggle_attr
 from .types import *
 from .. import config, settings, version
 from ..core import soe, rcd, rtu
-from ..lib import instance_factory, rgetattr
+from ..lib import rgetattr
 
 
 CalcOutputGen: TypeAlias = Generator[float, dict, dict]		# (percentage, state, result)
 
-AVRCD_PARAMS: List[str] = ['calculate_bi', 'check_repetition', 'success_mark', 'failed_mark', 'unused_mark', 'reduction_ratio_threshold']
-AVRTU_PARAMS: List[str] = ['maintenance_mark', 'link_failure_mark', 'rtu_failure_mark', 'other_failure_mark', 'downtime_rules']
-AVRCD_MENU: list[dict[str, Any]] = [
-	{
-		'id': 'ofdb',
-		'label': 'Dari DB Offline',
-		'description': 'Menganalisa dan melakukan perhitungan availability RCD menggunakan data dari database Offline.',
-		'component': 'OfdbProcessor',
-		'component_kwargs': {
-			# 'instance': partial(RCDFromOFDB),
-			'auto_next': False,
-		}
-	},
-	{
-		'id': 'spectrum',
-		'label': 'Dari File SOE (Spectrum)',
-		'description': 'Menganalisa dan melakukan perhitungan availability RCD dari file SOE Spectrum.',
-		'component': 'FileProcessor',
-		'component_kwargs': {
-			# 'instance': partial(instance_factory, RCDFromFile, **config.get_config(*AVRCD_PARAMS)),
-			'auto_next': False,
-		}
-	},
-	{
-		'id': 'survalent',
-		'label': 'Dari File SOE (Survalent)',
-		'description': 'Menganalisa dan melakukan perhitungan availability RCD dari file SOE Survalent.',
-		'component': 'FileProcessor',
-		'component_kwargs': {
-			# 'instance': partial(instance_factory, RCDFromFile2, **config.get_config(*AVRCD_PARAMS)),
-			'auto_next': False,
-		}
-	},
-	{
-		'id': 'accumulative',
-		'label': 'Rangkum File Availability',
-		'description': 'Menghitung akumulasi availability RCD dari beberapa file availability RCD.',
-		'component': 'FileProcessor',
-		'component_kwargs': {
-			# 'instance': partial(instance_factory, RCDCollective, **config.get_config(*AVRCD_PARAMS)),
-			'auto_next': False,
-		}
-	}
-]
-AVRTU_MENU: list[dict[str, Any]] = [
-	{
-		'id': 'ofdb',
-		'label': 'Dari DB Offline',
-		'description': 'Menganalisa dan melakukan perhitungan availability Link & Remote Station menggunakan data dari database Offline.',
-		'component': 'OfdbProcessor',
-		'component_kwargs': {
-			'instance': partial(instance_factory, Any),
-			'auto_next': False,
-		}
-	},
-	{
-		'id': 'spectrum',
-		'label': 'Dari File SOE (Spectrum)',
-		'description': 'Menganalisa dan melakukan perhitungan availability Link & Remote Station dari file SOE Spectrum.',
-		'component': 'FileProcessor',
-		'component_kwargs': {
-			'instance': partial(instance_factory, Any, **config.get_config(*AVRTU_PARAMS)),
-			'auto_next': False,
-		}
-	},
-	{
-		'id': 'accumulative',
-		'label': 'Rangkum File Availability',
-		'description': 'Menghitung akumulasi availability Link & Remote Station dari beberapa file availability Remote Station.',
-		'component': 'FileProcessor',
-		'component_kwargs': {
-			'instance': partial(instance_factory, Any, **config.get_config(*AVRTU_PARAMS)),
-			'auto_next': False,
-		}
-	}
-]
-SETTINGS_MENU: list[dict[str, Any]] = [
-	{
-		'id': 'basic_conf',
-		'label': 'General',
-		'description': '',
-		'component': 'GeneralSettingMenu',
-		'component_kwargs': {}
-	},
-	{
-		'id': 'ofdb_conf',
-		'label': 'DB Offline',
-		'description': '',
-		'component': 'OfdbSettingMenu',
-		'component_kwargs': {}
-	},
-	{
-		'id': 'avrcd_conf',
-		'label': 'Perhitungan RCD',
-		'description': '',
-		'component': 'RCDSettingMenu',
-		'component_kwargs': {}
-	},
-	{
-		'id': 'avrs_conf',
-		'label': 'Perhitungan AVRS',
-		'description': '',
-		'component': 'AVRSSettingMenu',
-		'component_kwargs': {}
-	}
-]
-MAIN_MENU: list[dict[str, Any]] = [
-	{
-		'id': 'avrcd',
-		'label': 'Remote Control',
-		'description': 'Perhitungan Keberhasilan Remote Control (RCD) SCADA',
-		'submenu': AVRCD_MENU
-	},
-	{
-		'id': 'avrs',
-		'label': 'Remote Station',
-		'description': 'Perhitungan Availability Remote Station (RTU) SCADA',
-		'submenu': AVRTU_MENU
-	},
-	{
-		'id': 'setting',
-		'label': 'Pengaturan',
-		'description': '',
-		'submenu': SETTINGS_MENU
-	}
-]
 ABOUT = f"""**{settings.APP_TITLE}**
 
-	Version		: {version.__version__}
-	Company		: Fasop UP2B Sistem Makassar
-	Contributor	: Putu Agus Antara A.
+	\tVersi		: {version.__version__}
+	\tPerusahaan	: Fasop UP2B Sistem Makassar
+	\tKreator		: Putu Agus Antara A.
 
-This project is _open source_ and free to use for testing serial link purpose in various applications.\n
-Read our documentation [here](/docs) or check our source code [here](https://github.com/antara-adiputra/spectrum7-scada-availability).
+\nAplikasi ini tercipta didorong oleh rasa bosan dan penat karena melakukan _crosscheck_ berbagai sumber data secara berulang untuk memperoleh nilai kinerja _availability_ (keberhasilan) RCD di lingkungan PLN UP2B Sistem Makassar. Dengan bermodalkan hobi, serta ambisi untuk memudahkan pekerjaan perhitungan maupun rekapitulasi oleh siapapun penggunanya, maka dibuatlah {settings.APP_TITLE}.
+\nAplikasi ini berbasis **Python** dan seluruhnya dibangun menggunakan library _open source_, sehingga siapapun yang ingin mengembangkan fitur-fitur di dalamnya bebas untuk berkontribusi.
+\nBaca dokumentasi [disini](/docs), atau jika tertarik dengan sistem di dalamnya bisa mengunjungi [repositori](https://github.com/antara-adiputra/spectrum7-scada-availability) kami.
 """
 
-
-####################################################################################################
-# NEW DEVELOPED CODE
-####################################################################################################
-
-soe_survalent = [
-	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/SOE_Survalent/EVENT_RC-2025_08.XLSX',
-	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/SOE_Survalent/2025_09_Event_Log_Summary.xlsx',
-	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/10/2025_10_Event_RC_Summary.xlsx',
-	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/2025_11_Event_Log_Summary.xlsx'
-]
-sts_survalent = [
-	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/SOE_Survalent/EVENT_RS-2025_08.xlsx',
-	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/SOE_Survalent/2025_09_Status_Point_SUMMARY.xlsx',
-	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/10/2025_10_AV_RS_SUMMARY.xlsx',
-	'/media/shared-ntfs/2-fasop-kendari/Laporan_EOB/2025/11/2025_11_AV_RS_SUMMARY.xlsx'
-]
 
 @bindable_dataclass
 class GUIState(BaseState):
@@ -214,7 +70,7 @@ class WebGUIv3(ui.card):
 			ui.label('About').classes('text-lg text-bold text-center')
 			ui.separator()
 			with UIColumn(css_padding='p-1'):
-				ui.markdown(content=ABOUT)
+				ui.markdown(content=ABOUT).classes('text-justify')
 				ui.separator()
 				with UIRow():
 					ui.space()
@@ -369,7 +225,7 @@ class WebGUIv3(ui.card):
 		debug = self.debug_view()
 		Button(icon='open_in_full', on_click=debug.open).props('dense size=xs').classes('absolute top-1.5 right-1.5')
 		self.update_ui()
-		self.logger.push(logprint('Aplikasi running..', level='info', cli=False), classes='text-blue')
+		self.logger.push(logprint('Aplikasi start..', level='info', cli=False), classes='text-blue')
 
 	def stop_services(self):
 		for panel in (self.panel_rcd, self.panel_rtu):
