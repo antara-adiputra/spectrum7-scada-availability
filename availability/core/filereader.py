@@ -148,6 +148,7 @@ class FileReader(BaseWithProgress):
 				if df is None:
 					status = 1
 					logprint(f'None data in file "{file}" has valid schema', level='warning')
+					logprint(f'Open "{file}" FAILED', level='error')
 
 		except ValueError as err:
 			logprint(', '.join(err.args), level='error')
@@ -158,6 +159,7 @@ class FileReader(BaseWithProgress):
 				validate(dfxml)
 				if df is None:
 					status = 1
+					logprint(f'Open "{file}" FAILED', level='error')
 
 			except (ValueError, ImportError):
 				status = 2
