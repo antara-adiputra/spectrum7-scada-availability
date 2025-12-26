@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from functools import partial
 from queue import Queue
 
-import numpy as np
 import pandas as pd
 
 from .base import BaseWithProgress, CalculationState, Config, DataModel, DataTable, SerializableException, frozen_dataclass_set
