@@ -10,7 +10,6 @@ from .filewriter import SheetInfo, SheetSOE, SheetWrapper, xl_hyperlink_to_range
 from .main import Availability, AvailabilityCore, AvailabilityData, AvailabilityResult, QueueMessage
 from .soe import SOEData
 from ..lib import join_datetime, logprint, toggle_attr, try_remove
-from ..test import *
 from ..types import *
 from .. import config, settings
 
@@ -940,31 +939,3 @@ class RTU(Availability):
 	def get_properties(self) -> Dict[str, str]:
 		return super().get_properties(title='Availability Remote Station & Link')
 
-
-# def av_analyze_file(**params):
-# 	handler = AVRSFromFile
-# 	filepaths = 'sample/sample_rtu*.xlsx'
-# 	title = 'RTU'
-# 	return test_analyze(handler, title=title, filepaths=filepaths)
-
-# def av_collective(**params):
-# 	handler = AVRSCollective
-# 	filepaths = 'sample/sample_rtu*.xlsx'
-# 	title = 'RTU'
-# 	return test_collective(handler, title=title, filepaths=filepaths)
-
-
-# if __name__=='__main__':
-# 	test_list = [
-# 		('Test analisa file SOE Spectrum', av_analyze_file),
-# 		('Test menggabungkan file', av_collective)
-# 	]
-# 	ans = input('Confirm troubleshooting? [y/n]  ')
-# 	if ans=='y':
-# 		print('\r\n'.join([f'  {no+1}.'.ljust(6) + tst[0] for no, tst in enumerate(test_list)]))
-# 		choice = int(input(f'\r\nPilih modul test [1-{len(test_list)}] :  ')) - 1
-# 		if choice in range(len(test_list)):
-# 			print()
-# 			test = test_list[choice][1]()
-# 		else:
-# 			print('Pilihan tidak valid!')

@@ -12,7 +12,6 @@ from .main import Availability, AvailabilityCore, AvailabilityData, Availability
 from .soe import SOEData
 from . import params
 from ..lib import get_datetime, get_execution_duration, get_termination_duration, get_rtu_timestamp, get_system_timestamp, join_datetime, logprint, toggle_attr, try_remove
-from ..test import *
 from ..types import *
 from .. import settings
 
@@ -1778,66 +1777,3 @@ class RCD(Availability):
 	def get_properties(self) -> Dict[str, str]:
 		return super().get_properties(title='Keberhasilan Remote Control SCADA')
 
-
-def summary_template(**kwargs):
-	width = kwargs.get('width', 40) - 1
-	return f"""
-{'='*width}
-Rangkuman RC {kwargs.get('element')} tanggal {kwargs.get('date_start')} s/d {kwargs.get('date_end')}
-{'='*width}
-- Jumlah RC	: {kwargs.get('rc_total')}
-- RC Sukses	: {kwargs.get('rc_percentage')}
-
-
-> TOP {kwargs.get('df_gi_count')} GI DENGAN RASIO SUKSES TERENDAH
-{'-'*width}
-{kwargs.get('df_gi')}
-
-
-> TOP {kwargs.get('df_bay_count')} BAY DENGAN RASIO SUKSES TERENDAH
-{'-'*width}
-{kwargs.get('df_bay')}
-
-
-> TOP {kwargs.get('df_dispa_count')} DISPATCHER DENGAN RASIO SUKSES TERENDAH
-{'-'*width}
-{kwargs.get('df_dispa')}
-
-"""
-
-
-# def rc_analyze_file(**params):
-# 	handler = RCDFromFile
-# 	filepaths = 'sample/sample_rcd*.xlsx'
-# 	title = 'RCD'
-# 	return test_analyze(handler, title=title, filepaths=filepaths)
-
-# def rc_analyze_file2(**params):
-# 	handler = RCDFromFile2
-# 	filepaths = 'sample/survalent/sample_soe*.XLSX'
-# 	title = 'RCD'
-# 	master = 'Survalent'
-# 	return test_analyze(handler, title=title, filepaths=filepaths, master=master)
-
-# def rc_collective(**params):
-# 	handler = RCDCollective
-# 	filepaths = 'sample/sample_rcd*.xlsx'
-# 	title = 'RCD'
-# 	return test_collective(handler, title=title, filepaths=filepaths)
-
-
-if __name__=='__main__':
-	test_list = [
-		# ('Test analisa file SOE Spectrum', rc_analyze_file),
-		# ('Test analisa file SOE Survalent', rc_analyze_file2),
-		# ('Test menggabungkan file', rc_collective)
-	]
-	ans = input('Confirm troubleshooting? [y/n]  ')
-	if ans=='y':
-		print('\r\n'.join([f'  {no+1}.'.ljust(6) + tst[0] for no, tst in enumerate(test_list)]))
-		choice = int(input(f'\r\nPilih modul test [1-{len(test_list)}] :  ')) - 1
-		if choice in range(len(test_list)):
-			print()
-			test = test_list[choice][1]()
-		else:
-			print('Pilihan tidak valid!')
