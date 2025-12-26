@@ -1,12 +1,10 @@
 import asyncio, calendar, datetime, functools, os, re, time, warnings
 import inspect
-from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from difflib import SequenceMatcher, get_close_matches
 from functools import partial
 from glob import glob
 from io import BytesIO
-from itertools import islice
 from types import MappingProxyType
 
 import pandas as pd
@@ -98,15 +96,6 @@ def add_months(date: Union[datetime.date, datetime.datetime], n: int) -> Union[d
 
 def instance_factory(cls, *initargs, **initkwargs) -> object:
 	return cls(*initargs, **initkwargs)
-
-def consume(iterator: Iterable, n: int | None = None) -> None:
-	"Advance the iterator n-steps ahead. If n is None, consume entirely."
-	# Use functions that consume iterators at C speed.
-	# For more information, https://docs.python.org/3/library/itertools.html#itertools-recipes
-	if n is None:
-		deque(iterator, maxlen=0)
-	else:
-		next(islice(iterator, n, n), None)
 
 def get_ifs_name(list1: list, list2: list) -> dict:
 	"""Get IFS name pair based on name similarity in list1 & list2."""
