@@ -41,9 +41,9 @@ APP_TITLE: str = 'Aplikasi Availability SCADA'
 VIEWPORT: str = 'width=device-width, initial-scale=1'
 FAVICON: Optional[str] = None
 
+DEBUG: bool = False
 AUTO_SHOW: bool = True
-AUTO_RELOAD: bool = True
-DEBUG: bool = True
+AUTO_RELOAD: bool = False
 
 ON_AIR: bool = False
 ENDPOINT_DOCUMENTATION: Literal['none', 'internal', 'page', 'all'] = 'none'
