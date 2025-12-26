@@ -1,7 +1,19 @@
+from collections import deque
+from itertools import islice
+
 from nicegui import events
 
 from .types import *
-from ..lib import consume
+
+
+def consume(iterator: Iterable, n: int | None = None) -> None:
+	"Advance the iterator n-steps ahead. If n is None, consume entirely."
+	# Use functions that consume iterators at C speed.
+	# For more information, https://docs.python.org/3/library/itertools.html#itertools-recipes
+	if n is None:
+		deque(iterator, maxlen=0)
+	else:
+		next(islice(iterator, n, n), None)
 
 
 class _EventChains:
