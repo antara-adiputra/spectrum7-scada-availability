@@ -141,10 +141,10 @@ class ObjectDebugger(ui.expansion):
 
 ui_item = ui.item.default_style('padding: 2px 8px;')
 ui_section = ui.item_section.default_classes('align-stretch')
-ui_select = ui.select.default_props('dense outlined square stack-label options-dense')
 ui_input = ui.input.default_props('dense outlined square stack-label')
 ui_menu_label = ui.item_label.default_classes('text-md')
-btn_dialog_ctrl = ui.button.default_props('dense').default_classes('min-w-16')
+Select = type('Select', (ui.select,), {}).default_props('dense outlined square stack-label options-dense')
+ButtonDialogControl = type('ButtonDialogControl', (ui.button,), {}).default_props('dense').default_classes('min-w-16')
 
 def get_css_class(*style, **kwstyle) -> str:
 	cls = list(style)
@@ -320,11 +320,11 @@ class DialogPrompt(ui.dialog):
 			if isinstance(self.state.choices, list):
 				for ch in self.state.choices:
 					fn_click = partial(self.submit, ch)
-					btn_dialog_ctrl(ch.title(), on_click=fn_click).props('no-caps')
+					ButtonDialogControl(ch.title(), on_click=fn_click).props('no-caps')
 			elif isinstance(self.state.choices, dict):
 				for val, text in self.state.choices.items():
 					fn_click = partial(self.submit, val)
-					btn_dialog_ctrl(text, on_click=fn_click).props('no-caps')
+					ButtonDialogControl(text, on_click=fn_click).props('no-caps')
 
 	def set(self, **params):
 		self.state.set(**params)
@@ -641,8 +641,8 @@ class AvProxy:
 			ui.separator()
 			with UIRow(gap=2).classes('px-4'):
 				ui.space()
-				btn_dialog_ctrl('Batal', color='yellow', on_click=EventChainsWithoutArgs((dialog.close, self.event_cancel_changes))).props('text-color=black')
-				btn_dialog_ctrl('Simpan', color='secondary', on_click=dialog.close)
+				ButtonDialogControl('Batal', color='yellow', on_click=EventChainsWithoutArgs((dialog.close, self.event_cancel_changes))).props('text-color=black')
+				ButtonDialogControl('Simpan', color='secondary', on_click=dialog.close)
 
 		return dialog
 
@@ -749,7 +749,7 @@ class GUIAvailability(ui.tab_panel):
 				with ui_section():
 					ui_menu_label('Data Input')
 				with ui_section():
-					self.select_input = ui_select(options=options, on_change=self.event_input_source_changed)\
+					self.select_input = Select(options=options, on_change=self.event_input_source_changed)\
 						.bind_value_from(self.src, 'source')\
 						.bind_enabled_from(self.iloc, 'enable_change_input')\
 						.classes('w-full')
@@ -789,7 +789,7 @@ class GUIAvailability(ui.tab_panel):
 					with UIRow(overflow='visible')\
 						.bind_visibility_from(self.src, 'category', value='database')\
 						.classes('w-full'):
-						self.button_checkdb = Button('Cek Koneksi')\
+						self.button_checkdb = Button('Cek Koneksi', on_click=lambda: ui.notify('Untuk saat ini, fitur ini belum dapat digunakan', type='ongoing'))\
 							.bind_enabled_from(self.src, 'category')\
 							.props('dense')\
 							.classes('px-2')
@@ -824,8 +824,8 @@ class GUIAvailability(ui.tab_panel):
 			ui.separator()
 			with UIRow(gap=2).classes('w-full'):
 				ui.space()
-				btn_dialog_ctrl('Batal', on_click=dialog.close).props('color=white text-color=black')
-				btn_dialog_ctrl('Simpan', on_click=dialog.close).props('color=secondary')
+				ButtonDialogControl('Batal', on_click=dialog.close).props('color=white text-color=black')
+				ButtonDialogControl('Simpan', on_click=dialog.close).props('color=secondary')
 
 		return dialog
 
@@ -836,7 +836,7 @@ class GUIAvailability(ui.tab_panel):
 			ui.separator()
 			with UIRow(gap=2).classes('px-4'):
 				ui.space()
-				btn_dialog_ctrl('Tutup', on_click=dialog.close)
+				ButtonDialogControl('Tutup', on_click=dialog.close)
 
 		return dialog
 
@@ -1210,7 +1210,7 @@ class RTUProxy(AvProxy):
 				with ui_section():
 					ui_menu_label('List RTU')
 				with ui_section():
-					ui_select(options=['', *config.RTU_NAMES_CONFIG.keys()])\
+					Select(options=['', *config.RTU_NAMES_CONFIG.keys()])\
 						.bind_value(self.config, 'rtu_file_name', strict=True)\
 						.props('dense')
 			with ui_item():
