@@ -1040,7 +1040,7 @@ class GUIAvailability(ui.tab_panel):
 
 	@toggle_attr('state.progress_visible', True, False)
 	async def generate_file(self):
-		filename = f'temp/{datetime.datetime.timestamp(datetime.datetime.now()):.0f}_availability_{self.av.object.__class__.__name__.lower()}_{self.av.object.result.date_min.strftime("%y%m%d")}-{self.av.object.result.date_max.strftime("%y%m%d")}'
+		filename = f'temp/{datetime.datetime.timestamp(datetime.datetime.now()):.0f}_availability_{self.av.object.__class__.__name__.lower()}_{self.av.object.result.date_min.strftime("%Y%m%d")}-{self.av.object.result.date_max.strftime("%Y%m%d")}'
 		file = self.av.object.write_file(filename=filename, log_callback=self.logger.push)
 		ui.notify('Generate file SUKSES', type='positive')
 
@@ -1048,7 +1048,7 @@ class GUIAvailability(ui.tab_panel):
 		if not self.av.state.exported or self.state.force_regeneration:
 			await self.generate_file()
 
-		dateparm = f'{self.dater.start.strftime("%y%m%d")}-{self.dater.end.strftime("%y%m%d")}'
+		dateparm = f'{self.dater.start.strftime("%Y%m%d")}-{self.dater.end.strftime("%Y%m%d")}'
 		download_file = f'Availability_{self.av.object.__class__.__name__}_{dateparm}.xlsx'
 		ui.download.file(self.av.object.state.last_exported_file, download_file)
 		self.logger.push(logprint(f'File {download_file} berhasil diunduh.', level='info', cli=False), **params.SUCCESSLOG_KWARGS)
