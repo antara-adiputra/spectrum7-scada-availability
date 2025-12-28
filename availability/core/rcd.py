@@ -1707,9 +1707,8 @@ class RCD(Availability):
 		columns = df.columns.tolist()
 		# Remove navigation column, not used in cummulative loads
 		try_remove(columns, 'navigation')
-		if self.config.master=='survalent':
-			try_remove(columns, 'order_iloc')
-			try_remove(columns, 'feedback_iloc')
+		try_remove(columns, 'order_iloc')
+		try_remove(columns, 'feedback_iloc')
 
 		# Exclude footer data
 		df_rc = df[~(df['order_time'].isna()) & ~(df['feedback_time'].isna())]
@@ -1725,13 +1724,13 @@ class RCD(Availability):
 		filename = infokwargs.get('filename', '<undefined>')
 
 		if isinstance(self.core.data, SOEData):
-			sheet1 = SheetSOE('HIS_MESSAGES', data=self.core.data.his, master=self.config.master)
+			sheet1 = SheetSOE('HIS_MESSAGES', data=self.core.data.his)
 			sheets.append(sheet1)
 
-		sheet2 = SheetRCOnly('RC_ONLY', data=self.result.data.all, master=self.config.master)
-		sheet3 = SheetStation('GI', data=self.result.data.station, master=self.config.master)
-		sheet4 = SheetBay('BAY', data=self.result.data.bay, master=self.config.master)
-		sheet5 = SheetOperator('DISPATCHER', data=self.result.data.operator, master=self.config.master)
+		sheet2 = SheetRCOnly('RC_ONLY', data=self.result.data.all)
+		sheet3 = SheetStation('GI', data=self.result.data.station)
+		sheet4 = SheetBay('BAY', data=self.result.data.bay)
+		sheet5 = SheetOperator('DISPATCHER', data=self.result.data.operator)
 		sheet6 = SheetInfo(
 			'Info',
 			info_data=[

@@ -906,11 +906,11 @@ class RTU(Availability):
 
 		# Add sheet HIS_MESSAGES if any
 		if isinstance(self.core.data, SOEData):
-			sheet1 = SheetSOE('HIS_MESSAGES', data=self.core.data.his, master=self.config.master)
+			sheet1 = SheetSOE('HIS_MESSAGES', data=self.core.data.his)
 			sheets.append(sheet1)
 
-		sheet2 = SheetDowntime('DOWNTIME', data=self.result.data.all, master=self.config.master)
-		sheet3 = SheetAvailability('AVAILABILITY', data=self.result.data.availability, master=self.config.master)
+		sheet2 = SheetDowntime('DOWNTIME', data=self.result.data.all)
+		sheet3 = SheetAvailability('AVAILABILITY', data=self.result.data.availability)
 		sheet4 = SheetInfo(
 			'Info',
 			info_data=[
