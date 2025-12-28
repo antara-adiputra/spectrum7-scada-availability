@@ -59,7 +59,6 @@ class AvailabilityCore(BaseWithProgress):
 
 	def __init__(self, config: Config, data: Optional[SOEData] = None, **kwargs):
 		super().__init__(**kwargs)
-		self._oridata: SOEData = None
 		self.config = config
 		self.reset()
 		self.set_data(data)
@@ -70,16 +69,13 @@ class AvailabilityCore(BaseWithProgress):
 		self.analyzing: bool = False
 		self.key_items: List[AvKeys] = list()
 		self.data_count: int = 0
-		if isinstance(self._oridata, SOEData):
-			self.data = self._oridata.copy()
+		self.data: SOEData = None
 
 	def set_data(self, data: SOEData):
 		"""Set data source to analyze."""
 		if isinstance(data, SOEData):
-			self._oridata = data.copy()
 			self.data = data
 		else:
-			self._oridata = None
 			self.data = None
 			if not data is None:
 				# Warn user about inappropriate data source
