@@ -464,7 +464,7 @@ class Availability:
 		time_start = time.perf_counter()
 
 		if isinstance(self.data, pd.DataFrame):
-			periods = '' if start_date is None else f' dalam periode {start_date.strftime("%d-%m-%y")} s/d {end_date.strftime("%d-%m-%y")}'
+			periods = '' if start_date is None else f' dalam periode {start_date.strftime("%d-%m-%Y")} s/d {end_date.strftime("%d-%m-%Y")}'
 			message = f'Menghitung {self.core.subject} dari {self.data.shape[0]} {self.core.topic}{periods}...'
 			logprint(message, level='info', cli=False, ext_func=log_callback, **params.INFOLOG_KWARGS)
 			result = self.get_result(self.data, start_date=start_date, end_date=end_date)

@@ -538,19 +538,19 @@ class DateSetupState(BaseState):
 
 	def set_year(self, value: int):
 		self.year = value
-		if self.month in range(1, 13):
+		if self.period=='monthly' and self.month in range(1, 13):
 			self.start = datetime.date(year=value, month=self.month, day=1)
 			self.end = datetime.date(year=value, month=self.month, day=calendar.monthrange(value, self.month)[1])
 
 	def set_month(self, value: int):
 		self.month = value
-		if value in range(1, 13):
+		if self.period=='monthly' and value in range(1, 13):
 			self.start = datetime.date(year=self.year, month=value, day=1)
 			self.end = datetime.date(year=self.year, month=value, day=calendar.monthrange(self.year, value)[1])
 
 	def set_start_date(self, value: datetime.date):
 		self.start = value
-		if isinstance(value, datetime.date) and isinstance(self.end, datetime.date):
+		if self.period=='specific' and isinstance(value, datetime.date) and isinstance(self.end, datetime.date):
 			if value.year==self.end.year:
 				self.year = value.year
 
@@ -561,7 +561,7 @@ class DateSetupState(BaseState):
 
 	def set_end_date(self, value: datetime.date):
 		self.end = value
-		if isinstance(value, datetime.date) and isinstance(self.start, datetime.date):
+		if self.period=='specific' and isinstance(value, datetime.date) and isinstance(self.start, datetime.date):
 			if value.year==self.start.year:
 				self.year = value.year
 
@@ -721,7 +721,7 @@ class GUIAvailability(ui.tab_panel):
 					Button('', icon='edit_calendar', color='secondary', on_click=self.dialog_dater.open)\
 						.props('outline dense')\
 						.tooltip('Ubah periode waktu')
-					Button('', icon='preview', color='secondary')\
+					Button('', icon='preview', color='secondary', on_click=lambda: ui.notify('Sedang dalam pengembangan :)'))\
 						.bind_enabled_from(self.iloc, 'enable_download')\
 						.props('outline dense')\
 						.tooltip('Lihat data')
@@ -849,10 +849,10 @@ class GUIAvailability(ui.tab_panel):
 					.bind_enabled_from(self.src, 'source')\
 					.props('inline')
 			with UIRow().bind_visibility_from(self.dater, 'period', value='monthly'):
-				ui.select(options={-1: '--------', **MONTH_OPTIONS}, on_change=self.event_date_month_changed)\
+				Select(options={-1: '--------', **MONTH_OPTIONS}, on_change=self.event_date_month_changed)\
 					.bind_value_from(self.dater, 'month')\
 					.classes('w-40')
-				ui.select(options=[self.dater.year - x for x in range(3)], on_change=self.event_date_year_changed)\
+				Select(options=[self.dater.year - x for x in range(3)], on_change=self.event_date_year_changed)\
 					.bind_value_from(self.dater, 'year')
 			with UIRow().bind_visibility_from(self.dater, 'period', value='specific'):
 				ui.checkbox('Dari')\
@@ -997,6 +997,7 @@ class GUIAvailability(ui.tab_panel):
 
 		await asyncio.sleep(1)
 		self.button_calculate.props(remove='loading')
+		self.state.result_visible = True
 
 	async def do_read_file(self):
 		if self.src.source not in ('soe', 'rcd', 'rtu'):
