@@ -166,7 +166,7 @@ cython_debug/
 .nicegui
 .setting
 cpoint*.xlsx
-config.json
+config.*
 output/
 sample/
 *.bak
