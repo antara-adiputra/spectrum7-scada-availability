@@ -1,13 +1,15 @@
 import datetime
-from dataclasses import Field, InitVar, dataclass, field, fields, is_dataclass
+from dataclasses import Field, InitVar, asdict, dataclass, field, fields, is_dataclass
 from functools import partial
 from typing_extensions import Required
+import yaml
 
 import pandas as pd
 
 from .excel import XlsxFormat
 from ..lib import immutable_dict, logprint
 from ..types import *
+from .. import config
 
 
 T = TypeVar('T')
@@ -124,6 +126,47 @@ class State:
 class Config(State):
 	"""Base class for avaiability calculation configuration."""
 	master: SCDMasterType = 'spectrum'
+
+	def export(self, **kwargs) -> Dict[str, Any]:
+		dumped = dict()
+		excluded = kwargs.get('exclude', list())
+		for field in fields(self):
+			if field.name.startswith('__'):
+				continue
+
+			key = field.name
+			if key in excluded or field.name in excluded:
+				continue
+
+			dumped[key] = getattr(self, field.name)
+
+		return dumped
+
+	def validate(self, **kwargs) -> Dict[str, Any]:
+		return kwargs
+
+	def save(self, section: str = None):
+		file = 'config.yaml'
+		cfg = config.try_load_file_config()
+		data = dict() if cfg is None else cfg
+		if section is None:
+			data.update(self.export())
+		else:
+			data[section] = self.export()
+
+		yaml.safe_dump(data, open(file, 'w'))
+		logprint(f'Configuration has been saved in memory', level='info')
+
+	def reload(self, section: str, as_new: bool = True):
+		cfg = config.try_load_file_config()
+		if isinstance(cfg, dict):
+			data = cfg.get(section)
+			if isinstance(data, dict):
+				valid = self.validate(**data)
+				if as_new:
+					return self.__class__(**valid)
+				else:
+					self.set(**valid)
 
 
 class BaseClass:

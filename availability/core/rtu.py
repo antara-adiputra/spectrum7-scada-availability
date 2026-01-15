@@ -15,6 +15,12 @@ from .. import config, settings
 
 
 xlf = XlsxFormula()
+DOWNTIME_RULES: List[Tuple[str, int]] = [
+	['Critical', 72],
+	['Major', 24],
+	['Intermediate', 8],
+	['Minor', 3]
+]
 
 
 @dataclass
@@ -311,20 +317,36 @@ class DowntimeRules:
 
 	def __init__(self, value: Optional[List[Union[_DowntimeCategory, Tuple, List]]] = None):
 		if value is None:
-			value = config.DOWNTIME_RULES
-			logprint('Using default downtime rules.', level='info')
+			value = DOWNTIME_RULES
+			# logprint('Using default downtime rules.', level='info')
 
+		self._init_value(value)
+
+	def __iter__(self):
+		for value in self._value:
+			yield value
+
+	def _init_value(self, value: List[Union[_DowntimeCategory, Tuple, List]]):
+		self._value: List[_DowntimeCategory] = list()
 		if all(map(lambda r: isinstance(r, _DowntimeCategory), value)):
-			self._value = value
+			self._value.extend(value)
 		elif all(map(lambda r: isinstance(r, (tuple, list)), value)):
-			self._value = list(map(lambda cat: _DowntimeCategory(name=cat[0], threshold=datetime.timedelta(hours=cat[1])), value))
-		else:
-			self._value = list()
+			for rule in value:
+				try:
+					if rule[0] and int(rule[1])>0:
+						self._value.append(
+							_DowntimeCategory(name=rule[0], threshold=datetime.timedelta(hours=rule[1]))
+						)
+				except (ValueError, IndexError):
+					pass
 
 		self.sort(desc=True)
 
 	def sort(self, desc: bool = False):
 		self._value = sorted(self._value, key=lambda rule: rule.threshold, reverse=desc)
+
+	def change_rules(self, rules: List[Union[_DowntimeCategory, Tuple, List]]):
+		self._init_value(value=rules)
 
 	def categorize(self, value: Union[datetime.timedelta, int, float]) -> Optional[_DowntimeCategory]:
 		"""Get up/down category from rules."""
@@ -343,9 +365,13 @@ class DowntimeRules:
 
 		return result
 
+	def to_list(self) -> List[Dict[str, int]]:
+		return [{rule.name: int(rule.threshold.total_seconds()//3600)} for rule in self._value]
 
-def default_downtime_rules():
-	return DowntimeRules(config.DOWNTIME_RULES)
+	@classmethod
+	def from_list(cls, value: List[Dict[str, int]]) -> Self:
+		data = [_DowntimeCategory(key, val) for d in value for key, val in d.items()]
+		return cls(data)
 
 
 @dataclass
@@ -361,7 +387,7 @@ class RTUConfig(Config):
 		rtu_failure_mark : string used to mark event as RTU failure
 		other_failure_mark : string used to mark event as other failure
 	"""
-	rules: DowntimeRules = field(default_factory=default_downtime_rules)
+	rules: DowntimeRules = field(default_factory=DowntimeRules)
 	rtu_file_name: str = ''
 	# Whether only list known RTUs included in Availability
 	known_rtus_only: bool = False
@@ -369,6 +395,27 @@ class RTUConfig(Config):
 	link_failure_mark: str = '**link**'
 	rtu_failure_mark: str = '**rtu**'
 	other_failure_mark: str = '**other**'
+
+	def export(self, **kwargs) -> Dict[str, Any]:
+		dumped = super().export(**kwargs)
+		dumped['rules'] = self.rules.to_list()
+		return dumped
+
+	def validate(self, **kwargs) -> Dict[str, Any]:
+		data = dict()
+		for key, val in kwargs.items():
+			if key=='rules':
+				data['rules'] = DowntimeRules.from_list(val)
+			elif key in self.__dataclass_fields__:
+				data[key] = val
+
+		return data
+
+	def save(self):
+		return super().save(section='avrtu')
+
+	def reload(self, as_new: bool = True):
+		return super().reload(section='avrtu', as_new=as_new)
 
 	@property
 	def rtu_names(self) -> Dict[str, str]:

@@ -477,6 +477,12 @@ class RCDConfig(Config):
 	failed_mark: str = '**failed**'
 	unused_mark: str = '**unused**'
 
+	def save(self):
+		return super().save(section='avrcd')
+
+	def reload(self, as_new: bool = True):
+		return super().reload(section='avrcd', as_new=as_new)
+
 	@property
 	def elements(self) -> Tuple[str]:
 		elements = ['CB']
