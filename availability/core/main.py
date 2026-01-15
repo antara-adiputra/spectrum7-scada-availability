@@ -417,7 +417,10 @@ class Availability:
 	async def async_read_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
 		self.reader.change_data_models(self.core.model_class)
 		df = await self._read_files(files=files, sheet=sheet, **kwargs)
-		return self.post_read_file(df, **kwargs)
+		if isinstance(df, pd.DataFrame):
+			return self.post_read_file(df, **kwargs)
+		else:
+			return
 
 	def read_soe_file(self, files: FileInput, sheet: Optional[str] = None, **kwargs):
 		return asyncio.run(self.async_read_soe_file(files=files, sheet=sheet, **kwargs))
