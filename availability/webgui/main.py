@@ -1,8 +1,8 @@
-import asyncio, datetime, os
+import asyncio, datetime, os, yaml
 from functools import partial
 
 from nicegui import app, binding, events, ui
-from nicegui.binding import bindable_dataclass
+from nicegui.binding import BindableProperty, bindable_dataclass
 
 from .components import Button, DialogPrompt, GUIAvailability, NavButton, NavDropdownButton, ObjectDebugger, RCDTabPanel, RTUTabPanel, UIColumn, UIRow, dialog_title_section
 from .event import EventChainsWithArgs, EventChainsWithoutArgs, consume
@@ -48,6 +48,7 @@ class WebGUIv3(ui.card):
 	logger: ui.log = None
 	statusbar_text: ui.label = None
 	statusbar_progress: ui.linear_progress = None
+	dark_mode: bool = BindableProperty()
 
 	def __init__(self) -> None:
 		super().__init__()
@@ -60,6 +61,9 @@ class WebGUIv3(ui.card):
 		self.dialog_prompt = DialogPrompt()
 		self.cache = app.storage.client
 
+		# Initialize dark mode
+		cfg = config.try_load_file_config()
+		self.dark_mode = cfg.get('dark_mode', False) if isinstance(cfg, dict) else False
 		# Initialize display
 		self.about = self.app_info()
 
@@ -91,11 +95,11 @@ class WebGUIv3(ui.card):
 			ui.separator().props('vertical size=1px')
 			NavButton('', icon='',
 				on_click=ui.dark_mode(
-					value=config.DARK_MODE,
-					on_change=lambda e: config.save(DARK_MODE=e.value)
+					value=self.dark_mode,
+					on_change=self.event_dark_mode
 				).toggle)\
-				.bind_icon_from(config, 'DARK_MODE', backward=lambda b: 'light_mode' if b else 'dark_mode')\
-				.bind_text_from(config, 'DARK_MODE', backward=lambda b: 'Cerah' if b else 'Gelap')\
+				.bind_icon_from(self, 'dark_mode', backward=lambda b: 'light_mode' if b else 'dark_mode')\
+				.bind_text_from(self, 'dark_mode', backward=lambda b: 'Cerah' if b else 'Gelap')\
 				.tooltip('Pilih mode cerah / gelap')
 			ui.separator().props('vertical size=1px')
 			NavButton('Doc', icon='description',
@@ -204,9 +208,6 @@ class WebGUIv3(ui.card):
 		else:
 			return
 
-	def event_menu_changed(self, e: events.ValueChangeEventArguments):
-		self.state.event_menu_changed(e.value)
-
 	def update_refreshable(self, *args):
 		consume(map(lambda comp: comp.refresh(), self._refreshable))
 
@@ -222,8 +223,10 @@ class WebGUIv3(ui.card):
 			ui.separator()
 			self.statusbar()
 
-		debug = self.debug_view()
-		Button(icon='open_in_full', on_click=debug.open).props('dense size=xs').classes('absolute top-1.5 right-1.5')
+		if settings.DEBUG:
+			debug = self.debug_view()
+			Button(icon='open_in_full', on_click=debug.open).props('dense size=xs').classes('absolute top-1.5 right-1.5')
+
 		self.update_ui()
 		self.logger.push(logprint('Aplikasi start..', level='info', cli=False), classes='text-blue')
 
@@ -263,6 +266,17 @@ class WebGUIv3(ui.card):
 		self.state.reset()
 		self.panel_rcd.state.reset()
 		# self.panel_rtu.state.reset()
+
+	def event_menu_changed(self, e: events.ValueChangeEventArguments):
+		self.state.event_menu_changed(e.value)
+
+	def event_dark_mode(self, e: events.ValueChangeEventArguments):
+		self.dark_mode = e.value
+
+		cfg = config.try_load_file_config()
+		data = cfg if isinstance(cfg, dict) else dict()
+		data['dark_mode'] = e.value
+		yaml.safe_dump(data, open('config.yaml', 'w'))
 
 	async def event_test_read(self):
 		self.state.progress_visible = True
