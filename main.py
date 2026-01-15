@@ -19,10 +19,7 @@ def local_file(path: str) -> str:
 		content = ''.join(lines)
 	return content
 
-ui.add_head_html(local_file('availability/webgui/head.html'), shared=True)
-
-
-if __name__=='__main__':
+def run_app():
 	# Modified in 25-12-2025
 	# Prevent code run twice and slightly improve performance!!
 	# Reference : https://github.com/zauberzeug/nicegui/issues/794
@@ -33,7 +30,6 @@ if __name__=='__main__':
 			port=settings.PORT,
 			title=settings.APP_TITLE,
 			favicon=settings.FAVICON,
-			dark=config.DARK_MODE,
 			show=settings.AUTO_SHOW,
 			reload=settings.AUTO_RELOAD,
 			on_air=settings.ON_AIR,
@@ -44,3 +40,10 @@ if __name__=='__main__':
 		)
 	except KeyboardInterrupt:
 		config.logprint('Application shutdown successfully.', level='info')
+
+
+ui.add_head_html(local_file('availability/webgui/head.html'), shared=True)
+
+
+if __name__=='__main__':
+	run_app()
