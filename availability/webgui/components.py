@@ -4,7 +4,7 @@ from functools import partial
 from io import BytesIO
 
 import pandas as pd
-from nicegui import events, ui
+from nicegui import binding, events, ui
 from nicegui.binding import bindable_dataclass
 from nicegui.observables import ObservableDict, ObservableList
 from starlette.formparsers import MultiPartParser
@@ -614,9 +614,11 @@ class AvProxy:
 	config: Config
 	object: Union[RCD, RTU]
 	state: BindableCoreState
+	persistent_mode: bool = binding.BindableProperty()
 
 	def __init__(self, config: Config, object: Union[RCD, RTU], interlock: InterlockState):
 		self._preconfig = dict()
+		self.persistent_mode = False
 		self.config = create_bindable(config)
 		self.object = object
 		self.iloc = interlock
@@ -639,10 +641,13 @@ class AvProxy:
 			dialog_title_section(title='Pengaturan', icon='settings')
 			self.config_layout()
 			ui.separator()
+			ui.switch('Simpan parameter di memory')\
+				.bind_value(self, 'persistent_mode')\
+				.tooltip('Jika aktif, parameter tetap sama setiap kali aplikasi diakses')
 			with UIRow(gap=2).classes('px-4'):
 				ui.space()
 				ButtonDialogControl('Batal', color='yellow', on_click=EventChainsWithoutArgs((dialog.close, self.event_cancel_changes))).props('text-color=black')
-				ButtonDialogControl('Simpan', color='secondary', on_click=dialog.close)
+				ButtonDialogControl('Simpan', color='secondary', on_click=EventChainsWithoutArgs(chains=(dialog.close, self.event_save_changes)))
 
 		return dialog
 
@@ -650,6 +655,11 @@ class AvProxy:
 		if e.value==True:
 			self.config_layout.refresh()
 			self._preconfig = asdict(self.config)
+			self.persistent_mode = False
+
+	def event_save_changes(self):
+		if self.persistent_mode:
+			self.config.save()
 
 	def event_cancel_changes(self):
 		self.config.set(**self._preconfig)
@@ -1083,6 +1093,7 @@ class RCDProxy(AvProxy):
 
 	def __init__(self, interlock: InterlockState, logger: Optional[ui.log] = None):
 		config = RCDConfig()
+		config.reload(as_new=False)
 		super().__init__(config=config, object=RCD(config, log_callback=logger.push), interlock=interlock)
 
 	@ui.refreshable_method
@@ -1177,6 +1188,20 @@ class RCDTabPanel(GUIAvailability):
 # AVAILABILITY RTU
 ################################################################################################
 
+def add_row_rule(category: str = '', hours: int = None):
+	with UIRow(css_padding='p-1').classes('w-full') as row:
+		ui_input(value=category, placeholder='Kategori')\
+			.classes('w-2/3')
+		ui_input(value=hours, placeholder='Jam')\
+			.props('type="number" min=1 step=1')\
+			.classes('w-1/3')
+		Button(icon='cancel', color='red', on_click=row.delete)\
+			.props('dense flat round')
+
+def inject_input(elm: ui.element):
+	with ui.teleport(elm):
+		add_row_rule()
+
 
 @dataclass
 class RTUProxy(AvProxy):
@@ -1185,7 +1210,48 @@ class RTUProxy(AvProxy):
 
 	def __init__(self, interlock: InterlockState, logger: Optional[ui.log] = None):
 		config = RTUConfig()
+		config.reload(as_new=False)
 		super().__init__(config=config, object=RTU(config, log_callback=logger.push), interlock=interlock)
+
+	@staticmethod
+	def row_rule(category: str = '', hours: Union[int, datetime.timedelta] = None):
+		if isinstance(hours, datetime.timedelta):
+			hours = hours.total_seconds() // 3600
+
+		with UIRow(css_padding='p-1').classes('w-full') as row:
+			ui_input(value=category, placeholder='Kategori')\
+				.classes('w-2/3')\
+				.tooltip('Kategori')
+			ui_input(value=hours, placeholder='Jam')\
+				.props('type="number" min=1 step=1')\
+				.classes('w-1/3')\
+				.tooltip('Durasi (jam)')
+			Button(icon='cancel', color='red', on_click=row.delete)\
+				.props('dense flat round')\
+				.tooltip('Hapus')
+		return row
+
+	def add_new_rule(self):
+		with self.rules_container:
+			self.row_rule()
+
+	def get_rules_value(self) -> List[List[str]]:
+		results = list()
+		if isinstance(self.rules_container, ui.element):
+			for row in self.rules_container.default_slot.children:
+				rule = list()
+				for child in row.default_slot.children:
+					if isinstance(child, ui.input):
+						value = int(child.value) if child.props['type']=='number' else child.value
+						rule.append(value)
+
+				results.append(rule)
+
+		return results
+
+	def event_save_changes(self):
+		self.config.rules = rtu.DowntimeRules(self.get_rules_value())
+		return super().event_save_changes()
 
 	@ui.refreshable_method
 	def config_layout(self):
@@ -1207,13 +1273,28 @@ class RTUProxy(AvProxy):
 					ui.checkbox()\
 						.bind_value(self.config, 'known_rtus_only', strict=True)\
 						.props('dense')
-			with ui_item().bind_visibility_from(self.config, 'known_rtus_only', strict=True):
+			with ui_item():
 				with ui_section():
 					ui_menu_label('List RTU')
 				with ui_section():
 					Select(options=['', *config.RTU_NAMES_CONFIG.keys()])\
 						.bind_value(self.config, 'rtu_file_name', strict=True)\
+						.bind_enabled_from(self.config, 'known_rtus_only', strict=True)\
 						.props('dense')
+			with ui_item():
+				with ui_section():
+					ui_menu_label('Kategori Downtime')
+				with ui_section().classes('border border-solid rounded-sm border-stone-300'):
+					with ui.element('div') as container:
+						self.rules_container = container
+						for rule in self.config.rules:
+							self.row_rule(rule.name, rule.threshold)
+
+					with UIColumn(align_items='center'):
+						Button(icon='add', color='green', on_click=self.add_new_rule)\
+							.props('dense outline round size=sm')\
+							.classes('w-0')\
+							.tooltip('Tambah kategori')
 			with ui_item():
 				with ui_section():
 					ui_menu_label('Penanda down HAR')
